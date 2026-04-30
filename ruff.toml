@@ -1,0 +1,16 @@
+line-length = 100
+target-version = "py311"
+
+[lint]
+select = ["E", "F", "I", "UP", "B", "W"]
+ignore = [
+    "E501",  # line-too-long handled by formatter
+    "B008",  # function call in arg defaults — typer relies on this pattern
+]
+
+[lint.per-file-ignores]
+"tests/**" = ["B011"]                # allow `assert False` in tests
+
+[format]
+quote-style = "double"
+indent-style = "space"
