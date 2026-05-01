@@ -7,12 +7,14 @@ Stable surface (api_version = "1"):
     - ChannelPlugin (Protocol), PluginContext — channel-specific extension
     - NotificationPayload, NotificationSection, NotificationItem — notify data contract
     - PluginMetadata, TableSpec, MigrationSpec, PluginPermissions, ...
+    - StageProfile — LLM 调参档；插件持有 preset → stage 映射表，自行解析
 """
 
 from __future__ import annotations
 
 from deeptrade.plugins_api.base import Plugin
 from deeptrade.plugins_api.channel import ChannelPlugin, PluginContext
+from deeptrade.plugins_api.llm import StageProfile
 from deeptrade.plugins_api.metadata import (
     MigrationSpec,
     PluginMetadata,
@@ -36,6 +38,7 @@ __all__ = [
     "PluginContext",
     "PluginMetadata",
     "PluginPermissions",
+    "StageProfile",
     "TableSpec",
     "TushareApiPermissions",
 ]

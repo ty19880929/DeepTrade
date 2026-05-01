@@ -17,14 +17,16 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from deeptrade.core.deepseek_client import (
-    DeepSeekClient,
+from deeptrade.core.llm_client import (
+    LLMClient,
     LLMTransportError,
     LLMValidationError,
 )
+from deeptrade.plugins_api import StageProfile
 from deeptrade.plugins_api.events import EventLevel, EventType, StrategyEvent
 
 from .data import Round1Bundle, SectorStrength
+from .profiles import STAGE_FINAL, STAGE_R1, STAGE_R2, resolve_profile
 from .prompts import (
     FINAL_RANKING_SYSTEM,
     R1_SYSTEM,
@@ -160,12 +162,12 @@ class _SetMismatchError(Exception):
 
 
 def _complete_with_set_check(
-    llm: DeepSeekClient,
+    llm: LLMClient,
     *,
     system: str,
     user: str,
     schema: type[BaseModel],
-    stage: str,
+    profile: StageProfile,
     expected_ids: set[str],
     output_attr: str = "candidates",
     repair_retries: int = 1,
@@ -175,10 +177,11 @@ def _complete_with_set_check(
     once with a corrective hint appended to the user prompt.
 
     Args:
+        profile: caller-resolved StageProfile (see profiles.py).
         output_attr: name of the BaseModel field that holds the list of items
             (each having a ``.candidate_id`` attr). 'candidates' for R1/R2,
             'finalists' for final_ranking.
-        envelope_defaults: framework-controlled top-level fields (e.g. ``stage``,
+        envelope_defaults: caller-controlled top-level fields (e.g. ``stage``,
             ``trade_date``, ``batch_no``) injected when the LLM omits them.
     """
     current_user = user
@@ -188,7 +191,7 @@ def _complete_with_set_check(
             system=system,
             user=current_user,
             schema=schema,
-            stage=stage,
+            profile=profile,
             envelope_defaults=envelope_defaults,
         )
         obj = raw if isinstance(raw, schema) else schema.model_validate(raw)
@@ -213,9 +216,9 @@ def _complete_with_set_check(
 
 def run_r1(
     *,
-    llm: DeepSeekClient,
+    llm: LLMClient,
     bundle: Round1Bundle,
-    output_budget: int,
+    preset: str,
     input_budget: int = DEFAULT_R1_INPUT_BUDGET,
 ) -> Iterable[tuple[StrategyEvent, RoundResult | None]]:
     """Run all R1 batches, yielding (event, terminal_result_or_None).
@@ -224,11 +227,12 @@ def run_r1(
     iteration yields a result alongside the STEP_FINISHED event so the caller
     can hand it on to R2.
     """
+    profile = resolve_profile(preset, STAGE_R1)
     candidates = bundle.candidates
     plan = plan_r1_batches(
         n_candidates=len(candidates),
         input_budget=input_budget,
-        output_budget=output_budget,
+        output_budget=profile.max_output_tokens,
     )
     yield (
         StrategyEvent(
@@ -299,10 +303,10 @@ def run_r1(
                 system=R1_SYSTEM,
                 user=user,
                 schema=StrongAnalysisResponse,
-                stage="strong_target_analysis",
+                profile=profile,
                 expected_ids=expected_ids,
                 envelope_defaults={
-                    "stage": "strong_target_analysis",
+                    "stage": STAGE_R1,
                     "trade_date": bundle.trade_date,
                     "batch_no": i + 1,
                     "batch_total": plan.n_batches,
@@ -379,17 +383,18 @@ def run_r1(
 
 def run_r2(
     *,
-    llm: DeepSeekClient,
+    llm: LLMClient,
     selected: list[StrongCandidate],
     bundle: Round1Bundle,
-    output_budget: int,
+    preset: str,
     input_budget: int = DEFAULT_R2_INPUT_BUDGET,
 ) -> Iterable[tuple[StrategyEvent, RoundResult | None]]:
     """Run R2; if the candidate set exceeds the input budget, multi-batch + final_ranking."""
+    profile = resolve_profile(preset, STAGE_R2)
     plan = plan_r1_batches(
         n_candidates=len(selected),
         input_budget=input_budget,
-        output_budget=output_budget,
+        output_budget=profile.max_output_tokens,
     )
     yield (
         StrategyEvent(
@@ -463,7 +468,7 @@ def run_r2(
                 system=R2_SYSTEM,
                 user=user,
                 schema=ContinuationResponse,
-                stage="continuation_prediction",
+                profile=profile,
                 expected_ids=expected_ids,
                 envelope_defaults={
                     "stage": "limit_up_continuation_prediction",
@@ -572,11 +577,12 @@ def select_finalists(
 
 def run_final_ranking(
     *,
-    llm: DeepSeekClient,
+    llm: LLMClient,
     bundle: Round1Bundle,
     finalists: list[ContinuationCandidate],
-    output_budget: int,  # noqa: ARG001 — final_ranking uses a separate stage profile
+    preset: str,
 ) -> Iterable[tuple[StrategyEvent, FinalRankingResponse | None]]:
+    profile = resolve_profile(preset, STAGE_FINAL)
     yield (
         StrategyEvent(
             type=EventType.LIVE_STATUS,
@@ -611,11 +617,11 @@ def run_final_ranking(
             system=FINAL_RANKING_SYSTEM,
             user=user,
             schema=FinalRankingResponse,
-            stage="final_ranking",
+            profile=profile,
             expected_ids=expected_ids,
             output_attr="finalists",
             envelope_defaults={
-                "stage": "final_ranking",
+                "stage": STAGE_FINAL,
                 "trade_date": bundle.trade_date,
                 "next_trade_date": bundle.next_trade_date,
             },

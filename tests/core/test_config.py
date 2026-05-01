@@ -1,4 +1,8 @@
-"""V0.2 DoD — ConfigService priority + secret routing + profile loading."""
+"""V0.2 DoD — ConfigService priority + secret routing + profile loading.
+
+v0.6 — `SECRET_KEYS` was retired in favor of `is_secret_key()` (prefix
+matching for `llm.<name>.api_key`). Tests updated accordingly.
+"""
 
 from __future__ import annotations
 
@@ -8,11 +12,10 @@ from pathlib import Path
 import pytest
 
 from deeptrade.core.config import (
-    PROFILES_DEFAULT,
-    SECRET_KEYS,
     AppConfig,
     ConfigService,
     env_var_for,
+    is_secret_key,
 )
 from deeptrade.core.db import Database, apply_core_migrations
 from deeptrade.core.secrets import SecretStore
@@ -41,19 +44,39 @@ def test_config_show_masks_secrets(svc: ConfigService) -> None:
 
 def test_env_overrides_db_and_default(svc: ConfigService, monkeypatch: pytest.MonkeyPatch) -> None:
     # default
-    assert svc.get("deepseek.profile") == "balanced"
+    assert svc.get("app.profile") == "balanced"
     # db override
-    svc.set("deepseek.profile", "quality")
-    assert svc.get("deepseek.profile") == "quality"
+    svc.set("app.profile", "quality")
+    assert svc.get("app.profile") == "quality"
     # env var beats db
-    monkeypatch.setenv(env_var_for("deepseek.profile"), "fast")
-    assert svc.get("deepseek.profile") == "fast"
-    assert svc.source_of("deepseek.profile") == "env"
+    monkeypatch.setenv(env_var_for("app.profile"), "fast")
+    assert svc.get("app.profile") == "fast"
+    assert svc.source_of("app.profile") == "env"
+
+
+def test_legacy_deepseek_profile_env_raises(
+    svc: ConfigService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """v0.7: legacy DEEPTRADE_DEEPSEEK_PROFILE must hard-stop on materialize."""
+    monkeypatch.setenv("DEEPTRADE_DEEPSEEK_PROFILE", "fast")
+    monkeypatch.delenv("DEEPTRADE_APP_PROFILE", raising=False)
+    with pytest.raises(RuntimeError, match="DEEPTRADE_DEEPSEEK_PROFILE"):
+        svc.get_app_config()
+
+
+def test_legacy_deepseek_profile_env_silent_when_new_env_set(
+    svc: ConfigService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the user sets BOTH old and new env, defer to new — no error."""
+    monkeypatch.setenv("DEEPTRADE_DEEPSEEK_PROFILE", "fast")
+    monkeypatch.setenv("DEEPTRADE_APP_PROFILE", "quality")
+    cfg = svc.get_app_config()
+    assert cfg.app_profile == "quality"
 
 
 def test_env_var_naming_convention() -> None:
     assert env_var_for("tushare.token") == "DEEPTRADE_TUSHARE_TOKEN"
-    assert env_var_for("deepseek.api_key") == "DEEPTRADE_DEEPSEEK_API_KEY"
+    assert env_var_for("llm.deepseek.api_key") == "DEEPTRADE_LLM_DEEPSEEK_API_KEY"
     assert env_var_for("app.close_after") == "DEEPTRADE_APP_CLOSE_AFTER"
 
 
@@ -61,14 +84,18 @@ def test_env_var_naming_convention() -> None:
 
 
 def test_set_secret_routes_to_secret_store_only(svc: ConfigService) -> None:
-    svc.set("deepseek.api_key", "sk-abc")
+    svc.set("llm.deepseek.api_key", "sk-abc")
     # app_config table must NOT contain the secret
-    rows = svc._db.fetchall("SELECT key FROM app_config WHERE key='deepseek.api_key'")  # type: ignore[attr-defined]
+    rows = svc._db.fetchall(  # type: ignore[attr-defined]
+        "SELECT key FROM app_config WHERE key='llm.deepseek.api_key'"
+    )
     assert rows == []
     # secret_store DOES
-    rows = svc._db.fetchall("SELECT key FROM secret_store WHERE key='deepseek.api_key'")  # type: ignore[attr-defined]
-    assert rows and rows[0][0] == "deepseek.api_key"
-    assert svc.get("deepseek.api_key") == "sk-abc"
+    rows = svc._db.fetchall(  # type: ignore[attr-defined]
+        "SELECT key FROM secret_store WHERE key='llm.deepseek.api_key'"
+    )
+    assert rows and rows[0][0] == "llm.deepseek.api_key"
+    assert svc.get("llm.deepseek.api_key") == "sk-abc"
 
 
 def test_set_non_secret_routes_to_app_config_only(svc: ConfigService) -> None:
@@ -80,10 +107,18 @@ def test_set_non_secret_routes_to_app_config_only(svc: ConfigService) -> None:
     assert rows == []
 
 
-def test_secret_keys_constant_is_complete() -> None:
-    """Sanity: all keys ending in `.token` or `.api_key` should be in SECRET_KEYS."""
-    assert "tushare.token" in SECRET_KEYS
-    assert "deepseek.api_key" in SECRET_KEYS
+def test_is_secret_key_routing() -> None:
+    """v0.6: is_secret_key matches tushare.token + llm.<name>.api_key prefix."""
+    assert is_secret_key("tushare.token") is True
+    assert is_secret_key("llm.deepseek.api_key") is True
+    assert is_secret_key("llm.qwen-plus.api_key") is True
+    assert is_secret_key("llm.providers") is False
+    assert is_secret_key("llm.audit_full_payload") is False
+    assert is_secret_key("tushare.rps") is False
+    # llm.<name>.something_else is NOT a secret
+    assert is_secret_key("llm.deepseek.base_url") is False
+    # extra dots inside name are NOT allowed
+    assert is_secret_key("llm.foo.bar.api_key") is False
 
 
 # --- DoD 5: invalid value rejection ----------------------------------------
@@ -96,7 +131,7 @@ def test_set_unknown_key_raises(svc: ConfigService) -> None:
 
 def test_set_invalid_profile_value_raises(svc: ConfigService) -> None:
     with pytest.raises(Exception):  # noqa: B017 — Pydantic ValidationError varies
-        svc.set("deepseek.profile", "ultra")
+        svc.set("app.profile", "ultra")
 
 
 # --- DoD 6: close_after default = 18:00 (S2 fix) --------------------------
@@ -116,36 +151,9 @@ def test_close_after_can_be_overridden(svc: ConfigService) -> None:
     assert cfg.app_close_after == time(17, 30)
 
 
-# --- profile loading ------------------------------------------------------
-
-
-def test_profile_default_balanced_disables_thinking_for_r1_only(svc: ConfigService) -> None:
-    p = svc.get_profile()
-    assert p.strong_target_analysis.thinking is False
-    assert p.continuation_prediction.thinking is True
-    assert p.final_ranking.thinking is True
-
-
-def test_fast_profile_disables_thinking_for_all_stages() -> None:
-    """F3 fix: fast profile must have thinking=false everywhere."""
-    p = PROFILES_DEFAULT["fast"]
-    assert p.strong_target_analysis.thinking is False
-    assert p.continuation_prediction.thinking is False
-    assert p.final_ranking.thinking is False
-
-
-def test_stage_max_output_tokens_r1_r2_32k_final_8k() -> None:
-    """F5 fix: R1/R2 default to 32k output, final_ranking 8k."""
-    for name in ("fast", "balanced", "quality"):
-        p = PROFILES_DEFAULT[name]
-        assert p.strong_target_analysis.max_output_tokens == 32768
-        assert p.continuation_prediction.max_output_tokens == 32768
-        assert p.final_ranking.max_output_tokens == 8192
-
-
-def test_unknown_profile_name_raises(svc: ConfigService) -> None:
-    with pytest.raises(ValueError, match="unknown deepseek profile"):
-        svc.get_profile("ultra")
+# --- profile preset key ----------------------------------------------------
+# v0.7: stage 调参档归插件，框架只保留 preset 名作为字符串配置；具体每档的
+# stage tuning 由各插件 profiles.py 维护，对应单测见各插件包内。
 
 
 def test_get_app_config_picks_up_env_var(
@@ -167,3 +175,46 @@ def test_delete_secret(svc: ConfigService) -> None:
     assert svc.get("tushare.token") == "x"
     svc.delete("tushare.token")
     assert svc.get("tushare.token") is None
+
+
+# --- v0.6 LLM provider CRUD -----------------------------------------------
+
+
+def test_set_llm_provider_persists_config_and_api_key(svc: ConfigService) -> None:
+    svc.set_llm_provider(
+        "deepseek",
+        base_url="https://api.deepseek.com",
+        model="deepseek-v4-pro",
+        timeout=120,
+        api_key="sk-test",
+    )
+    cfg = svc.get_app_config()
+    assert "deepseek" in cfg.llm_providers
+    assert cfg.llm_providers["deepseek"].base_url == "https://api.deepseek.com"
+    assert cfg.llm_providers["deepseek"].timeout == 120
+    assert svc.get("llm.deepseek.api_key") == "sk-test"
+
+
+def test_set_llm_provider_rejects_dot_in_name(svc: ConfigService) -> None:
+    with pytest.raises(ValueError, match="invalid provider name"):
+        svc.set_llm_provider("foo.bar", base_url="x", model="y")
+
+
+def test_delete_llm_provider_clears_config_and_api_key(svc: ConfigService) -> None:
+    svc.set_llm_provider("deepseek", base_url="x", model="y", api_key="sk-1")
+    svc.set_llm_provider("kimi", base_url="x", model="y", api_key="sk-2")
+    svc.delete_llm_provider("deepseek")
+    cfg = svc.get_app_config()
+    assert "deepseek" not in cfg.llm_providers
+    assert "kimi" in cfg.llm_providers
+    assert svc.get("llm.deepseek.api_key") is None
+    assert svc.get("llm.kimi.api_key") == "sk-2"
+
+
+def test_list_all_includes_per_provider_api_key_rows(svc: ConfigService) -> None:
+    svc.set_llm_provider("deepseek", base_url="x", model="y", api_key="sk-abcd1234")
+    rendered = {k: (v, src) for k, v, src in svc.list_all()}
+    assert "llm.deepseek.api_key" in rendered
+    val, src = rendered["llm.deepseek.api_key"]
+    assert val.startswith("********") and val.endswith("1234")
+    assert src == "secret_store"

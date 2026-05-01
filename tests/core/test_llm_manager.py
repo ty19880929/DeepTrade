@@ -1,0 +1,137 @@
+"""v0.6 — LLMManager: list / info / get_client + cache + missing-config errors."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from deeptrade.core.config import ConfigService
+from deeptrade.core.db import Database, apply_core_migrations
+from deeptrade.core.llm_client import LLMClient
+from deeptrade.core.llm_manager import LLMManager, LLMNotConfiguredError, LLMProviderInfo
+from deeptrade.core.secrets import SecretStore
+
+
+@pytest.fixture
+def svc(tmp_path: Path) -> ConfigService:
+    db = Database(tmp_path / "test.duckdb")
+    apply_core_migrations(db)
+    return ConfigService(db, secret_store=SecretStore(db, force_plaintext=True))
+
+
+@pytest.fixture
+def mgr(svc: ConfigService) -> LLMManager:
+    return LLMManager(svc._db, svc)  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# list_providers
+# ---------------------------------------------------------------------------
+
+
+def test_list_providers_empty_when_unconfigured(mgr: LLMManager) -> None:
+    assert mgr.list_providers() == []
+
+
+def test_list_providers_filters_out_missing_api_key(svc: ConfigService, mgr: LLMManager) -> None:
+    """A provider entry without an api_key must NOT appear — semantics is
+    'usable providers', not 'declared providers'.
+    """
+    svc.set_llm_provider("deepseek", base_url="x", model="y", api_key="sk-1")
+    svc.set_llm_provider("kimi", base_url="x", model="y")  # api_key missing
+    assert mgr.list_providers() == ["deepseek"]
+
+
+def test_list_providers_returns_sorted(svc: ConfigService, mgr: LLMManager) -> None:
+    svc.set_llm_provider("zeta", base_url="x", model="y", api_key="sk-z")
+    svc.set_llm_provider("alpha", base_url="x", model="y", api_key="sk-a")
+    svc.set_llm_provider("mu", base_url="x", model="y", api_key="sk-m")
+    assert mgr.list_providers() == ["alpha", "mu", "zeta"]
+
+
+# ---------------------------------------------------------------------------
+# get_provider_info
+# ---------------------------------------------------------------------------
+
+
+def test_get_provider_info_returns_metadata(svc: ConfigService, mgr: LLMManager) -> None:
+    svc.set_llm_provider(
+        "deepseek",
+        base_url="https://api.deepseek.com",
+        model="deepseek-v4-pro",
+        api_key="sk-x",
+    )
+    info = mgr.get_provider_info("deepseek")
+    assert info == LLMProviderInfo(
+        name="deepseek", model="deepseek-v4-pro", base_url="https://api.deepseek.com"
+    )
+
+
+def test_get_provider_info_for_missing_provider_raises(mgr: LLMManager) -> None:
+    with pytest.raises(LLMNotConfiguredError, match="not configured"):
+        mgr.get_provider_info("does-not-exist")
+
+
+def test_get_provider_info_works_without_api_key(svc: ConfigService, mgr: LLMManager) -> None:
+    """info() is intentionally usable for entries without api_key — supports
+    'edit existing' UX flows."""
+    svc.set_llm_provider("kimi", base_url="x", model="y")
+    info = mgr.get_provider_info("kimi")
+    assert info.name == "kimi"
+
+
+# ---------------------------------------------------------------------------
+# get_client
+# ---------------------------------------------------------------------------
+
+
+def test_get_client_returns_llm_client_for_configured_provider(
+    svc: ConfigService, mgr: LLMManager
+) -> None:
+    svc.set_llm_provider("deepseek", base_url="x", model="m", api_key="sk-1")
+    client = mgr.get_client("deepseek", plugin_id="some-plugin", run_id="run-1")
+    assert isinstance(client, LLMClient)
+
+
+def test_get_client_caches_by_name_plugin_runid(svc: ConfigService, mgr: LLMManager) -> None:
+    svc.set_llm_provider("deepseek", base_url="x", model="m", api_key="sk-1")
+    a = mgr.get_client("deepseek", plugin_id="P", run_id="R")
+    b = mgr.get_client("deepseek", plugin_id="P", run_id="R")
+    assert a is b
+    # Different plugin → different instance (audit isolation)
+    c = mgr.get_client("deepseek", plugin_id="Q", run_id="R")
+    assert c is not a
+    # Different run_id → different instance
+    d = mgr.get_client("deepseek", plugin_id="P", run_id="R2")
+    assert d is not a
+
+
+def test_get_client_raises_when_provider_missing(mgr: LLMManager) -> None:
+    with pytest.raises(LLMNotConfiguredError, match="not configured"):
+        mgr.get_client("nope", plugin_id="P")
+
+
+def test_get_client_raises_when_api_key_missing(svc: ConfigService, mgr: LLMManager) -> None:
+    svc.set_llm_provider("kimi", base_url="x", model="m")  # no api_key
+    with pytest.raises(LLMNotConfiguredError, match="api_key"):
+        mgr.get_client("kimi", plugin_id="P")
+
+
+# ---------------------------------------------------------------------------
+# Multi-provider parallel use case
+# ---------------------------------------------------------------------------
+
+
+def test_multiple_providers_coexist(svc: ConfigService, mgr: LLMManager) -> None:
+    """The defining v0.6 use case: a plugin holding two clients at once."""
+    svc.set_llm_provider("deepseek", base_url="u1", model="m1", api_key="sk-1")
+    svc.set_llm_provider("kimi", base_url="u2", model="m2", api_key="sk-2")
+
+    a = mgr.get_client("deepseek", plugin_id="P", run_id="R")
+    b = mgr.get_client("kimi", plugin_id="P", run_id="R")
+
+    assert a is not b
+    # Each is independently a working LLMClient
+    assert isinstance(a, LLMClient)
+    assert isinstance(b, LLMClient)

@@ -1,4 +1,8 @@
-"""V0.4 DoD — DeepSeekClient: profile / stage / no-tools / JSON validate / retry / audit."""
+"""V0.4 DoD — LLMClient: profile / no-tools / JSON validate / retry / audit.
+
+(Renamed from ``test_deepseek_client.py`` in v0.6; profiles 在 v0.7 改由调用方
+直接传入 ``StageProfile``，stage 概念退出框架。)
+"""
 
 from __future__ import annotations
 
@@ -9,18 +13,30 @@ from typing import Any
 import pytest
 from pydantic import BaseModel, ConfigDict, Field
 
-from deeptrade.core.config import PROFILES_DEFAULT
 from deeptrade.core.db import Database, apply_core_migrations
-from deeptrade.core.deepseek_client import (
-    KNOWN_STAGES,
-    DeepSeekClient,
+from deeptrade.core.llm_client import (
+    LLMClient,
     LLMResponse,
     LLMTransport,
     LLMTransportError,
-    LLMUnknownStageError,
     LLMValidationError,
     OpenAIClientTransport,
     RecordedTransport,
+)
+from deeptrade.plugins_api import StageProfile
+
+
+# Test stage profiles — mirror what plugin profiles.py would resolve.
+# `THINKING_OFF_32K` corresponds to fast/balanced R1; `THINKING_ON_32K` to
+# balanced/quality R2; `THINKING_ON_8K` to balanced/quality final_ranking.
+THINKING_OFF_32K = StageProfile(
+    thinking=False, reasoning_effort="medium", temperature=0.1, max_output_tokens=32768
+)
+THINKING_ON_32K = StageProfile(
+    thinking=True, reasoning_effort="high", temperature=0.2, max_output_tokens=32768
+)
+THINKING_ON_8K = StageProfile(
+    thinking=True, reasoning_effort="high", temperature=0.0, max_output_tokens=8192
 )
 
 
@@ -50,21 +66,19 @@ def transport() -> RecordedTransport:
 
 
 @pytest.fixture
-def client(db: Database, transport: RecordedTransport) -> DeepSeekClient:
-    return DeepSeekClient(
+def client(db: Database, transport: RecordedTransport) -> LLMClient:
+    return LLMClient(
         db,
         transport,
         model="deepseek-v4-pro",
-        profiles=PROFILES_DEFAULT["balanced"],
         plugin_id="test-plugin",
         run_id=None,
     )
 
 
-# Convenience helper
-def _ok_response(stage: str, n: int = 2) -> LLMResponse:
+def _ok_response(stage_label: str = "test", n: int = 2) -> LLMResponse:
     payload = {
-        "stage": stage,
+        "stage": stage_label,
         "candidates": [
             {"candidate_id": f"c{i}", "selected": i % 2 == 0, "score": 50.0 + i} for i in range(n)
         ],
@@ -79,14 +93,11 @@ def _ok_response(stage: str, n: int = 2) -> LLMResponse:
 
 
 def test_complete_json_validates_with_pydantic(
-    client: DeepSeekClient, transport: RecordedTransport
+    client: LLMClient, transport: RecordedTransport
 ) -> None:
-    transport.register("strong_target_analysis", _ok_response("strong_target_analysis"))
+    transport.register(_ok_response())
     obj, meta = client.complete_json(
-        system="sys",
-        user="usr",
-        schema=_SchemaResp,
-        stage="strong_target_analysis",
+        system="sys", user="usr", schema=_SchemaResp, profile=THINKING_OFF_32K
     )
     assert isinstance(obj, _SchemaResp)
     assert len(obj.candidates) == 2
@@ -101,18 +112,14 @@ def test_complete_json_validates_with_pydantic(
 
 
 def test_complete_json_retries_once_on_json_decode_error(
-    client: DeepSeekClient, transport: RecordedTransport, db: Database
+    client: LLMClient, transport: RecordedTransport, db: Database
 ) -> None:
-    transport.register(
-        "strong_target_analysis",
-        LLMResponse(text="not-json{}", input_tokens=10, output_tokens=4),
-    )
-    transport.register("strong_target_analysis", _ok_response("strong_target_analysis"))
+    transport.register(LLMResponse(text="not-json{}", input_tokens=10, output_tokens=4))
+    transport.register(_ok_response())
     obj, _ = client.complete_json(
-        system="sys", user="usr", schema=_SchemaResp, stage="strong_target_analysis"
+        system="sys", user="usr", schema=_SchemaResp, profile=THINKING_OFF_32K
     )
     assert isinstance(obj, _SchemaResp)
-    # llm_calls log shows: 1 retry + 1 ok
     rows = db.fetchall("SELECT validation_status FROM llm_calls ORDER BY created_at")
     assert [r[0] for r in rows] == ["retry", "ok"]
 
@@ -123,91 +130,65 @@ def test_complete_json_retries_once_on_json_decode_error(
 
 
 def test_complete_json_retries_once_on_pydantic_error(
-    client: DeepSeekClient, transport: RecordedTransport
+    client: LLMClient, transport: RecordedTransport
 ) -> None:
-    bad_payload = json.dumps({"stage": "strong_target_analysis", "candidates": [{"x": 1}]})
-    transport.register(
-        "strong_target_analysis",
-        LLMResponse(text=bad_payload, input_tokens=10, output_tokens=10),
-    )
-    transport.register("strong_target_analysis", _ok_response("strong_target_analysis"))
+    bad_payload = json.dumps({"stage": "x", "candidates": [{"x": 1}]})
+    transport.register(LLMResponse(text=bad_payload, input_tokens=10, output_tokens=10))
+    transport.register(_ok_response())
     obj, _ = client.complete_json(
-        system="sys", user="usr", schema=_SchemaResp, stage="strong_target_analysis"
+        system="sys", user="usr", schema=_SchemaResp, profile=THINKING_OFF_32K
     )
     assert isinstance(obj, _SchemaResp)
 
 
 def test_complete_json_raises_after_two_failures(
-    client: DeepSeekClient, transport: RecordedTransport, db: Database
+    client: LLMClient, transport: RecordedTransport, db: Database
 ) -> None:
     bad = LLMResponse(text="garbage", input_tokens=1, output_tokens=1)
-    transport.register("strong_target_analysis", bad)
-    transport.register("strong_target_analysis", bad)
+    transport.register(bad)
+    transport.register(bad)
     with pytest.raises(LLMValidationError):
-        client.complete_json(
-            system="sys", user="usr", schema=_SchemaResp, stage="strong_target_analysis"
-        )
+        client.complete_json(system="sys", user="usr", schema=_SchemaResp, profile=THINKING_OFF_32K)
     rows = db.fetchall("SELECT validation_status FROM llm_calls ORDER BY created_at")
     assert [r[0] for r in rows] == ["retry", "failed"]
 
 
 # ---------------------------------------------------------------------------
-# DoD 4 — Stage-specific max_output_tokens (F5 fix)
+# DoD 4 — Per-call max_output_tokens (from caller-supplied profile)
 # ---------------------------------------------------------------------------
 
 
-def test_stage_specific_max_output_tokens_r1_32k_final_8k(
-    client: DeepSeekClient, transport: RecordedTransport
+def test_per_call_max_output_tokens(
+    client: LLMClient, transport: RecordedTransport
 ) -> None:
-    transport.register("strong_target_analysis", _ok_response("strong_target_analysis"))
-    client.complete_json(system="s", user="u", schema=_SchemaResp, stage="strong_target_analysis")
+    transport.register(_ok_response())
+    client.complete_json(system="s", user="u", schema=_SchemaResp, profile=THINKING_OFF_32K)
     assert transport.last_call_kwargs["max_tokens"] == 32768
 
-    transport.register("final_ranking", _ok_response("final_ranking"))
-    client.complete_json(system="s", user="u", schema=_SchemaResp, stage="final_ranking")
+    transport.register(_ok_response())
+    client.complete_json(system="s", user="u", schema=_SchemaResp, profile=THINKING_ON_8K)
     assert transport.last_call_kwargs["max_tokens"] == 8192
 
 
 # ---------------------------------------------------------------------------
-# DoD 5 — Fast profile disables thinking for ALL stages (F3 fix)
+# DoD 5 — Profile.thinking flag is wired through the transport
 # ---------------------------------------------------------------------------
 
 
-def test_fast_profile_disables_thinking_for_all_stages(
-    db: Database, transport: RecordedTransport
+def test_thinking_off_passes_thinking_false(
+    client: LLMClient, transport: RecordedTransport
 ) -> None:
-    cli = DeepSeekClient(db, transport, model="deepseek-v4-pro", profiles=PROFILES_DEFAULT["fast"])
-    for stage in KNOWN_STAGES:
-        transport.register(stage, _ok_response(stage))
-        cli.complete_json(system="s", user="u", schema=_SchemaResp, stage=stage)
-        assert transport.last_call_kwargs["thinking"] is False, (
-            f"fast profile must disable thinking; stage={stage}"
-        )
-
-
-def test_balanced_profile_disables_r1_only(db: Database, transport: RecordedTransport) -> None:
-    cli = DeepSeekClient(
-        db, transport, model="deepseek-v4-pro", profiles=PROFILES_DEFAULT["balanced"]
-    )
-    transport.register("strong_target_analysis", _ok_response("strong_target_analysis"))
-    cli.complete_json(system="s", user="u", schema=_SchemaResp, stage="strong_target_analysis")
+    transport.register(_ok_response())
+    client.complete_json(system="s", user="u", schema=_SchemaResp, profile=THINKING_OFF_32K)
     assert transport.last_call_kwargs["thinking"] is False
 
-    transport.register("continuation_prediction", _ok_response("continuation_prediction"))
-    cli.complete_json(system="s", user="u", schema=_SchemaResp, stage="continuation_prediction")
-    assert transport.last_call_kwargs["thinking"] is True
 
-
-def test_quality_profile_enables_thinking_for_all(
-    db: Database, transport: RecordedTransport
+def test_thinking_on_passes_thinking_true(
+    client: LLMClient, transport: RecordedTransport
 ) -> None:
-    cli = DeepSeekClient(
-        db, transport, model="deepseek-v4-pro", profiles=PROFILES_DEFAULT["quality"]
-    )
-    for stage in KNOWN_STAGES:
-        transport.register(stage, _ok_response(stage))
-        cli.complete_json(system="s", user="u", schema=_SchemaResp, stage=stage)
-        assert transport.last_call_kwargs["thinking"] is True
+    transport.register(_ok_response())
+    client.complete_json(system="s", user="u", schema=_SchemaResp, profile=THINKING_ON_32K)
+    assert transport.last_call_kwargs["thinking"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -216,10 +197,10 @@ def test_quality_profile_enables_thinking_for_all(
 
 
 def test_no_tools_param_passed_through_transport(
-    client: DeepSeekClient, transport: RecordedTransport
+    client: LLMClient, transport: RecordedTransport
 ) -> None:
-    transport.register("strong_target_analysis", _ok_response("strong_target_analysis"))
-    client.complete_json(system="s", user="u", schema=_SchemaResp, stage="strong_target_analysis")
+    transport.register(_ok_response())
+    client.complete_json(system="s", user="u", schema=_SchemaResp, profile=THINKING_OFF_32K)
     forbidden = {"tools", "tool_choice", "functions", "function_call"}
     assert not (forbidden & set(transport.last_call_kwargs.keys()))
 
@@ -247,21 +228,20 @@ def test_llm_transport_abc_has_no_tool_methods() -> None:
 
 
 def test_complete_json_persists_llm_calls_record(
-    client: DeepSeekClient, transport: RecordedTransport, db: Database
+    client: LLMClient, transport: RecordedTransport, db: Database
 ) -> None:
     """M4: by default audit is LEAN — DB row carries hash + truncated payload only.
     Full prompt/response always go to reports/<run_id>/llm_calls.jsonl."""
-    transport.register("strong_target_analysis", _ok_response("strong_target_analysis"))
+    transport.register(_ok_response())
     client.complete_json(
-        system="my-system", user="my-user", schema=_SchemaResp, stage="strong_target_analysis"
+        system="my-system", user="my-user", schema=_SchemaResp, profile=THINKING_OFF_32K
     )
     row = db.fetchone(
-        "SELECT stage, model, prompt_hash, input_tokens, output_tokens, "
+        "SELECT model, prompt_hash, input_tokens, output_tokens, "
         "validation_status, request_json, response_json FROM llm_calls"
     )
     assert row is not None
-    stage, model, ph, in_t, out_t, vs, req_json, resp_json = row
-    assert stage == "strong_target_analysis"
+    model, ph, in_t, out_t, vs, req_json, resp_json = row
     assert model == "deepseek-v4-pro"
     assert len(ph) == 64
     assert in_t == 120
@@ -279,19 +259,15 @@ def test_complete_json_full_audit_mode_keeps_payload(
     db: Database, transport: RecordedTransport
 ) -> None:
     """M4: opt-in full mode keeps original system/user/response in the row."""
-    cli = DeepSeekClient(
+    cli = LLMClient(
         db,
         transport,
         model="deepseek-v4-pro",
-        profiles=PROFILES_DEFAULT["balanced"],
         audit_full_payload=True,
     )
-    transport.register("strong_target_analysis", _ok_response("strong_target_analysis"))
+    transport.register(_ok_response())
     cli.complete_json(
-        system="full-system",
-        user="full-user",
-        schema=_SchemaResp,
-        stage="strong_target_analysis",
+        system="full-system", user="full-user", schema=_SchemaResp, profile=THINKING_OFF_32K
     )
     row = db.fetchone("SELECT request_json FROM llm_calls")
     assert row is not None
@@ -301,47 +277,35 @@ def test_complete_json_full_audit_mode_keeps_payload(
 
 
 # ---------------------------------------------------------------------------
-# DoD 8 — RecordedTransport replays deterministically
+# DoD 8 — RecordedTransport replays FIFO
 # ---------------------------------------------------------------------------
 
 
-def test_recorded_transport_replays_response_deterministically(
+def test_recorded_transport_replays_fifo(
     db: Database, transport: RecordedTransport
 ) -> None:
-    cli = DeepSeekClient(
-        db, transport, model="deepseek-v4-pro", profiles=PROFILES_DEFAULT["balanced"]
-    )
-    transport.register("strong_target_analysis", _ok_response("strong_target_analysis", n=3))
-    transport.register("strong_target_analysis", _ok_response("strong_target_analysis", n=5))
+    cli = LLMClient(db, transport, model="deepseek-v4-pro")
+    transport.register(_ok_response(n=3))
+    transport.register(_ok_response(n=5))
 
     obj1, _ = cli.complete_json(
-        system="s", user="u", schema=_SchemaResp, stage="strong_target_analysis"
+        system="s", user="u", schema=_SchemaResp, profile=THINKING_OFF_32K
     )
     obj2, _ = cli.complete_json(
-        system="s2", user="u2", schema=_SchemaResp, stage="strong_target_analysis"
+        system="s2", user="u2", schema=_SchemaResp, profile=THINKING_OFF_32K
     )
     assert len(obj1.candidates) == 3
     assert len(obj2.candidates) == 5
 
 
 # ---------------------------------------------------------------------------
-# DoD 9 — unknown stage raises
-# ---------------------------------------------------------------------------
-
-
-def test_unknown_stage_raises(client: DeepSeekClient) -> None:
-    with pytest.raises(LLMUnknownStageError):
-        client.complete_json(system="s", user="u", schema=_SchemaResp, stage="bogus_stage_name")
-
-
-# ---------------------------------------------------------------------------
-# DoD 10 — Transport error retried by tenacity
+# DoD 9 — Transport error retried by tenacity
 # ---------------------------------------------------------------------------
 
 
 def test_transport_error_retried_by_tenacity(db: Database, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        DeepSeekClient._transport_call.retry,  # type: ignore[attr-defined]
+        LLMClient._transport_call.retry,  # type: ignore[attr-defined]
         "sleep",
         lambda *_: None,
     )
@@ -354,27 +318,25 @@ def test_transport_error_retried_by_tenacity(db: Database, monkeypatch: pytest.M
             if self.fail_left > 0:
                 self.fail_left -= 1
                 raise LLMTransportError("503")
-            return _ok_response("strong_target_analysis")
+            return _ok_response()
 
-    cli = DeepSeekClient(
-        db, Flaky(), model="deepseek-v4-pro", profiles=PROFILES_DEFAULT["balanced"]
-    )
+    cli = LLMClient(db, Flaky(), model="deepseek-v4-pro")
     obj, _ = cli.complete_json(
-        system="s", user="u", schema=_SchemaResp, stage="strong_target_analysis"
+        system="s", user="u", schema=_SchemaResp, profile=THINKING_OFF_32K
     )
     assert isinstance(obj, _SchemaResp)
 
 
 # ---------------------------------------------------------------------------
-# DoD 11 — Reasoning effort wired per stage
+# DoD 10 — reasoning_effort flows through from profile to transport
 # ---------------------------------------------------------------------------
 
 
-def test_reasoning_effort_per_stage(client: DeepSeekClient, transport: RecordedTransport) -> None:
-    transport.register("strong_target_analysis", _ok_response("strong_target_analysis"))
-    client.complete_json(system="s", user="u", schema=_SchemaResp, stage="strong_target_analysis")
+def test_reasoning_effort_flows_through(client: LLMClient, transport: RecordedTransport) -> None:
+    transport.register(_ok_response())
+    client.complete_json(system="s", user="u", schema=_SchemaResp, profile=THINKING_OFF_32K)
     assert transport.last_call_kwargs["reasoning_effort"] == "medium"
 
-    transport.register("continuation_prediction", _ok_response("continuation_prediction"))
-    client.complete_json(system="s", user="u", schema=_SchemaResp, stage="continuation_prediction")
+    transport.register(_ok_response())
+    client.complete_json(system="s", user="u", schema=_SchemaResp, profile=THINKING_ON_32K)
     assert transport.last_call_kwargs["reasoning_effort"] == "high"

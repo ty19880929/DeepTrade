@@ -1,8 +1,12 @@
 """LubRuntime — context bundle the plugin's pipeline runs against.
 
 Replaces the old framework-provided ``StrategyContext``. The plugin owns its
-own runtime now: it constructs db / config / tushare / llm clients itself,
-and the runner threads ``run_id`` through.
+own runtime now: it constructs db / config / tushare itself, and obtains LLM
+clients on-demand from the framework's :class:`LLMManager`.
+
+v0.6 — ``llm: DeepSeekClient`` field removed. ``llms: LLMManager`` is the
+new framework hand-off; runner / pipeline pull a per-provider ``LLMClient``
+via ``rt.llms.get_client(name, plugin_id=, run_id=)``.
 """
 
 from __future__ import annotations
@@ -16,7 +20,7 @@ from deeptrade.plugins_api.events import EventLevel, EventType, StrategyEvent
 if TYPE_CHECKING:  # pragma: no cover
     from deeptrade.core.config import ConfigService
     from deeptrade.core.db import Database
-    from deeptrade.core.deepseek_client import DeepSeekClient
+    from deeptrade.core.llm_manager import LLMManager
     from deeptrade.core.tushare_client import TushareClient
     from deeptrade.plugins_api.notify import NotificationPayload
 
@@ -29,18 +33,19 @@ PLUGIN_ID = "limit-up-board"
 class LubRuntime:
     """Services bundle the plugin's run() / sync_data() use.
 
-    Mirrors the old ``StrategyContext`` shape so existing pipeline code can
-    reference ``ctx.db``, ``ctx.config``, ``ctx.tushare``, ``ctx.llm``,
-    ``ctx.run_id``, ``ctx.emit(...)``, ``ctx.notify(...)`` unchanged.
+    ``llms`` is the framework's LLMManager — call
+    ``rt.llms.get_client(name, plugin_id=rt.plugin_id, run_id=rt.run_id, ...)``
+    to obtain a per-provider client. The plugin may use multiple providers
+    in the same run.
     """
 
     db: Database
     config: ConfigService
+    llms: LLMManager
     plugin_id: str = PLUGIN_ID
     run_id: str | None = None
     is_intraday: bool = False
     tushare: TushareClient | None = None
-    llm: DeepSeekClient | None = None
 
     def emit(
         self,
@@ -100,31 +105,21 @@ def build_tushare_client(
     )
 
 
-def build_llm_client(rt: LubRuntime) -> DeepSeekClient:
-    """Construct a DeepSeekClient bound to this plugin's run_id."""
-    from pathlib import Path
+def pick_llm_provider(rt: LubRuntime) -> str:
+    """Pick which configured LLM provider to use for this run.
 
-    from deeptrade.core import paths
-    from deeptrade.core.deepseek_client import DeepSeekClient, OpenAIClientTransport
+    v0.6 policy: prefer ``deepseek`` (the original default and the target of
+    the legacy-config auto-migration), else fall back to the first available
+    provider. v0.7 will let the user override via a plugin-level config key
+    such as ``limit-up-board.default_llm``.
 
-    api_key = rt.config.get("deepseek.api_key")
-    if not api_key:
-        raise RuntimeError("deepseek.api_key not configured; run `deeptrade config set-deepseek`")
-    cfg = rt.config.get_app_config()
-    profiles = rt.config.get_profile()
-    transport = OpenAIClientTransport(
-        api_key=str(api_key),
-        base_url=cfg.deepseek_base_url,
-        timeout=cfg.deepseek_timeout,
-    )
-    reports_dir: Path | None = paths.reports_dir() / rt.run_id if rt.run_id else None
-    return DeepSeekClient(
-        rt.db,
-        transport,
-        model=cfg.deepseek_model,
-        profiles=profiles,
-        plugin_id=rt.plugin_id,
-        run_id=rt.run_id,
-        audit_full_payload=cfg.deepseek_audit_full_payload,
-        reports_dir=reports_dir,
-    )
+    Raises ``RuntimeError`` if no provider is configured at all.
+    """
+    available = rt.llms.list_providers()
+    if not available:
+        raise RuntimeError(
+            "No LLM provider configured; run `deeptrade config set-llm`"
+        )
+    if "deepseek" in available:
+        return "deepseek"
+    return available[0]

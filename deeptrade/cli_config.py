@@ -1,10 +1,17 @@
 """`deeptrade config` subcommand group.
 
-V0.2 wires show/set/test. V0.3/V0.4 will replace the inline `test` probes
-with proper TushareClient / DeepSeekClient calls.
+v0.6 — multi-provider LLM (DESIGN §0.7 / §10):
+
+    * ``set-deepseek`` removed; replaced by ``set-llm`` (interactive new /
+      edit / delete) + ``list-llm``.
+    * ``config test`` replaced by ``test-llm [name]`` (provider-targeted).
+    * ``show`` expands ``llm.providers`` so each provider's api_key gets its
+      own masked row.
 """
 
 from __future__ import annotations
+
+from typing import TYPE_CHECKING
 
 import questionary
 import typer
@@ -17,6 +24,9 @@ from deeptrade.core.config import (
     known_keys,
 )
 from deeptrade.core.db import Database
+
+if TYPE_CHECKING:  # pragma: no cover
+    pass
 
 app = typer.Typer(help="View / edit configuration", no_args_is_help=True)
 
@@ -62,13 +72,20 @@ def cmd_show() -> None:
 
 @app.command("set")
 def cmd_set(
-    key: str = typer.Argument(..., help="Dotted key (e.g. `deepseek.profile`)"),
+    key: str = typer.Argument(..., help="Dotted key (e.g. `app.profile`)"),
     value: str = typer.Argument(..., help="Value (string-coerced)"),
 ) -> None:
-    """Set a single config key to a value (scriptable form)."""
+    """Set a single config key to a value (scriptable form).
+
+    For multi-provider LLM keys (``llm.<name>.*``), prefer
+    ``deeptrade config set-llm`` — it walks you through the full provider
+    record interactively.
+    """
     db, svc = _open_service()
     try:
-        if key not in known_keys():
+        from deeptrade.core.config import is_secret_key  # noqa: PLC0415
+
+        if key not in known_keys() and not is_secret_key(key):
             typer.echo(f"Unknown key: {key!r}; valid keys:\n  " + "\n  ".join(known_keys()))
             raise typer.Exit(2)
         try:
@@ -111,130 +128,268 @@ def cmd_set_tushare() -> None:
         db.close()
 
 
-@app.command("set-deepseek")
-def cmd_set_deepseek() -> None:
-    """Interactive DeepSeek configuration."""
+# ---------------------------------------------------------------------------
+# LLM provider management (v0.6)
+# ---------------------------------------------------------------------------
+
+
+_DEFAULT_BASE_URLS: dict[str, str] = {
+    "deepseek": "https://api.deepseek.com",
+    "qwen": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "kimi": "https://api.moonshot.cn/v1",
+    "doubao": "https://ark.cn-beijing.volces.com/api/v3",
+}
+
+
+@app.command("set-llm")
+def cmd_set_llm() -> None:
+    """Interactive LLM provider management (new / edit / delete).
+
+    Walks the user through the full provider record (name + api_key +
+    base_url + model + timeout). Each provider stored in ``llm.providers``
+    is independently usable; plugins pick by name via
+    ``LLMManager.get_client(name=...)``.
+    """
     db, svc = _open_service()
     try:
-        cur = svc.get_app_config()
-        api_key = questionary.password("DeepSeek API key:").ask()
-        if api_key is None:
-            raise typer.Exit(1)
-        base_url = questionary.text(
-            f"Base URL [{cur.deepseek_base_url}]:",
-            default=cur.deepseek_base_url,
-        ).ask()
-        model = questionary.text(
-            f"Model [{cur.deepseek_model}]:",
-            default=cur.deepseek_model,
-        ).ask()
-        profile = questionary.select(
-            f"Profile [{cur.deepseek_profile}]:",
-            choices=["fast", "balanced", "quality"],
-            default=cur.deepseek_profile,
-        ).ask()
-        if profile is None:
-            raise typer.Exit(1)
-        if api_key:
-            svc.set("deepseek.api_key", api_key)
-        svc.set("deepseek.base_url", base_url or cur.deepseek_base_url)
-        svc.set("deepseek.model", model or cur.deepseek_model)
-        svc.set("deepseek.profile", profile)
-        typer.echo("✔ Saved deepseek config")
+        cfg = svc.get_app_config()
+        existing = sorted(cfg.llm_providers.keys())
+
+        if existing:
+            choices = ["[+] Add new provider"] + [f"[~] {n}" for n in existing] + ["[x] Delete a provider"]
+            picked = questionary.select(
+                "Pick action:", choices=choices
+            ).ask()
+            if picked is None:
+                raise typer.Exit(1)
+            if picked.startswith("[+]"):
+                _set_llm_new(svc)
+            elif picked.startswith("[x]"):
+                _set_llm_delete(svc, existing)
+            else:
+                name = picked[4:]  # strip "[~] "
+                _set_llm_edit(svc, name)
+        else:
+            typer.echo("No LLM providers configured yet — let's add the first one.")
+            _set_llm_new(svc)
+    finally:
+        db.close()
+
+
+def _set_llm_new(svc: ConfigService) -> None:
+    name = questionary.text(
+        "Provider name (e.g. deepseek, qwen-plus, kimi):"
+    ).ask()
+    if not name:
+        raise typer.Exit(1)
+    name = name.strip()
+    if "." in name:
+        typer.echo(f"Invalid provider name: {name!r} (must not contain '.')")
+        raise typer.Exit(2)
+    cfg = svc.get_app_config()
+    if name in cfg.llm_providers:
+        typer.echo(f"Provider {name!r} already exists; pick edit instead.")
+        raise typer.Exit(2)
+    default_base = _DEFAULT_BASE_URLS.get(name.split("-")[0], "")
+    _prompt_and_save_provider(svc, name, defaults=None, default_base_url=default_base)
+
+
+def _set_llm_edit(svc: ConfigService, name: str) -> None:
+    cfg = svc.get_app_config()
+    cur = cfg.llm_providers[name]
+    _prompt_and_save_provider(svc, name, defaults=cur.model_dump(), default_base_url=cur.base_url)
+
+
+def _prompt_and_save_provider(
+    svc: ConfigService,
+    name: str,
+    *,
+    defaults: dict | None,
+    default_base_url: str,
+) -> None:
+    base_url_default = defaults.get("base_url", default_base_url) if defaults else default_base_url
+    model_default = defaults.get("model", "") if defaults else ""
+    timeout_default = defaults.get("timeout", 180) if defaults else 180
+
+    base_url = questionary.text(
+        f"Base URL [{base_url_default}]:",
+        default=base_url_default,
+    ).ask()
+    if not base_url:
+        raise typer.Exit(1)
+    model = questionary.text(
+        f"Model name [{model_default}]:",
+        default=model_default,
+    ).ask()
+    if not model:
+        raise typer.Exit(1)
+    timeout_input = questionary.text(
+        f"Timeout (s) [{timeout_default}]:",
+        default=str(timeout_default),
+    ).ask()
+    if timeout_input is None:
+        raise typer.Exit(1)
+    try:
+        timeout = int(timeout_input)
+    except ValueError as e:
+        typer.echo(f"Invalid timeout: {e}")
+        raise typer.Exit(2) from e
+
+    api_key_prompt = (
+        "API key (leave empty to keep existing):"
+        if defaults is not None
+        else "API key:"
+    )
+    api_key = questionary.password(api_key_prompt).ask()
+    if api_key is None:
+        raise typer.Exit(1)
+
+    try:
+        svc.set_llm_provider(
+            name,
+            base_url=base_url,
+            model=model,
+            timeout=timeout,
+            api_key=api_key if api_key else None,
+        )
+    except ValueError as e:
+        typer.echo(f"Invalid provider: {e}")
+        raise typer.Exit(2) from e
+
+    if defaults is None and not api_key:
+        typer.echo(
+            f"⚠ Saved provider {name!r} but no api_key was set — it won't appear "
+            "in `list-llm` until you run set-llm again to add the key."
+        )
+    else:
+        typer.echo(f"✔ Saved LLM provider {name!r}")
+
+
+def _set_llm_delete(svc: ConfigService, existing: list[str]) -> None:
+    name = questionary.select("Pick provider to delete:", choices=existing).ask()
+    if name is None:
+        raise typer.Exit(1)
+    confirm = questionary.confirm(
+        f"Delete provider {name!r} (and its api_key)?", default=False
+    ).ask()
+    if not confirm:
+        raise typer.Exit(1)
+    svc.delete_llm_provider(name)
+    typer.echo(f"✔ Deleted LLM provider {name!r}")
+
+
+@app.command("list-llm")
+def cmd_list_llm() -> None:
+    """List all configured LLM providers (those with ``api_key`` set).
+
+    Mirrors ``LLMManager.list_providers()`` — what plugins will see.
+    """
+    db, _svc = _open_service()
+    try:
+        from deeptrade.core.config import ConfigService  # noqa: PLC0415
+        from deeptrade.core.llm_manager import LLMManager  # noqa: PLC0415
+
+        cfg = ConfigService(db)
+        mgr = LLMManager(db, cfg)
+        names = mgr.list_providers()
+        if not names:
+            typer.echo("(no LLM providers configured; run `deeptrade config set-llm`)")
+            return
+
+        console = Console()
+        table = Table(title="LLM Providers")
+        table.add_column("Name", style="cyan")
+        table.add_column("Model", overflow="fold")
+        table.add_column("Base URL", overflow="fold")
+        for name in names:
+            info = mgr.get_provider_info(name)
+            table.add_row(info.name, info.model, info.base_url)
+        console.print(table)
     finally:
         db.close()
 
 
 # ---------------------------------------------------------------------------
-# test
+# test-llm
 # ---------------------------------------------------------------------------
 
 
-def _test_tushare(svc: ConfigService, db) -> tuple[bool, str]:  # noqa: ANN001
-    """B3.6 — go through the production TushareClient so the call benefits from
-    rate limiting, error translation, audit logging."""
-    token = svc.get("tushare.token")
-    if not token:
-        return False, "tushare.token not configured"
+@app.command("test-llm")
+def cmd_test_llm(
+    name: str | None = typer.Argument(
+        None,
+        help="Provider name to test; omit to test every configured provider.",
+    ),
+) -> None:
+    """Connectivity check via the production ``LLMClient`` for one or all providers.
+
+    Each test sends a tiny JSON-mode echo through the cheapest stage profile
+    (``final_ranking``) so the no-tools / JSON-mode constraints are exercised.
+    """
+    db, _svc = _open_service()
     try:
-        import time as _time  # noqa: PLC0415
+        from deeptrade.core.config import ConfigService  # noqa: PLC0415
+        from deeptrade.core.llm_manager import LLMManager  # noqa: PLC0415
 
-        from deeptrade.core.tushare_client import (  # noqa: PLC0415
-            FRAMEWORK_PLUGIN_ID,
-            TushareClient,
-            TushareSDKTransport,
-        )
+        cfg = ConfigService(db)
+        mgr = LLMManager(db, cfg)
 
-        cfg = svc.get_app_config()
-        transport = TushareSDKTransport(str(token))
-        client = TushareClient(
-            db, transport, plugin_id=FRAMEWORK_PLUGIN_ID, rps=cfg.tushare_rps
-        )
-        t0 = _time.time()
-        df = client.call("stock_basic", fields="ts_code")
-        latency_ms = int((_time.time() - t0) * 1000)
-        rows = 0 if df is None else len(df)
-        return True, f"stock_basic returned {rows} rows in {latency_ms}ms"
-    except Exception as e:  # noqa: BLE001
-        return False, f"{type(e).__name__}: {e}"
+        if name is not None:
+            targets = [name]
+        else:
+            targets = mgr.list_providers()
+            if not targets:
+                typer.echo("(no LLM providers configured; run `deeptrade config set-llm`)")
+                raise typer.Exit(1)
+
+        any_failed = False
+        for target in targets:
+            ok, msg = _test_one_llm(mgr, target)
+            marker = "✔" if ok else "✘"
+            typer.echo(f"{marker} LLM[{target}]: {msg}")
+            if not ok:
+                any_failed = True
+        if any_failed:
+            raise typer.Exit(1)
+    finally:
+        db.close()
 
 
-def _test_deepseek(svc: ConfigService, db) -> tuple[bool, str]:  # noqa: ANN001
-    """B3.6 — go through DeepSeekClient with a stage-aware 1-token echo so the
-    production no-tools / JSON-mode constraints are exercised."""
-    api_key = svc.get("deepseek.api_key")
-    if not api_key:
-        return False, "deepseek.api_key not configured"
+def _test_one_llm(mgr, target: str) -> tuple[bool, str]:  # type: ignore[no-untyped-def]
+    """Echo a 1-token JSON via a minimal StageProfile through the production client."""
+    import time as _time  # noqa: PLC0415
+
+    from pydantic import BaseModel, ConfigDict  # noqa: PLC0415
+
+    from deeptrade.core.llm_manager import LLMNotConfiguredError  # noqa: PLC0415
+    from deeptrade.plugins_api import StageProfile  # noqa: PLC0415
+
+    class _Echo(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        ok: bool
+
     try:
-        import time as _time  # noqa: PLC0415
+        client = mgr.get_client(target, plugin_id="__framework__", run_id=None)
+    except LLMNotConfiguredError as e:
+        return False, str(e)
 
-        from pydantic import BaseModel, ConfigDict  # noqa: PLC0415
-
-        from deeptrade.core.deepseek_client import (  # noqa: PLC0415
-            DeepSeekClient,
-            OpenAIClientTransport,
-        )
-
-        class _Echo(BaseModel):
-            model_config = ConfigDict(extra="forbid")
-            ok: bool
-
-        cfg = svc.get_app_config()
-        profiles = svc.get_profile()
-        transport = OpenAIClientTransport(
-            api_key=str(api_key),
-            base_url=cfg.deepseek_base_url,
-            timeout=cfg.deepseek_timeout,
-        )
-        client = DeepSeekClient(db, transport, model=cfg.deepseek_model, profiles=profiles)
+    # v0.7: framework owns no profile presets; supply a minimal echo-friendly
+    # profile directly. thinking off + tiny output cap keeps the test cheap.
+    echo_profile = StageProfile(
+        thinking=False, reasoning_effort="low", temperature=0.0, max_output_tokens=1024
+    )
+    try:
         t0 = _time.time()
         client.complete_json(
             system='Reply ONLY with this JSON: {"ok": true}',
             user="ping",
             schema=_Echo,
-            stage="final_ranking",  # cheapest stage profile
+            profile=echo_profile,
         )
         latency_ms = int((_time.time() - t0) * 1000)
         return True, f"echo ok ({latency_ms}ms)"
     except Exception as e:  # noqa: BLE001
         return False, f"{type(e).__name__}: {e}"
-
-
-@app.command("test")
-def cmd_test() -> None:
-    """End-to-end connectivity check via the production clients (B3.6)."""
-    db, svc = _open_service()
-    try:
-        ok_t, msg_t = _test_tushare(svc, db)
-        marker_t = "✔" if ok_t else "✘"
-        typer.echo(f"{marker_t} Tushare: {msg_t}")
-        ok_d, msg_d = _test_deepseek(svc, db)
-        marker_d = "✔" if ok_d else "✘"
-        typer.echo(f"{marker_d} DeepSeek: {msg_d}")
-        if not (ok_t and ok_d):
-            raise typer.Exit(1)
-    finally:
-        db.close()
 
 
 # Note: cmd_set passes raw strings; Pydantic field validators in AppConfig

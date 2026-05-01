@@ -1,15 +1,15 @@
 # DeepTrade 设计文档
 
 > 基于 LLM 与多策略的 A 股沪深主板选股 CLI 工具
-> 文档版本 v0.5 · 2026-04-30
+> 文档版本 v0.6 · 2026-05-01
 >
 > 免责声明：本工具仅用于策略研究、数据整理与候选标的分析，不构成投资建议，不进行自动交易。
 
 ---
 
-## 0. v0.5 架构修订（破坏式重构，无兼容性）
+## 0. v0.5 / v0.6 架构修订（破坏式重构，无兼容性）
 
-> 本节是 v0.5 重塑的权威摘要。**与下文 §2–§18 中具体描述存在冲突时，以本节为准**；§2–§18 保留为历史设计参考与各子系统的细节说明。完整决策记录见 [`docs/plugin_cli_dispatch_evaluation.md`](docs/plugin_cli_dispatch_evaluation.md) v0.3。
+> 本节是 v0.5 + v0.6 重塑的权威摘要。**与下文 §2–§18 中具体描述存在冲突时，以本节为准**；§2–§18 保留为历史设计参考与各子系统的细节说明。完整决策记录：v0.5 见 [`docs/plugin_cli_dispatch_evaluation.md`](docs/plugin_cli_dispatch_evaluation.md) v0.3；v0.6 LLM Manager 化见 §0.7 + §10。
 
 ### 0.1 框架命令面（封闭）
 
@@ -17,7 +17,7 @@
 deeptrade --version | -V
 deeptrade --help    | -h         # 仅展示框架命令；不枚举插件子命令
 deeptrade init [--no-prompts]
-deeptrade config {show, set, set-tushare, set-deepseek, test}
+deeptrade config {show, set, set-tushare, set-llm, list-llm, test-llm}
 deeptrade plugin {install, list, info, enable, disable, uninstall, upgrade}
 deeptrade data sync ...           # 临时禁用 stub，下版本恢复
 deeptrade <plugin_id> <argv...>   # 纯透传：framework → plugin.dispatch(argv)
@@ -87,8 +87,71 @@ with notification_session(db) as ns:        # 批量
 - §6.2 "Shared market tables"（`stock_basic / daily / ...`）→ 不再共享，每插件自带 `<prefix>_*`
 - §9 Live TUI dashboard → 删除；插件自行打印进度
 - `deeptrade strategy run` / `strategy history` / `strategy report` / `channel test` → 不存在；由插件自管
+- `DeepSeekClient` 类与 `core/deepseek_client.py` 模块 → v0.6 改名为 `LLMClient` / `core/llm_client.py`，并由新 `LLMManager` 统一构造（详见 §0.7 与 §10）
 
 阅读本文档时请把 §0 视作首要权威，§2–§18 视作各子系统设计意图与历史决策的注释。
+
+### 0.7 v0.6 LLM Manager 化（多 Provider）
+
+> 把 LLM 从"DeepSeek 专属客户端"抬升为**框架层基础能力**：多 provider 同时存在，按名取用；单一插件可同时调用多个 LLM。完整规格见 §10。
+
+**核心变化：**
+
+- 配置模型从 `deepseek.*` 改为 `llm.*`：
+  - `llm.providers` (JSON dict, app_config) — `{name: {base_url, model, timeout}}`
+  - `llm.<name>.api_key` (secret_store) — 每 provider 一把 key
+  - `llm.audit_full_payload` (app_config bool) — 取代 `deepseek.audit_full_payload`
+  - **没有 `llm.default`** — 调用方必须显式指定 provider 名
+- 新增框架层服务 `core/llm_manager.py::LLMManager`：
+  ```python
+  class LLMManager:
+      def list_providers(self) -> list[str]:                   # 仅返回 api_key 已配的
+      def get_provider_info(self, name: str) -> LLMProviderInfo:  # name/model/base_url
+      def get_client(self, name, *, plugin_id, run_id, reports_dir=None) -> LLMClient
+  ```
+  按 `(name, plugin_id, run_id)` 缓存客户端实例；**非线程安全**（doc 注明，并发场景需多实例或外部加锁）。
+- `core/deepseek_client.py` → `core/llm_client.py`；`DeepSeekClient` → `LLMClient`；`OpenAIClientTransport` 名称保留（OpenAI 兼容协议 transport 是其真实身份）。
+- 假定所有 provider 都走 OpenAI 兼容协议（DeepSeek/Qwen/Kimi/Doubao/GLM/Yi/SiliconFlow/OpenRouter 等）；真正异构（Anthropic native / Gemini native）等出现需求时再引入 `type=llm-transport` 插件类型，本版不做。
+- Stage profile（`fast/balanced/quality`）保持全局，与 provider 正交：transport 对不支持的 thinking/reasoning_effort 字段静默丢弃。
+- `KNOWN_STAGES` 仍硬编码（`strong_target_analysis / continuation_prediction / final_ranking`）—— **登记为已知技术债**，v0.7 已偿还（见 §0.8）。
+- CLI：删除 `set-deepseek` 与 `config test`；新增 `set-llm`（交互式新建/修改/删除）、`list-llm`、`test-llm [name]`。
+- 内建策略 `volume-anomaly` / `limit-up-board` 的 `runtime.py` 移除各自 `build_llm_client`；改用 `rt.llms: LLMManager` 字段，调用 `rt.llms.get_client(name, plugin_id=, run_id=)`。
+- DB 迁移：开启时若发现遗留 `deepseek.*` 键，幂等迁移成 `llm.providers["deepseek"]` + `llm.deepseek.api_key` + `llm.audit_full_payload`，并删除遗留键。
+
+### 0.8 v0.7 Stage 概念归插件 + 配置键改名
+
+> 偿还 v0.6 RV6-4 / §10.2 已知技术债：把 stage 名字、preset → stage tuning 表彻底从框架剔除，归插件自维护；同步把全局 preset 键 `deepseek.profile` 改名为 vendor-agnostic 的 `app.profile`。
+
+**核心变化：**
+
+- **删除 `core.llm_client.KNOWN_STAGES` / `LLMUnknownStageError` / `_stage_profile()` / `_CURRENT_STAGE`**。框架对 stage 名字一无所知。
+- `LLMClient.complete_json` 签名变化：删 `stage: str` 入参；新增必填 `profile: StageProfile`；调用方直接传入已解析的调参档。`LLMClient.__init__` 也删除 `profiles=` 入参，`LLMManager.get_client()` 不再绑 profile。
+- **删除 `core.config.DS_STAGES` / `DeepSeekProfileSet` / `PROFILES_DEFAULT` / `ConfigService.get_profile()`**。
+- `StageProfile` 升格为公共契约，搬到 `deeptrade.plugins_api.llm`；`from deeptrade.plugins_api import StageProfile` 是插件作者唯一需要 import 的 LLM 调参类型。
+- 配置键改名：`deepseek.profile` → `app.profile`。`AppConfig.deepseek_profile` 字段同名重命名为 `app_profile`。preset 仍是 `Literal["fast","balanced","quality"]`，语义保持全局。
+- DB 行幂等迁移：`config_migrations.migrate_legacy_deepseek_profile_key`。
+- **环境变量直接断代**：`DEEPTRADE_DEEPSEEK_PROFILE` 不再被识别；启动时若旧 env 设而新 env 未设，`get_app_config()` 抛 `RuntimeError` 退出（避免静默回落到默认 "balanced"）。
+- DB schema：新增 `20260501_002_drop_llm_calls_stage.sql` 删除 `llm_calls.stage` 列；`20260427_001_init.sql` 同步去掉该字段，让 fresh DB 直接落到目标状态。
+- `RecordedTransport` 改为纯 FIFO：`register(response)` 不再携带 stage 标签。
+- 内建插件改造：每个插件新增 `<plugin>/profiles.py`（preset → stage tuning 表 + `resolve_profile(preset, stage)` 解析函数）；`runner.py` 读取 `cfg.app_profile` 字符串，传给 pipeline；pipeline 调用 `resolve_profile()` 拿 `StageProfile`。volume-anomaly 借此把语义错误的 stage 名 `continuation_prediction` 改回 `trend_analysis`。
+
+**插件作者契约变化（api_version 仍为 "1"）：**
+
+```python
+from deeptrade.plugins_api import StageProfile
+
+# 插件本地 profiles.py:
+PROFILES = {
+    "fast":     {"my_stage": StageProfile(thinking=False, ...)},
+    "balanced": {"my_stage": StageProfile(thinking=True, ...)},
+    "quality":  {"my_stage": StageProfile(thinking=True, ...)},
+}
+def resolve_profile(preset: str, stage: str) -> StageProfile: ...
+
+# pipeline 内部:
+prof = resolve_profile(rt.config.get_app_config().app_profile, "my_stage")
+obj, _ = llm.complete_json(system=..., user=..., schema=..., profile=prof)
+```
 
 ---
 
@@ -439,24 +502,40 @@ CREATE TABLE IF NOT EXISTS daily_basic (
 | 类型 | 字段（key） | 存储位置 |
 |---|---|---|
 | 引导（非敏感） | `app.db_path`、`app.timezone`(`Asia/Shanghai`)、`app.locale`(`zh_CN`)、`app.log_level`、`app.close_after`(默认 `"18:00"`，§12.2 用于判定"已收盘"的时刻阈值) | `~/.deeptrade/config.toml` + `app_config` |
-| 业务（非敏感） | `tushare.rps`(默认 6)、`tushare.timeout`、`deepseek.base_url`(`https://api.deepseek.com`)、`deepseek.model`(`deepseek-v4-pro`)、`deepseek.profile`(`balanced`)、`deepseek.max_output_tokens`(8192) — profile 三档预设见 §10 | `app_config` |
-| 密钥 | `tushare.token`、`deepseek.api_key` | `secret_store` + 系统 keyring；keyring 不可用时降级到 `plaintext` 模式（CLI 显式提示风险） |
+| 业务（非敏感） | `tushare.rps`(默认 6)、`tushare.timeout`、`llm.providers`(JSON dict — 见下)、`llm.audit_full_payload`(默认 false)、`app.profile`(`balanced`，全局 preset 名；per-stage tuning 由各插件 `profiles.py` 解析，见 §10.1) | `app_config` |
+| 密钥 | `tushare.token`、`llm.<name>.api_key`（每 provider 一把） | `secret_store` + 系统 keyring；keyring 不可用时降级到 `plaintext` 模式（CLI 显式提示风险） |
+
+**`llm.providers` 形态（v0.6）**：
+
+```json
+{
+  "deepseek":  {"base_url": "https://api.deepseek.com",   "model": "deepseek-v4-pro", "timeout": 180},
+  "qwen-plus": {"base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                "model": "qwen-plus", "timeout": 180}
+}
+```
+
+- 名字（key）由用户决定，作为后续插件代码 `rt.llms.get_client(name=...)` 的标识。
+- `api_key` 不放在此字典里，单独走 `llm.<name>.api_key` → secret_store。
+- `SECRET_KEYS` 改为前缀匹配：以 `llm.` 开头且以 `.api_key` 结尾的任意 key 都视作 secret，由 ConfigService 路由到 secret_store。
+- 详见 §10 的 `LLMManager` 接口与运行时语义。
 
 ### 7.2 优先级
 
 环境变量 > `secret_store`/`app_config` > 代码默认值。
 
-环境变量映射：`DEEPTRADE_TUSHARE_TOKEN`、`DEEPTRADE_DEEPSEEK_API_KEY`、`DEEPTRADE_DEEPSEEK_MODEL` …（`DEEPTRADE_<KEY 全大写下划线>`）。
+环境变量映射：`DEEPTRADE_TUSHARE_TOKEN`、`DEEPTRADE_LLM_<NAME>_API_KEY`(逐 provider) …（`DEEPTRADE_<KEY 全大写下划线>`）。
 
 ### 7.3 子命令
 
 ```text
 deeptrade init                       # 初始化（建库、迁移、收集 token、连通性自检）
-deeptrade config show                # 表格列出当前配置（密钥脱敏）
-deeptrade config set tushare         # 交互式编辑 tushare 配置 + 实时验证
-deeptrade config set deepseek        # 交互式编辑 deepseek 配置 + 实时验证
+deeptrade config show                # 表格列出当前配置（密钥脱敏；llm.providers 展开列出每个 provider）
 deeptrade config set <key> <value>   # 直接设置（脚本化场景）
-deeptrade config test                # 全链路自检：拉一条 stock_basic + DeepSeek echo
+deeptrade config set-tushare         # 交互式编辑 tushare 配置
+deeptrade config set-llm             # 交互式新建 / 修改 / 删除某 provider
+deeptrade config list-llm            # 列出所有可用 provider（即 api_key 已配置的）
+deeptrade config test-llm [name]     # 不带 name 测全部，带则只测一个
 ```
 
 ---
@@ -821,100 +900,180 @@ EVA_THEME = Theme({
 
 ---
 
-## 10. LLM 客户端
+## 10. LLM 接入（v0.6 多 Provider + Manager）
 
-DeepSeek V4 提供 OpenAI 兼容协议（`https://api.deepseek.com`）；同时支持 `https://api.deepseek.com/anthropic`，本工具默认走 OpenAI 风格。
+> 抬升为框架层基础能力。多 provider 同时存在，由框架统一管理，插件按名取用。OpenAI 兼容协议作为单一 transport（DeepSeek/Qwen/Kimi/Doubao/GLM/Yi/SiliconFlow/OpenRouter 等都覆盖）；真正异构协议未来用 `type=llm-transport` 插件接入，本版不做。
 
-### 10.1 阶段级 Profile 配置
+### 10.0 LLMManager（框架对插件的接口）
 
-不同筛选阶段对成本/质量的偏好不同：R1 候选数大、需要稳定低成本；R2 候选少但决策关键，可开思维链；final_ranking 仅做排序合并，温度归零。
+`core/llm_manager.py` 提供唯一的 LLM 入口：
 
-```yaml
-deepseek:
-  model: deepseek-v4-pro
-  base_url: https://api.deepseek.com
-  profile: balanced            # fast | balanced | quality（默认 balanced）
-  timeout: 180
-  # 每 stage 默认 max_output_tokens 取值见各 profile（R1/R2 默认 32k 防截断；final_ranking 8k 足够）
-  profiles:
-    fast:                                # 全程低成本：R1/R2 均关 thinking
-      strong_target_analysis:    {thinking: false, reasoning_effort: medium, temperature: 0.1, max_output_tokens: 32768}
-      continuation_prediction:   {thinking: false, reasoning_effort: medium, temperature: 0.2, max_output_tokens: 32768}
-      final_ranking:             {thinking: false, reasoning_effort: medium, temperature: 0.0, max_output_tokens: 8192}
-    balanced:                    # 推荐默认：R1 关 thinking，R2/final 开
-      strong_target_analysis:    {thinking: false, reasoning_effort: medium, temperature: 0.1, max_output_tokens: 32768}
-      continuation_prediction:   {thinking: true,  reasoning_effort: high,   temperature: 0.2, max_output_tokens: 32768}
-      final_ranking:             {thinking: true,  reasoning_effort: high,   temperature: 0.0, max_output_tokens: 8192}
-    quality:                     # 全程深度推理
-      strong_target_analysis:    {thinking: true,  reasoning_effort: high,   temperature: 0.2, max_output_tokens: 32768}
-      continuation_prediction:   {thinking: true,  reasoning_effort: high,   temperature: 0.2, max_output_tokens: 32768}
-      final_ranking:             {thinking: true,  reasoning_effort: high,   temperature: 0.0, max_output_tokens: 8192}
+```python
+class LLMNotConfiguredError(Exception): ...
+
+@dataclass(frozen=True)
+class LLMProviderInfo:
+    name: str
+    model: str
+    base_url: str
+
+class LLMManager:
+    """框架层 LLM 管理器；插件通过 PluginContext / runtime 拿到此实例。
+
+    非线程安全：缓存的 LLMClient 在单线程顺序调用下复用 transport，多线程并发
+    需要外部加锁或为每线程构造独立 LLMManager。
+    """
+
+    def __init__(self, db: Database, config: ConfigService) -> None: ...
+
+    def list_providers(self) -> list[str]:
+        """返回所有【可用】 provider 名称（即 llm.providers 配置完整且
+        llm.<name>.api_key 已设）。缺 api_key 的 provider 不会出现在列表中。"""
+
+    def get_provider_info(self, name: str) -> LLMProviderInfo:
+        """元信息（不含 api_key），可日志可展示。未配置抛 LLMNotConfiguredError。"""
+
+    def get_client(
+        self,
+        name: str,
+        *,
+        plugin_id: str,
+        run_id: str | None = None,
+        reports_dir: Path | None = None,
+    ) -> LLMClient:
+        """返回直接可调用 complete_json(...) 的 LLMClient。
+        缓存 key = (name, plugin_id, run_id)：一次 run 内多次取同名 provider
+        复用 transport，避免重建 httpx 连接池。
+        未配置 / 缺 api_key 抛 LLMNotConfiguredError。"""
 ```
 
-> R1/R2 默认 32k 输出预算的依据：单批 30 只候选 × 单只 ~600 tokens（含 evidence/rationale/risk_flags/missing_data + JSON 结构开销）≈ 18k；留 ~80% 安全垫即 32k。8k 默认值会必然触发 R1 输出截断 → JSON 失败 → partial_failed。
+**关键设计取舍：**
+
+- **没有 `default` provider**：插件每次调用必须显式给名字。框架只管"清单 + 按名取"，"哪个 provider 是默认"是插件的偏好（插件可以读自己的 `<plugin>.default_llm` 配置项实现）。
+- **`list_providers()` 过滤掉缺 api_key 的项**：语义是"可用清单"，避免插件拿到一个会 401 的名字。
+- **缓存按 `(name, plugin_id, run_id)`**：一次 run 内的多次调用复用 transport。`plugin_id` 进 cache key 是为了 audit 隔离——不同插件的同名 provider 实例分开，`llm_calls.plugin_id` 列保持正确。
+
+### 10.1 阶段级 Profile 配置（v0.7：归插件维护）
+
+不同筛选阶段对成本/质量的偏好不同（R1 候选数大、需要稳定低成本；R2 候选少但决策关键，可开思维链；final_ranking 仅做排序合并，温度归零）—— 这种**阶段语义是插件域的知识，框架对其无感知**。
+
+**预设档名仍框架级，"档 → 各 stage tuning" 表归插件**：用户在框架配置 `app.profile = balanced` 选择全局档位（`fast / balanced / quality`），由各插件本地的 `profiles.py` 把这个 preset 字符串解析成具体的 `StageProfile`。同一档名在不同插件里的具体 tuning 可以不同，因为不同插件的 stage 集合本身就不同。
+
+```python
+# deeptrade/plugins_api/llm.py（公共契约）
+class StageProfile(BaseModel):
+    thinking: bool
+    reasoning_effort: Literal["low", "medium", "high"]
+    temperature: float = Field(ge=0.0, le=2.0)
+    max_output_tokens: int = Field(ge=1024, le=384_000)
+
+# limit-up-board 的 profiles.py 示例
+PROFILES: dict[str, dict[str, StageProfile]] = {
+    "fast":     {"strong_target_analysis": ..., "continuation_prediction": ..., "final_ranking": ...},
+    "balanced": {...},
+    "quality":  {...},
+}
+def resolve_profile(preset: str, stage: str) -> StageProfile: ...
+```
+
+**Profile 与 provider 正交**：profile 描述"用法档位"（thinking / reasoning_effort / temperature / max_output_tokens），与具体厂商无关。transport 对当前 provider 不支持的字段静默丢弃（OpenAI o-系列、Qwen/Kimi 思维链开关支持各异）。
+
+> R1/R2 默认 32k 输出预算的依据：单批 30 只候选 × 单只 ~600 tokens（含 evidence/rationale/risk_flags/missing_data + JSON 结构开销）≈ 18k；留 ~80% 安全垫即 32k。8k 默认值会必然触发 R1 输出截断 → JSON 失败 → partial_failed。具体 tuning 见各插件 `profiles.py`。
 
 ### 10.2 客户端实现
 
+实际运行时由 `LLMManager.get_client(name, plugin_id=, run_id=)` 构造，插件不应直接 `import LLMClient` / `OpenAIClientTransport`。下面只展示关键接口骨架（实现见 `core/llm_client.py`）：
+
 ```python
-# deeptrade/core/deepseek_client.py
-from openai import OpenAI
-from pydantic import BaseModel
-from tenacity import retry, stop_after_attempt, wait_exponential
-import json, hashlib
+# deeptrade/core/llm_client.py — v0.7
+class OpenAIClientTransport(LLMTransport):
+    """OpenAI 兼容协议 transport — 适配所有遵循 OpenAI Chat Completions
+    协议的厂商（DeepSeek/Qwen/Kimi/Doubao/GLM/Yi/SiliconFlow/OpenRouter）。
+    对当前 provider 不支持的字段（thinking 等）静默丢弃。"""
+    def __init__(self, api_key: str, base_url: str, timeout: int) -> None: ...
+    def chat(self, *, model, system, user, temperature, max_tokens,
+             thinking, reasoning_effort) -> LLMResponse: ...
 
-# 已知阶段（与 EventType 中 LLM 阶段对齐）
-KNOWN_STAGES = {"strong_target_analysis", "continuation_prediction", "final_ranking"}
-
-class DeepSeekClient:
-    def __init__(self, api_key, base_url, model, *,
-                 timeout=180, profile="balanced",
-                 profiles_cfg: dict):
-        self._cli = OpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
-        self._model = model
-        self._profile_cfg = profiles_cfg[profile]      # 当前 profile 的 stage→params 映射
-
-    @retry(stop=stop_after_attempt(3),
-           wait=wait_exponential(multiplier=2, max=30))
-    def complete_json(self, system: str, user: str,
-                      schema: type[BaseModel], *, stage: str) -> tuple[BaseModel, dict]:
-        assert stage in KNOWN_STAGES, f"unknown stage: {stage}"
-        cfg = self._profile_cfg[stage]
-        extra = {}
-        if cfg["thinking"]:
-            extra["thinking"] = {"type": "enabled"}
-        resp = self._cli.chat.completions.create(
-            model=self._model,
-            messages=[{"role": "system", "content": system},
-                      {"role": "user",   "content": user}],
-            response_format={"type": "json_object"},
-            reasoning_effort=cfg["reasoning_effort"],
-            extra_body=extra,
-            temperature=cfg["temperature"],
-            max_tokens=cfg["max_output_tokens"],         # ⚠ stage 级，不能用全局值
-            stream=False,
-            # ⚠ 硬约束：永不传 tools / tool_choice / functions 参数
-        )
-        text = resp.choices[0].message.content
-        data = json.loads(text)
-        obj = schema.model_validate(data)              # 严格校验
-        meta = {
-            "input_tokens":  resp.usage.prompt_tokens,
-            "output_tokens": resp.usage.completion_tokens,
-            "prompt_hash":   hashlib.sha256((system + user).encode()).hexdigest(),
-            "stage":         stage,
-        }
-        return obj, meta
+class LLMClient:
+    """JSON-mode + 调用方传入的 StageProfile + 审计写入 llm_calls。
+    构造由 LLMManager 完成，绑定 (provider_name, plugin_id, run_id, model)。
+    v0.7：不再持有 profile 集，stage 概念归插件。"""
+    def __init__(self, db, transport, *, model, plugin_id, run_id,
+                 audit_full_payload=False, reports_dir=None) -> None: ...
+    def complete_json(self, *, system: str, user: str,
+                      schema: type[BaseModel], profile: StageProfile,
+                      envelope_defaults: dict[str, Any] | None = None
+                      ) -> tuple[BaseModel, dict[str, Any]]: ...
 ```
 
 ### 10.3 设计要点与硬约束
 
 - 统一 `complete_json` 入口，**杜绝**自由文本响应。
-- `response_format={"type":"json_object"}` + Pydantic 双重校验；JSON 解析或 schema 校验失败 → tenacity 重试 1 次 → 仍失败抛出，runner 按 §13 partial_failed 处理。
+- 插件**不直接构造** `LLMClient` / `OpenAIClientTransport`；唯一入口是 `LLMManager.get_client(name, ...)`。框架因此可在不破坏插件 API 的情况下未来引入 transport 插件类型（`type=llm-transport`）。
+- `response_format={"type":"json_object"}` + Pydantic 双重校验；JSON 解析或 schema 校验失败 → 单次重试（带针对性 hint）→ 仍失败抛 `LLMValidationError` / `LLMEmptyResponseError`，runner 按 §13 partial_failed 处理。
 - **永不传** `tools` / `tool_choice` / `functions` 参数 —— 模型无外部数据通道。
 - **永不暴露** `chat_with_tools` / `register_tool` 之类的接口给插件作者。
 - `permissions.llm_tools=true` 的元数据 → 安装拒绝（§8.3）。
-- 阶段级 profile 由 stage 参数解析，调用前后写 `llm_calls`（含 prompt_hash 与原始响应）。
+- 调用方传入 `profile: StageProfile`（由插件本地 `profiles.resolve_profile(preset, stage)` 解析得到），调用前后写 `llm_calls`（含 `plugin_id` / `prompt_hash` / `validation_status` / `model` / token 计数；v0.7 起**不再有 stage 列**）。`audit_full_payload=False` 时 DB 行只存摘要，但 `~/.deeptrade/reports/<run_id>/llm_calls.jsonl` 永远写完整 prompt + response。
 - **EvidenceItem 必须带 unit**：值 + 单位（如 `value=3.2, unit="亿"`）让证据自包含含义；prompt 装配时由 §11 数据层从 raw 单位生成 normalized 字段，DB 表保留 raw 单位（详见 §11.4）。
+
+### 10.4 插件使用示例（v0.7 推荐用法）
+
+```python
+from deeptrade.plugins_api import StageProfile
+from .profiles import resolve_profile  # 插件本地 preset → stage tuning 表
+
+# 在插件 runtime 内（构造一次，整个 run 复用）
+@dataclass
+class VaRuntime:
+    db: Database
+    config: ConfigService
+    llms: LLMManager        # ← 由插件 dispatch 入口注入
+    plugin_id: str = PLUGIN_ID
+    run_id: str | None = None
+    ...
+
+# 在 pipeline 内（同一 plugin 同时调多个 LLM 的合法用法）
+preset = rt.config.get_app_config().app_profile  # "balanced" / "fast" / "quality"
+
+analyser = rt.llms.get_client("deepseek",  plugin_id=rt.plugin_id, run_id=rt.run_id)
+ranker   = rt.llms.get_client("qwen-plus", plugin_id=rt.plugin_id, run_id=rt.run_id)
+
+evidence, _ = analyser.complete_json(
+    system=..., user=..., schema=R1Schema,
+    profile=resolve_profile(preset, "strong_target_analysis"),
+)
+ranking, _  = ranker.complete_json(
+    system=..., user=..., schema=FinalSchema,
+    profile=resolve_profile(preset, "final_ranking"),
+)
+```
+
+可用 provider 清单（API 用法层面）：
+
+```python
+names = rt.llms.list_providers()      # → ["deepseek", "qwen-plus"]（仅 api_key 已配的）
+info  = rt.llms.get_provider_info("deepseek")  # → LLMProviderInfo(name=, model=, base_url=)
+```
+
+### 10.5 配置迁移
+
+**v0.5 → v0.6 自动**：DB 打开时执行幂等迁移，若发现旧 `deepseek.*` 键存在且 `llm.providers` 为空，则：
+
+1. 构造一个名为 `deepseek` 的 provider 写入 `llm.providers`（`base_url` / `model` / `timeout` 来自旧键）。
+2. 旧 `deepseek.api_key`（secret_store）→ 新 `llm.deepseek.api_key`（secret_store）。
+3. 旧 `deepseek.audit_full_payload` → 新 `llm.audit_full_payload`。
+4. 删除迁移过的旧键。
+
+代码：`config_migrations.migrate_legacy_deepseek_keys`。
+
+**v0.6 → v0.7 自动**：
+
+1. DB 行：`deepseek.profile` → `app.profile`，幂等。代码：`config_migrations.migrate_legacy_deepseek_profile_key`。
+2. DB schema：SQL migration `20260501_002_drop_llm_calls_stage.sql` 删除 `llm_calls.stage` 列。
+3. **环境变量直接断代**：`DEEPTRADE_DEEPSEEK_PROFILE` 不再被识别。`ConfigService.get_app_config()` 启动时若检测到旧 env 设而新 env 未设，抛 `RuntimeError` 退出（避免静默回落到默认值）。请改为 `DEEPTRADE_APP_PROFILE`。
+
+迁移幂等：再次启动时新键已存在，跳过。CHANGELOG 显式声明这是不兼容变更，但用户实际配置不丢失。
 
 ---
 
@@ -1143,7 +1302,7 @@ def resolve_trade_date(now_dt, calendar, *, user_specified=None,
 - r1_batch_token_budget R1 每批 prompt token 预算上限（默认 80_000；用于动态切批）
 - r2_batch_token_budget R2 每批 prompt token 预算上限（默认 200_000；超出则启用 R2 分批）
 - include_optional_apis 可选接口启用清单（多选，默认全部）
-- llm_profile           覆写 deepseek.profile（默认继承全局；fast/balanced/quality）
+- llm_profile           覆写 app.profile（默认继承全局；fast/balanced/quality）
 ```
 
 > ⚠ **不存在"候选数上限"参数**。批次切分严格按 token 预算动态计算，确保所有候选都被分配到某个批次。

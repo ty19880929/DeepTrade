@@ -173,14 +173,14 @@ $ deeptrade stdout-channel log --limit 5
 - 关闭 thinking 加速（profile=fast，全程关思维链）：
 
   ```bash
-  deeptrade config set deepseek.profile fast
+  deeptrade config set app.profile fast
   ```
 
 - 看每次 LLM 调用的原始请求/响应：
 
   ```sql
   -- 直接 duckdb-cli 打开 DB
-  SELECT stage, validation_status, input_tokens, output_tokens
+  SELECT validation_status, input_tokens, output_tokens
     FROM llm_calls
     WHERE plugin_id = 'limit-up-board'
     ORDER BY created_at DESC LIMIT 20;

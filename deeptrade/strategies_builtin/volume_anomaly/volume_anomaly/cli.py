@@ -18,6 +18,7 @@ import typer
 from deeptrade.core import paths
 from deeptrade.core.config import ConfigService
 from deeptrade.core.db import Database
+from deeptrade.core.llm_manager import LLMManager
 
 from .runner import (
     DEFAULT_PRUNE_DAYS,
@@ -39,7 +40,8 @@ app = typer.Typer(
 
 def _open_runtime() -> tuple[Database, VaRuntime]:
     db = Database(paths.db_path())
-    rt = VaRuntime(db=db, config=ConfigService(db))
+    cfg = ConfigService(db)
+    rt = VaRuntime(db=db, config=cfg, llms=LLMManager(db, cfg))
     return db, rt
 
 

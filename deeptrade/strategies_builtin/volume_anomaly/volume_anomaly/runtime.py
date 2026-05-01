@@ -1,4 +1,9 @@
-"""VaRuntime — context bundle the volume-anomaly plugin's pipeline runs against."""
+"""VaRuntime — context bundle the volume-anomaly plugin's pipeline runs against.
+
+v0.6 — ``llm: DeepSeekClient`` field removed. ``llms: LLMManager`` is the
+new framework hand-off; runner / pipeline pull a per-provider ``LLMClient``
+via ``rt.llms.get_client(name, plugin_id=, run_id=)``.
+"""
 
 from __future__ import annotations
 
@@ -11,7 +16,7 @@ from deeptrade.plugins_api.events import EventLevel, EventType, StrategyEvent
 if TYPE_CHECKING:  # pragma: no cover
     from deeptrade.core.config import ConfigService
     from deeptrade.core.db import Database
-    from deeptrade.core.deepseek_client import DeepSeekClient
+    from deeptrade.core.llm_manager import LLMManager
     from deeptrade.core.tushare_client import TushareClient
     from deeptrade.plugins_api.notify import NotificationPayload
 
@@ -24,11 +29,11 @@ PLUGIN_ID = "volume-anomaly"
 class VaRuntime:
     db: Database
     config: ConfigService
+    llms: LLMManager
     plugin_id: str = PLUGIN_ID
     run_id: str | None = None
     is_intraday: bool = False
     tushare: TushareClient | None = None
-    llm: DeepSeekClient | None = None
 
     def emit(
         self,
@@ -68,30 +73,18 @@ def build_tushare_client(rt: VaRuntime, *, intraday: bool = False, event_cb: Any
     )
 
 
-def build_llm_client(rt: VaRuntime):
-    from pathlib import Path
+def pick_llm_provider(rt: VaRuntime) -> str:
+    """Pick which configured LLM provider to use for this run.
 
-    from deeptrade.core import paths
-    from deeptrade.core.deepseek_client import DeepSeekClient, OpenAIClientTransport
-
-    api_key = rt.config.get("deepseek.api_key")
-    if not api_key:
-        raise RuntimeError("deepseek.api_key not configured; run `deeptrade config set-deepseek`")
-    cfg = rt.config.get_app_config()
-    profiles = rt.config.get_profile()
-    transport = OpenAIClientTransport(
-        api_key=str(api_key),
-        base_url=cfg.deepseek_base_url,
-        timeout=cfg.deepseek_timeout,
-    )
-    reports_dir: Path | None = paths.reports_dir() / rt.run_id if rt.run_id else None
-    return DeepSeekClient(
-        rt.db,
-        transport,
-        model=cfg.deepseek_model,
-        profiles=profiles,
-        plugin_id=rt.plugin_id,
-        run_id=rt.run_id,
-        audit_full_payload=cfg.deepseek_audit_full_payload,
-        reports_dir=reports_dir,
-    )
+    See ``limit_up_board.runtime.pick_llm_provider`` for the policy rationale
+    — kept duplicated here so each plugin can later diverge (per-plugin
+    default LLM in v0.7).
+    """
+    available = rt.llms.list_providers()
+    if not available:
+        raise RuntimeError(
+            "No LLM provider configured; run `deeptrade config set-llm`"
+        )
+    if "deepseek" in available:
+        return "deepseek"
+    return available[0]

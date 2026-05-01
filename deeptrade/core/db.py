@@ -131,7 +131,13 @@ def _applied_versions(db: Database) -> set[str]:
 
 
 def apply_core_migrations(db: Database) -> list[str]:
-    """Apply core migrations not yet recorded. Returns versions newly applied."""
+    """Apply core migrations not yet recorded. Returns versions newly applied.
+
+    After SQL migrations, runs idempotent data migrations (e.g. v0.6
+    deepseek.* → llm.providers). Data migrations are idempotent by inspection
+    of current state (not tracked in schema_migrations) so a re-run on a
+    clean v0.6 DB is a no-op.
+    """
     applied = _applied_versions(db)
     newly: list[str] = []
     for version, sql_text in _list_core_migrations():
@@ -144,4 +150,16 @@ def apply_core_migrations(db: Database) -> list[str]:
                 (version,),
             )
         newly.append(version)
+
+    # v0.6 data migration — convert legacy deepseek.* config to llm.providers.
+    from deeptrade.core.config_migrations import (
+        migrate_legacy_deepseek_keys,
+        migrate_legacy_deepseek_profile_key,
+    )
+
+    if migrate_legacy_deepseek_keys(db):
+        newly.append("data:v06_llm_providers")
+    # v0.7 data migration — rename deepseek.profile → app.profile.
+    if migrate_legacy_deepseek_profile_key(db):
+        newly.append("data:v07_app_profile")
     return newly

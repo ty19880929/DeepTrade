@@ -74,12 +74,12 @@ CREATE TABLE IF NOT EXISTS plugin_schema_migrations (
 -- Framework service audit / cache state
 -- ============================================================
 
--- LLM call audit (DeepSeekClient writes; per-plugin scoped via plugin_id column)
+-- LLM call audit (LLMClient writes; per-plugin scoped via plugin_id column).
+-- v0.7 dropped the `stage` column — see migration 20260501_002.
 CREATE TABLE IF NOT EXISTS llm_calls (
     call_id           UUID PRIMARY KEY,
     run_id            UUID,
     plugin_id         VARCHAR,
-    stage             VARCHAR,
     model             VARCHAR,
     prompt_hash       VARCHAR,
     input_tokens      BIGINT,

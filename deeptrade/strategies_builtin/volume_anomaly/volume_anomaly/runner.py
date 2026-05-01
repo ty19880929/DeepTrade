@@ -38,7 +38,7 @@ from .render import (
     write_prune_report,
     write_screen_report,
 )
-from .runtime import VaRuntime, build_llm_client, build_tushare_client
+from .runtime import VaRuntime, build_tushare_client, pick_llm_provider
 from .schemas import VATrendCandidate
 
 logger = logging.getLogger(__name__)
@@ -221,7 +221,16 @@ class VaRunner:
         rt.tushare = build_tushare_client(
             rt, intraday=params.allow_intraday, event_cb=self._on_tushare_event
         )
-        rt.llm = build_llm_client(rt)
+        from deeptrade.core import paths
+
+        provider_name = pick_llm_provider(rt)
+        reports_dir = paths.reports_dir() / rt.run_id if rt.run_id else None
+        llm = rt.llms.get_client(
+            provider_name,
+            plugin_id=rt.plugin_id,
+            run_id=rt.run_id,
+            reports_dir=reports_dir,
+        )
         cfg = rt.config.get_app_config()
 
         yield rt.emit(EventType.STEP_STARTED, "Step 0: resolve trade date")
@@ -270,10 +279,9 @@ class VaRunner:
             yield from self._emit_empty_analyze_report(bundle, params, reason="empty watchlist")
             return
 
-        profile = rt.config.get_profile()
-        output_budget = profile.continuation_prediction.max_output_tokens
+        preset = cfg.app_profile  # v0.7: per-stage tuning resolved by plugin
         analyze_result = None
-        for ev, res in run_analyze(llm=rt.llm, bundle=bundle, output_budget=output_budget):
+        for ev, res in run_analyze(llm=llm, bundle=bundle, preset=preset):
             yield ev
             if res is not None:
                 analyze_result = res

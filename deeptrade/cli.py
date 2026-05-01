@@ -5,7 +5,7 @@ Framework command surface (closed):
     deeptrade --version | -V
     deeptrade --help    | -h
     deeptrade init [--no-prompts]
-    deeptrade config {show, set, set-tushare, set-deepseek, test}
+    deeptrade config {show, set, set-tushare, set-llm, list-llm, test-llm}
     deeptrade plugin {install, list, info, enable, disable, uninstall, upgrade}
     deeptrade data sync ...                 (stub — pending refactor)
 
@@ -31,7 +31,6 @@ from deeptrade.cli_data import app as data_app
 from deeptrade.cli_plugin import app as plugin_app
 from deeptrade.core import paths
 from deeptrade.core.db import Database, apply_core_migrations
-
 
 # ---------------------------------------------------------------------------
 # Custom click.Group implementing pure plugin pass-through
@@ -205,10 +204,10 @@ def init(
         from deeptrade.cli_config import cmd_set_tushare
 
         cmd_set_tushare()
-    if questionary.confirm("Configure deepseek now?", default=True).ask():
-        from deeptrade.cli_config import cmd_set_deepseek
+    if questionary.confirm("Configure an LLM provider now?", default=True).ask():
+        from deeptrade.cli_config import cmd_set_llm
 
-        cmd_set_deepseek()
+        cmd_set_llm()
 
 
 if __name__ == "__main__":

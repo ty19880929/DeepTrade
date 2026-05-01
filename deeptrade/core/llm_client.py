@@ -1,20 +1,36 @@
-"""DeepSeek V4 client.
+"""LLM client (OpenAI-compatible protocol, multi-provider).
+
+v0.7 — stage 概念彻底退出框架。``complete_json`` 不再认识 stage 名字，
+由调用方直接传入一个已解析好的 ``StageProfile``。预设档（``fast/balanced/
+quality``）保留为框架级用户配置（``app.profile``），但**预设档 → 各 stage
+tuning 的映射表归插件自己维护**（详见 ``deeptrade.plugins_api.llm``）。
+
+v0.6 — renamed from ``deepseek_client.py`` to reflect framework-level role.
+The same client now backs every provider configured in ``llm.providers``
+(DeepSeek / Qwen / Kimi / Doubao / GLM / Yi / SiliconFlow / OpenRouter, ...)
+— they all speak the OpenAI Chat Completions wire format. Real heterogeneous
+protocols (Anthropic native, Gemini native) will land later as a separate
+transport plugin type; this module assumes OpenAI-compatible.
+
+Construction is not normally done by plugins directly — use
+``deeptrade.core.llm_manager.LLMManager.get_client(name, ...)``.
 
 DESIGN §10.2 + the M3/F3/F5 hard constraints from v0.3 review:
 
-    * **No tool calls EVER** — `chat.completions.create()` is invoked without
-      any `tools` / `tool_choice` / `functions` parameter, and StrategyContext
-      does not expose a `chat_with_tools` surface.
-    * **Stage-aware profiles**: thinking / reasoning_effort / temperature /
-      max_output_tokens are per-stage (`fast` / `balanced` / `quality`).
-    * **JSON-only**: `response_format={"type": "json_object"}` + Pydantic
+    * **No tool calls EVER** — ``chat.completions.create()`` is invoked
+      without any ``tools`` / ``tool_choice`` / ``functions`` parameter, and
+      plugins are not handed a ``chat_with_tools`` surface.
+    * **Caller-supplied profile**: each ``complete_json`` call carries a
+      ``StageProfile`` (thinking / reasoning_effort / temperature /
+      max_output_tokens). Framework does not look up profiles by stage name.
+    * **JSON-only**: ``response_format={"type": "json_object"}`` + Pydantic
       double-validate; one retry on JSON / Pydantic failure, then re-raise.
-    * **Audit**: each call is persisted to `llm_calls` (request_json,
-      response_json, prompt_hash, validation_status).
+    * **Audit**: each call is persisted to ``llm_calls`` (request_json,
+      response_json, prompt_hash, validation_status, plugin_id).
 
 Transports:
     OpenAIClientTransport  — production; OpenAI-compatible chat completion API
-    RecordedTransport      — tests; replays a canned response for a given key
+    RecordedTransport      — tests; FIFO-replays canned responses
 """
 
 from __future__ import annotations
@@ -37,17 +53,10 @@ from tenacity import (
     wait_exponential,
 )
 
-from deeptrade.core.config import DeepSeekProfileSet, StageProfile
 from deeptrade.core.db import Database
+from deeptrade.plugins_api.llm import StageProfile
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Stage namespace
-# ---------------------------------------------------------------------------
-
-KNOWN_STAGES = frozenset({"strong_target_analysis", "continuation_prediction", "final_ranking"})
 
 
 # ---------------------------------------------------------------------------
@@ -56,7 +65,7 @@ KNOWN_STAGES = frozenset({"strong_target_analysis", "continuation_prediction", "
 
 
 class LLMError(Exception):
-    """Base for DeepSeek client errors."""
+    """Base for LLM client errors."""
 
 
 class LLMTransportError(LLMError):
@@ -72,10 +81,6 @@ class LLMEmptyResponseError(LLMValidationError):
     or None). Distinct from a JSON parse error so callers can show a clearer
     message and the retry path can append a "skip extended reasoning" hint
     instead of resending the same prompt that already produced nothing."""
-
-
-class LLMUnknownStageError(LLMError):
-    """Caller passed a stage name not in KNOWN_STAGES."""
 
 
 # ---------------------------------------------------------------------------
@@ -111,7 +116,7 @@ class LLMTransport(ABC):
 
 
 class OpenAIClientTransport(LLMTransport):
-    """Production transport — uses the OpenAI SDK pointed at DeepSeek."""
+    """Production transport — OpenAI-compatible chat completion."""
 
     def __init__(self, api_key: str, base_url: str, timeout: int) -> None:
         from openai import OpenAI  # noqa: PLC0415
@@ -168,19 +173,18 @@ class OpenAIClientTransport(LLMTransport):
 
 
 class RecordedTransport(LLMTransport):
-    """Test transport — replays canned responses keyed by stage / system / user.
+    """Test transport — FIFO-replays pre-registered responses.
 
-    Use ``register(stage, response)`` to seed; matching is by stage when no
-    per-call recording exists, falling back to FIFO replay.
+    Use ``register(response)`` to seed; each ``chat()`` call pops one entry.
     """
 
     def __init__(self) -> None:
-        self._by_stage: dict[str, list[LLMResponse | Exception]] = {}
+        self._queue: list[LLMResponse | Exception] = []
         # last-seen kwargs the test can introspect (M3 no-tools test relies on this)
         self.last_call_kwargs: dict[str, Any] = {}
 
-    def register(self, stage: str, response: LLMResponse | Exception) -> None:
-        self._by_stage.setdefault(stage, []).append(response)
+    def register(self, response: LLMResponse | Exception) -> None:
+        self._queue.append(response)
 
     def chat(
         self,
@@ -193,14 +197,6 @@ class RecordedTransport(LLMTransport):
         thinking: bool,
         reasoning_effort: str,
     ) -> LLMResponse:
-        # The stage label is woven into the system prompt by the production
-        # caller. For tests, we extract it heuristically: in V0.4 we'll trust
-        # the test to pre-register by looking at last seeded stage in order.
-        # Concretely: tests register via `register(stage, ...)` and call
-        # complete_json with a matching stage; the client passes through to
-        # this transport which pops one entry from the most-recent stage.
-        # To support stage-keyed replay reliably, the client re-injects the
-        # `stage` via a thread-local set just before chat(). We use that.
         self.last_call_kwargs = {
             "model": model,
             "system": system,
@@ -210,25 +206,12 @@ class RecordedTransport(LLMTransport):
             "thinking": thinking,
             "reasoning_effort": reasoning_effort,
         }
-        stage = _CURRENT_STAGE.get("v")
-        queue = self._by_stage.get(stage or "", [])
-        if not queue:
-            # fallback to any stage with remaining entries
-            for _s, q in self._by_stage.items():
-                if q:
-                    queue = q
-                    break
-        if not queue:
-            raise LLMTransportError(f"no recorded response for stage={stage!r}")
-        entry = queue.pop(0)
+        if not self._queue:
+            raise LLMTransportError("RecordedTransport: no more queued responses")
+        entry = self._queue.pop(0)
         if isinstance(entry, Exception):
             raise entry
         return entry
-
-
-# Module-level holder so RecordedTransport can introspect the stage. Kept
-# small because tests run sequentially.
-_CURRENT_STAGE: dict[str, str | None] = {"v": None}
 
 
 # ---------------------------------------------------------------------------
@@ -236,14 +219,13 @@ _CURRENT_STAGE: dict[str, str | None] = {"v": None}
 # ---------------------------------------------------------------------------
 
 
-class DeepSeekClient:
+class LLMClient:
     def __init__(
         self,
         db: Database,
         transport: LLMTransport,
         *,
         model: str,
-        profiles: DeepSeekProfileSet,
         plugin_id: str | None = None,
         run_id: str | None = None,
         audit_full_payload: bool = False,
@@ -252,20 +234,12 @@ class DeepSeekClient:
         self._db = db
         self._transport = transport
         self._model = model
-        self._profiles = profiles
         self._plugin_id = plugin_id
         self._run_id = run_id
         # F-M2 — when False (default), DB rows keep just hash + response excerpt;
         # full payloads ALWAYS go to reports_dir/llm_calls.jsonl (set by caller).
         self._audit_full = audit_full_payload
         self._reports_dir = reports_dir
-
-    # --- stage profile lookup ------------------------------------------
-
-    def _stage_profile(self, stage: str) -> StageProfile:
-        if stage not in KNOWN_STAGES:
-            raise LLMUnknownStageError(f"unknown stage: {stage!r}")
-        return getattr(self._profiles, stage)
 
     # --- main entry ----------------------------------------------------
 
@@ -275,32 +249,28 @@ class DeepSeekClient:
         system: str,
         user: str,
         schema: type[BaseModel],
-        stage: str,
+        profile: StageProfile,
         envelope_defaults: dict[str, Any] | None = None,
     ) -> tuple[BaseModel, dict[str, Any]]:
         """Send a JSON-mode chat and validate against `schema`.
 
+        ``profile`` (required) — caller-resolved per-call tuning. Plugins
+        own the preset → stage profile mapping; the framework just consumes
+        the four fields (thinking, reasoning_effort, temperature,
+        max_output_tokens).
+
         ``envelope_defaults`` (optional) — top-level keys to inject when
-        the LLM omits them. Useful for framework-controlled metadata like
-        ``stage`` / ``trade_date`` / ``batch_no`` that the LLM has no
-        business deciding; the framework already knows them. Only fills
-        keys missing from the parsed payload, never overwrites.
+        the LLM omits them. Useful for caller-controlled metadata like
+        ``stage`` / ``trade_date`` / ``batch_no``. Only fills keys missing
+        from the parsed payload, never overwrites.
 
         Returns (validated_model, meta) where meta includes input_tokens,
         output_tokens, latency_ms, prompt_hash. Raises:
-            LLMUnknownStageError  — bad stage name
             LLMValidationError    — JSON or Pydantic still failing after 1 retry
+            LLMEmptyResponseError — model returned empty content twice
             LLMTransportError     — transport-level error after retries
         """
-        cfg = self._stage_profile(stage)
-
-        # Track stage for RecordedTransport
-        _CURRENT_STAGE["v"] = stage
-        try:
-            obj, meta = self._with_retry(system, user, schema, stage, cfg, envelope_defaults)
-        finally:
-            _CURRENT_STAGE["v"] = None
-        return obj, meta
+        return self._with_retry(system, user, schema, profile, envelope_defaults)
 
     @staticmethod
     def _retry_hint_for(error: Exception) -> str:
@@ -331,15 +301,15 @@ class DeepSeekClient:
         wait=wait_exponential(multiplier=1, min=1, max=10),
         reraise=True,
     )
-    def _transport_call(self, system: str, user: str, cfg: StageProfile) -> LLMResponse:
+    def _transport_call(self, system: str, user: str, profile: StageProfile) -> LLMResponse:
         return self._transport.chat(
             model=self._model,
             system=system,
             user=user,
-            temperature=cfg.temperature,
-            max_tokens=cfg.max_output_tokens,
-            thinking=cfg.thinking,
-            reasoning_effort=cfg.reasoning_effort,
+            temperature=profile.temperature,
+            max_tokens=profile.max_output_tokens,
+            thinking=profile.thinking,
+            reasoning_effort=profile.reasoning_effort,
         )
 
     def _with_retry(
@@ -347,8 +317,7 @@ class DeepSeekClient:
         system: str,
         user: str,
         schema: type[BaseModel],
-        stage: str,
-        cfg: StageProfile,
+        profile: StageProfile,
         envelope_defaults: dict[str, Any] | None = None,
     ) -> tuple[BaseModel, dict[str, Any]]:
         """Two attempts: one retry on JSON / Pydantic / empty-response failure.
@@ -365,7 +334,7 @@ class DeepSeekClient:
         current_user = user
         for attempt in (1, 2):
             t0 = time.monotonic()
-            response = self._transport_call(system, current_user, cfg)
+            response = self._transport_call(system, current_user, profile)
             latency_ms = int((time.monotonic() - t0) * 1000)
             last_response = response
 
@@ -391,7 +360,6 @@ class DeepSeekClient:
             except (json.JSONDecodeError, ValidationError, LLMEmptyResponseError) as e:
                 last_err = e
                 self._record_call(
-                    stage=stage,
                     prompt_hash=prompt_hash,
                     request_system=system,
                     request_user=current_user,
@@ -409,7 +377,6 @@ class DeepSeekClient:
                 continue
             else:
                 self._record_call(
-                    stage=stage,
                     prompt_hash=prompt_hash,
                     request_system=system,
                     request_user=current_user,
@@ -425,7 +392,6 @@ class DeepSeekClient:
                     "output_tokens": response.output_tokens,
                     "latency_ms": latency_ms,
                     "prompt_hash": prompt_hash,
-                    "stage": stage,
                 }
 
         # both attempts failed — preserve the specific error subclass so callers
@@ -442,7 +408,6 @@ class DeepSeekClient:
     def _record_call(
         self,
         *,
-        stage: str,
         prompt_hash: str,
         request_system: str,
         request_user: str,
@@ -459,7 +424,6 @@ class DeepSeekClient:
         # audit gap). The DB row may be lean or full per audit_full_payload.
         self._append_jsonl(
             call_id=call_id,
-            stage=stage,
             prompt_hash=prompt_hash,
             request_system=request_system,
             request_user=request_user,
@@ -488,14 +452,13 @@ class DeepSeekClient:
             )
             response_payload = (response_text or "")[:200]
         self._db.execute(
-            "INSERT INTO llm_calls(call_id, run_id, plugin_id, stage, model, prompt_hash, "
+            "INSERT INTO llm_calls(call_id, run_id, plugin_id, model, prompt_hash, "
             "input_tokens, output_tokens, latency_ms, request_json, response_json, "
-            "validation_status, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "validation_status, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 call_id,
                 self._run_id,
                 self._plugin_id,
-                stage,
                 self._model,
                 prompt_hash,
                 input_tokens,
@@ -512,7 +475,6 @@ class DeepSeekClient:
         self,
         *,
         call_id: str,
-        stage: str,
         prompt_hash: str,
         request_system: str,
         request_user: str,
@@ -537,7 +499,6 @@ class DeepSeekClient:
                             "call_id": call_id,
                             "run_id": self._run_id,
                             "plugin_id": self._plugin_id,
-                            "stage": stage,
                             "model": self._model,
                             "prompt_hash": prompt_hash,
                             "input_tokens": input_tokens,

@@ -20,6 +20,7 @@ import typer
 from deeptrade.core import paths
 from deeptrade.core.config import ConfigService
 from deeptrade.core.db import Database
+from deeptrade.core.llm_manager import LLMManager
 
 from .runner import LubRunner, RunParams, render_finished_run
 from .runtime import LubRuntime
@@ -34,7 +35,8 @@ app = typer.Typer(
 
 def _open_runtime() -> tuple[Database, LubRuntime]:
     db = Database(paths.db_path())
-    rt = LubRuntime(db=db, config=ConfigService(db))
+    cfg = ConfigService(db)
+    rt = LubRuntime(db=db, config=cfg, llms=LLMManager(db, cfg))
     return db, rt
 
 

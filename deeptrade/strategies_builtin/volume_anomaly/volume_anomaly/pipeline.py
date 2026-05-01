@@ -16,14 +16,16 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from deeptrade.core.deepseek_client import (
-    DeepSeekClient,
+from deeptrade.core.llm_client import (
+    LLMClient,
     LLMTransportError,
     LLMValidationError,
 )
+from deeptrade.plugins_api import StageProfile
 from deeptrade.plugins_api.events import EventLevel, EventType, StrategyEvent
 
 from .data import AnalyzeBundle
+from .profiles import STAGE_TREND_ANALYSIS, resolve_profile
 from .prompts import VA_TREND_SYSTEM, va_trend_user_prompt
 from .schemas import VATrendCandidate, VATrendResponse
 
@@ -95,12 +97,12 @@ class _SetMismatchError(Exception):
 
 
 def _complete_with_set_check(
-    llm: DeepSeekClient,
+    llm: LLMClient,
     *,
     system: str,
     user: str,
     schema: type[BaseModel],
-    stage: str,
+    profile: StageProfile,
     expected_ids: set[str],
     output_attr: str = "candidates",
     repair_retries: int = 1,
@@ -114,7 +116,7 @@ def _complete_with_set_check(
             system=system,
             user=current_user,
             schema=schema,
-            stage=stage,
+            profile=profile,
             envelope_defaults=envelope_defaults,
         )
         obj = raw if isinstance(raw, schema) else schema.model_validate(raw)
@@ -159,9 +161,9 @@ class AnalyzeResult:
 
 def run_analyze(
     *,
-    llm: DeepSeekClient,
+    llm: LLMClient,
     bundle: AnalyzeBundle,
-    output_budget: int,
+    preset: str,
     input_budget: int = DEFAULT_INPUT_BUDGET,
 ) -> Iterable[tuple[StrategyEvent, AnalyzeResult | None]]:
     """Run all analyze batches, yielding (event, terminal_result_or_None).
@@ -169,11 +171,12 @@ def run_analyze(
     The final iteration emits a STEP_FINISHED event paired with the populated
     AnalyzeResult so the caller can hand it to render.
     """
+    profile = resolve_profile(preset, STAGE_TREND_ANALYSIS)
     candidates = bundle.candidates
     plan = plan_batches(
         n_candidates=len(candidates),
         input_budget=input_budget,
-        output_budget=output_budget,
+        output_budget=profile.max_output_tokens,
     )
     yield (
         StrategyEvent(
@@ -244,10 +247,10 @@ def run_analyze(
                 system=VA_TREND_SYSTEM,
                 user=user,
                 schema=VATrendResponse,
-                stage="continuation_prediction",
+                profile=profile,
                 expected_ids=expected_ids,
                 envelope_defaults={
-                    "stage": "continuation_prediction",
+                    "stage": STAGE_TREND_ANALYSIS,
                     "trade_date": bundle.trade_date,
                     "next_trade_date": bundle.next_trade_date,
                     "batch_no": i + 1,

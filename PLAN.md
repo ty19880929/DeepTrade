@@ -963,3 +963,52 @@ DEEPTRADE_DEEPSEEK_PROFILE=fast              # dev 时省钱
 - [ ] README.md 五分钟可上手
 
 满足全部即发布。
+
+---
+
+## 11. v0.6 LLM Manager 化（2026-05-01 加入）
+
+> v0.1 MVP / v0.5 架构修订之后的下一轮破坏式重构。把 LLM 抬升为框架层基础能力（多 provider + 统一 manager）。规格见 DESIGN §0.7 + §10。
+
+### 11.1 工作分解（按文件维度）
+
+| # | 任务 | 估算 | 备注 |
+|---|---|---|---|
+| T1 | `core/config.py`：删除 `deepseek_*` 字段；新增 `llm_providers` (dict)、`llm_audit_full_payload` (bool)；`SECRET_KEYS` 改为前缀匹配 `llm.*.api_key`；新增 `LLMConfig` Pydantic 模型 | 0.5 |  |
+| T2 | `core/deepseek_client.py` → `core/llm_client.py`，`DeepSeekClient` → `LLMClient`；保留 `OpenAIClientTransport`；改所有 import | 0.3 | 纯改名 |
+| T3 | `core/llm_manager.py`（新）：`LLMManager` + `LLMConfig` + `LLMProviderInfo` + `LLMNotConfiguredError`；按 `(name, plugin_id, run_id)` 缓存；非线程安全注释 | 0.5 |  |
+| T4 | DB 迁移脚本（`migrations/<ver>_v06_llm_providers.sql` 或 Python migration）：旧 `deepseek.*` → `llm.providers["deepseek"]` + `llm.deepseek.api_key` + `llm.audit_full_payload`；幂等 | 0.3 |  |
+| T5 | `cli_config.py`：删 `set-deepseek` / `cmd_test`；加 `set-llm`(交互新建/修改/删除) + `list-llm` + `test-llm [name]`；`show` 展开 `llm.providers` | 0.5 |  |
+| T6 | `volume_anomaly/runtime.py` + `limit_up_board/runtime.py`：移除 `build_llm_client`；`llm: DeepSeekClient` → `llms: LLMManager`；调用点改 `rt.llms.get_client(name, plugin_id=, run_id=)`。各内建插件**先硬编码 `name="deepseek"`**，未来再加 `<plugin>.default_llm` 配置项 | 0.5 |  |
+| T7 | 测试：`test_deepseek_client.py` → `test_llm_client.py`；新增 `test_llm_manager.py`（list_providers 过滤、get_client 缓存、缺 api_key、迁移）；更新所有 fixture 中 `deepseek.*` 写入路径 | 0.5 |  |
+| T8 | `CHANGELOG.md` v0.6 条目；DESIGN.md 已改完 | 0.2 |  |
+| **合计** |  | **3.3 人日** |  |
+
+### 11.2 顺序与依赖
+
+```
+T1 (config schema)
+  ├─→ T2 (rename client)
+  ├─→ T4 (migration)
+  └─→ T3 (LLMManager) ──┬─→ T6 (runtime collapse)
+                        └─→ T5 (CLI rework)
+                                ├─→ T7 (tests)
+                                └─→ T8 (CHANGELOG)
+```
+
+### 11.3 验证 / DoD
+
+- 单元：`test_llm_manager.py` 覆盖 list_providers 过滤、get_client 缓存、缺 api_key 抛错、provider 不存在抛错。
+- 整合：`tests/cli/test_config_llm.py`（新）覆盖 `set-llm` 三种交互（新建/修改/删除）、`list-llm`、`test-llm` 单/全。
+- 迁移：单元测试构造遗留 `deepseek.*` 行 → 应用迁移 → 断言新键存在、旧键删除、再次跑迁移幂等。
+- 回归：现有所有 LLM 相关测试在改名后通过；`volume-anomaly` / `limit-up-board` 端到端 dispatch 跑通。
+- ruff + mypy clean。
+
+### 11.4 风险
+
+| ID | 风险 | 概率 | 缓解 |
+|---|---|---|---|
+| RV6-1 | 迁移误判（已有 `llm.providers` 还把 `deepseek.*` 又迁一遍） | 低 | 迁移检查 `llm.providers` 是否非空；非空则跳过整段 |
+| RV6-2 | `SECRET_KEYS` 前缀匹配把无关 key 误判为 secret | 中 | 严格只匹配 `llm.<name>.api_key` 模式（正则或两端边界检查），不放宽到 `llm.*.*key*` |
+| RV6-3 | 缓存按 `(name, plugin_id, run_id)`，run_id 为 None 时多次构造同 client 也算独立项 | 低 | 文档注明；插件应在 dispatch 入口确定 run_id 后再 get_client |
+| RV6-4 | `KNOWN_STAGES` 仍硬编码，与"框架层基础能力"提法冲突 | 低 | **已在 v0.7 偿还**：stage 概念彻底归插件，`StageProfile` 升格为 `plugins_api.llm` 公共契约；同步把 `deepseek.profile` 改名 `app.profile`、删 `llm_calls.stage` 列。详见 DESIGN §0.8 / §10.1 / §10.5、CHANGELOG v0.7.0 |

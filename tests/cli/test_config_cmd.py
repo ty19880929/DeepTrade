@@ -22,7 +22,7 @@ def test_config_show_lists_keys(home: Path) -> None:
     runner = CliRunner()
     result = runner.invoke(app, ["config", "show"])
     assert result.exit_code == 0
-    assert "deepseek.profile" in result.stdout
+    assert "app.profile" in result.stdout
     assert "tushare.rps" in result.stdout
 
 
@@ -38,7 +38,7 @@ def test_config_show_masks_secret_value(home: Path) -> None:
 
 def test_config_set_persists_value(home: Path) -> None:
     runner = CliRunner()
-    r1 = runner.invoke(app, ["config", "set", "deepseek.profile", "fast"])
+    r1 = runner.invoke(app, ["config", "set", "app.profile", "fast"])
     assert r1.exit_code == 0
     r2 = runner.invoke(app, ["config", "show"])
     assert "fast" in r2.stdout
@@ -53,7 +53,7 @@ def test_config_set_unknown_key_returns_2(home: Path) -> None:
 
 def test_config_set_invalid_profile_returns_2(home: Path) -> None:
     runner = CliRunner()
-    result = runner.invoke(app, ["config", "set", "deepseek.profile", "ultra"])
+    result = runner.invoke(app, ["config", "set", "app.profile", "ultra"])
     assert result.exit_code == 2
 
 

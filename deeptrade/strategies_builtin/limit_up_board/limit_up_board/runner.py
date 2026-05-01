@@ -13,11 +13,14 @@ import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from deeptrade.core.run_status import RunStatus
 from deeptrade.core.tushare_client import TushareUnauthorizedError
 from deeptrade.plugins_api.events import EventLevel, EventType, StrategyEvent
+
+if TYPE_CHECKING:  # pragma: no cover
+    from deeptrade.core.llm_client import LLMClient
 
 from .calendar import TradeCalendar
 from .data import Round1Bundle, collect_round1, resolve_trade_date
@@ -28,7 +31,7 @@ from .pipeline import (
     select_finalists,
 )
 from .render import export_llm_calls, render_terminal_summary, write_report
-from .runtime import LubRuntime, build_llm_client, build_tushare_client
+from .runtime import LubRuntime, build_tushare_client, pick_llm_provider
 from .schemas import FinalRankingResponse
 
 logger = logging.getLogger(__name__)
@@ -74,6 +77,10 @@ class LubRunner:
         # Buffer for events emitted by sub-systems (currently TushareClient)
         # and drained between yields in the pipeline.
         self._pending: list[StrategyEvent] = []
+        # Selected LLM client for the current run. Bound at execute() entry
+        # via rt.llms.get_client(provider_name, ...). Stays None for
+        # execute_sync_only().
+        self._llm: LLMClient | None = None
 
     # ----- public --------------------------------------------------------
 
@@ -84,7 +91,15 @@ class LubRunner:
         self._rt.tushare = build_tushare_client(
             self._rt, intraday=params.allow_intraday, event_cb=self._on_tushare_event
         )
-        self._rt.llm = build_llm_client(self._rt)
+        from deeptrade.core import paths
+
+        provider_name = pick_llm_provider(self._rt)
+        self._llm = self._rt.llms.get_client(
+            provider_name,
+            plugin_id=self._rt.plugin_id,
+            run_id=run_id,
+            reports_dir=paths.reports_dir() / run_id,
+        )
 
         self._record_run_start(run_id, params)
 
@@ -257,10 +272,9 @@ class LubRunner:
             return
 
         # Step 2 — R1
-        profile = rt.config.get_profile()
-        r1_budget = profile.strong_target_analysis.max_output_tokens
+        preset = cfg.app_profile  # v0.7: per-stage tuning resolved by plugin
         r1_result = None
-        for ev, res in run_r1(llm=rt.llm, bundle=bundle, output_budget=r1_budget):  # type: ignore[arg-type]
+        for ev, res in run_r1(llm=self._llm, bundle=bundle, preset=preset):
             yield ev
             if res is not None:
                 r1_result = res
@@ -270,10 +284,9 @@ class LubRunner:
             return
 
         # Step 4 — R2
-        r2_budget = profile.continuation_prediction.max_output_tokens
         r2_result = None
         for ev, res in run_r2(
-            llm=rt.llm, selected=selected, bundle=bundle, output_budget=r2_budget  # type: ignore[arg-type]
+            llm=self._llm, selected=selected, bundle=bundle, preset=preset
         ):
             yield ev
             if res is not None:
@@ -286,12 +299,11 @@ class LubRunner:
         if r2_result and r2_result.success_batches > 1 and predictions:
             final_ranking_attempted = True
             finalists = select_finalists(predictions, batch_size_hint=r2_result.batch_size or 20)
-            final_budget = profile.final_ranking.max_output_tokens
             for ev, fr_obj in run_final_ranking(
-                llm=rt.llm,  # type: ignore[arg-type]
+                llm=self._llm,
                 bundle=bundle,
                 finalists=finalists,
-                output_budget=final_budget,
+                preset=preset,
             ):
                 yield ev
                 if fr_obj is not None:

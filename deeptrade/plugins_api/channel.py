@@ -30,7 +30,7 @@ class PluginContext:
     ``validate_static`` (during install) and to a channel plugin's ``push``
     (during notify).
 
-    Plugins that need richer services (TushareClient, DeepSeekClient, etc.)
+    Plugins that need richer services (TushareClient, LLMManager / LLMClient, etc.)
     construct them inside their own ``dispatch`` from these primitives.
     """
 

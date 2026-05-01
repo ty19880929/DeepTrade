@@ -159,7 +159,7 @@ def _build_validate_ctx(db: Database, meta: PluginMetadata) -> Any:
 
     All plugin types (strategy / channel / future) share the same narrow
     context shape: db + config + plugin_id. Plugins that need richer services
-    (TushareClient, DeepSeekClient, ...) construct them inside their own
+    (TushareClient, LLMManager / LLMClient, ...) construct them inside their own
     ``dispatch`` from these primitives.
     """
     from deeptrade.core.config import ConfigService
