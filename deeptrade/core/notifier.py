@@ -35,7 +35,8 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 if TYPE_CHECKING:  # pragma: no cover
     from deeptrade.core.db import Database
     from deeptrade.core.plugin_manager import InstalledPlugin, PluginManager
-    from deeptrade.plugins_api.channel import ChannelPlugin, PluginContext
+    from deeptrade.plugins_api.base import PluginContext
+    from deeptrade.plugins_api.channel import ChannelPlugin
     from deeptrade.plugins_api.notify import NotificationPayload
 
 logger = logging.getLogger(__name__)
@@ -229,7 +230,7 @@ def build_notifier(db: Database, plugin_manager: PluginManager) -> Notifier:
     """
     from deeptrade.core.config import ConfigService  # avoid circular import
     from deeptrade.core.plugin_manager import _load_entrypoint
-    from deeptrade.plugins_api.channel import PluginContext
+    from deeptrade.plugins_api.base import PluginContext
 
     channel_records: list[InstalledPlugin] = [
         r for r in plugin_manager.list_all() if r.type == "channel" and r.enabled

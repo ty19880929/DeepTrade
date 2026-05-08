@@ -22,7 +22,7 @@ import sys
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # pragma: no cover
-    from deeptrade.plugins_api.channel import PluginContext
+    from deeptrade.plugins_api.base import PluginContext
     from deeptrade.plugins_api.notify import NotificationPayload
 
 

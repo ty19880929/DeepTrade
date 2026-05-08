@@ -10,7 +10,12 @@ from enum import StrEnum
 
 
 class RunStatus(StrEnum):
-    """Allowed values for strategy_runs.status."""
+    """Allowed values for a plugin run's terminal status.
+
+    v0.5+: each plugin owns its own ``<prefix>_runs.status`` column (e.g.
+    ``lub_runs`` / ``va_runs``); the framework no longer keeps a unified
+    ``strategy_runs`` table.
+    """
 
     RUNNING = "running"
     SUCCESS = "success"

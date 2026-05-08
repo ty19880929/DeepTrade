@@ -5,17 +5,37 @@ via the dotted entrypoint declared in the YAML metadata. The framework knows
 NOTHING about the plugin's domain semantics; the plugin owns its own command
 parsing, execution, persistence, and output.
 
-Channel plugins additionally implement :class:`deeptrade.plugins_api.channel.ChannelPlugin`
-so the notifier can hand them payloads.
+``PluginContext`` is the minimal services bundle the framework hands to every
+plugin's ``validate_static`` (during install) and to channel plugins' ``push``
+(during notify). It lives here — alongside the base ``Plugin`` Protocol —
+because it is the universal context for the base contract; channel-specific
+extensions live in :mod:`deeptrade.plugins_api.channel`.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:  # pragma: no cover
-    from deeptrade.plugins_api.channel import PluginContext
+    from deeptrade.core.config import ConfigService
+    from deeptrade.core.db import Database
     from deeptrade.plugins_api.metadata import PluginMetadata
+
+
+@dataclass
+class PluginContext:
+    """Minimal services bundle the framework hands to a plugin's
+    ``validate_static`` (during install) and to a channel plugin's ``push``
+    (during notify).
+
+    Plugins that need richer services (TushareClient, LLMManager / LLMClient, etc.)
+    construct them inside their own ``dispatch`` from these primitives.
+    """
+
+    db: Database
+    config: ConfigService
+    plugin_id: str | None = None
 
 
 @runtime_checkable

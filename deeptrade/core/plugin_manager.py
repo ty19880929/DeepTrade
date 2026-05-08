@@ -163,7 +163,7 @@ def _build_validate_ctx(db: Database, meta: PluginMetadata) -> Any:
     ``dispatch`` from these primitives.
     """
     from deeptrade.core.config import ConfigService
-    from deeptrade.plugins_api.channel import PluginContext
+    from deeptrade.plugins_api.base import PluginContext
 
     return PluginContext(db=db, config=ConfigService(db), plugin_id=meta.plugin_id)
 

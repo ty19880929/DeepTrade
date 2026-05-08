@@ -29,8 +29,24 @@ DESIGN §10.2 + the M3/F3/F5 hard constraints from v0.3 review:
       response_json, prompt_hash, validation_status, plugin_id).
 
 Transports:
-    OpenAIClientTransport  — production; OpenAI-compatible chat completion API
-    RecordedTransport      — tests; FIFO-replays canned responses
+    OpenAICompatTransport  — base class; OpenAI-compatible chat completion API.
+        Subclasses ``_provider_extra_body()`` to translate ``StageProfile.thinking``
+        into each provider's wire shape (DashScope's ``enable_thinking`` boolean,
+        Claude-on-OAI-compat's ``thinking={"type":"enabled"}``, etc.).
+    GenericOpenAITransport — providers without a thinking dial (Kimi/DeepSeek/
+        OpenRouter/...); ``thinking`` flag is silently dropped per the
+        plugins_api/llm.py contract.
+    DashScopeTransport     — Alibaba Qwen on DashScope. qwen3.x defaults to
+        thinking=ON, so we MUST pass ``enable_thinking`` explicitly for both
+        True and False — otherwise the plugin's "thinking off" preset is
+        ineffective and runs hit the per-call timeout.
+    RecordedTransport      — tests; FIFO-replays canned responses.
+
+Routing: ``_select_transport_class(base_url)`` picks the right subclass via a
+small framework-internal substring table. Unknown base_urls fall back to
+GenericOpenAITransport. Insertion of a new provider type = one entry in
+``_TRANSPORT_BY_BASE_URL`` + one subclass; configuration-layer schemas are
+unaffected on purpose (the dialect is not user-tunable).
 """
 
 from __future__ import annotations
@@ -115,13 +131,25 @@ class LLMTransport(ABC):
         """Send one chat. MUST NOT pass tools/tool_choice/functions."""
 
 
-class OpenAIClientTransport(LLMTransport):
-    """Production transport — OpenAI-compatible chat completion."""
+class OpenAICompatTransport(LLMTransport):
+    """Production transport base — OpenAI-compatible chat completion.
+
+    Subclasses override ``_provider_extra_body()`` to inject provider-specific
+    knobs (notably the various flavors of the "thinking" dial). The default
+    implementation returns ``{}``: appropriate for OpenAI-compatible providers
+    that don't recognize a thinking concept, where ``StageProfile.thinking``
+    is silently dropped per the plugins_api/llm.py contract.
+    """
 
     def __init__(self, api_key: str, base_url: str, timeout: int) -> None:
         from openai import OpenAI  # noqa: PLC0415
 
         self._client = OpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
+
+    def _provider_extra_body(self, *, thinking: bool) -> dict[str, Any]:
+        """Provider-specific keys merged into ``extra_body``. Default: none."""
+        del thinking  # base class has no provider knobs
+        return {}
 
     def chat(
         self,
@@ -136,10 +164,6 @@ class OpenAIClientTransport(LLMTransport):
     ) -> LLMResponse:
         from openai import APIError, APITimeoutError  # noqa: PLC0415
 
-        extra_body: dict[str, Any] = {}
-        if thinking:
-            extra_body["thinking"] = {"type": "enabled"}
-
         kwargs: dict[str, Any] = {
             "model": model,
             "messages": [
@@ -152,6 +176,7 @@ class OpenAIClientTransport(LLMTransport):
             "max_tokens": max_tokens,
             "stream": False,
         }
+        extra_body = self._provider_extra_body(thinking=thinking)
         if extra_body:
             kwargs["extra_body"] = extra_body
 
@@ -170,6 +195,54 @@ class OpenAIClientTransport(LLMTransport):
             input_tokens=int(getattr(usage, "prompt_tokens", 0) or 0),
             output_tokens=int(getattr(usage, "completion_tokens", 0) or 0),
         )
+
+
+class GenericOpenAITransport(OpenAICompatTransport):
+    """OpenAI-compatible providers without a thinking dial.
+
+    Catch-all for providers like DeepSeek, Kimi, Doubao, GLM, Yi, OpenRouter, …
+    The ``thinking`` flag from ``StageProfile`` is silently dropped here per
+    the contract documented in ``plugins_api/llm.py``.
+    """
+
+
+class DashScopeTransport(OpenAICompatTransport):
+    """Alibaba DashScope (Qwen family).
+
+    qwen3.x defaults to thinking=ON; the only way to actually disable it is to
+    send ``enable_thinking=False`` explicitly. Sending nothing leaves thinking
+    on, which can blow past the per-call timeout for high-output prompts (the
+    model burns its budget on internal reasoning before any visible content).
+    Therefore we always emit ``enable_thinking`` — both for True and False.
+    """
+
+    def _provider_extra_body(self, *, thinking: bool) -> dict[str, Any]:
+        return {"enable_thinking": thinking}
+
+
+# ---------------------------------------------------------------------------
+# Transport routing (framework-internal)
+# ---------------------------------------------------------------------------
+
+# base_url substring → transport class. Substring (not strict host) is fine
+# because each entry's pattern is anchored to the provider's well-known domain
+# and tolerates port / path / version variations. New entries land here and
+# nowhere else; user-facing config has no "dialect" knob on purpose.
+_TRANSPORT_BY_BASE_URL: tuple[tuple[str, type[OpenAICompatTransport]], ...] = (
+    ("dashscope.aliyuncs.com", DashScopeTransport),
+)
+
+
+def _select_transport_class(base_url: str) -> type[OpenAICompatTransport]:
+    """Pick the OpenAI-compat transport subclass for a provider's base_url.
+
+    Substring match against ``_TRANSPORT_BY_BASE_URL``; unknown base_urls fall
+    back to ``GenericOpenAITransport`` (which silently drops thinking flags).
+    """
+    for pattern, cls in _TRANSPORT_BY_BASE_URL:
+        if pattern in base_url:
+            return cls
+    return GenericOpenAITransport
 
 
 class RecordedTransport(LLMTransport):

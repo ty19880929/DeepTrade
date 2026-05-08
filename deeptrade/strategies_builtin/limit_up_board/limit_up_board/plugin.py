@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 from . import cli as _cli
 
 if TYPE_CHECKING:  # pragma: no cover
-    from deeptrade.plugins_api.channel import PluginContext
+    from deeptrade.plugins_api.base import PluginContext
 
 
 class LimitUpBoardPlugin:

@@ -15,16 +15,18 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from deeptrade.core.db import Database, apply_core_migrations
 from deeptrade.core.llm_client import (
+    DashScopeTransport,
+    GenericOpenAITransport,
     LLMClient,
     LLMResponse,
     LLMTransport,
     LLMTransportError,
     LLMValidationError,
-    OpenAIClientTransport,
+    OpenAICompatTransport,
     RecordedTransport,
+    _select_transport_class,
 )
 from deeptrade.plugins_api import StageProfile
-
 
 # Test stage profiles — mirror what plugin profiles.py would resolve.
 # `THINKING_OFF_32K` corresponds to fast/balanced R1; `THINKING_ON_32K` to
@@ -206,11 +208,11 @@ def test_no_tools_param_passed_through_transport(
 
 
 def test_openai_transport_signature_does_not_accept_tools() -> None:
-    """OpenAIClientTransport.chat() must NOT have a `tools` kwarg in its
+    """OpenAICompatTransport.chat() must NOT have a `tools` kwarg in its
     signature; this prevents accidentally adding it later."""
     import inspect
 
-    sig = inspect.signature(OpenAIClientTransport.chat)
+    sig = inspect.signature(OpenAICompatTransport.chat)
     forbidden = {"tools", "tool_choice", "functions", "function_call"}
     assert not (forbidden & set(sig.parameters.keys()))
 
@@ -340,3 +342,86 @@ def test_reasoning_effort_flows_through(client: LLMClient, transport: RecordedTr
     transport.register(_ok_response())
     client.complete_json(system="s", user="u", schema=_SchemaResp, profile=THINKING_ON_32K)
     assert transport.last_call_kwargs["reasoning_effort"] == "high"
+
+
+# ---------------------------------------------------------------------------
+# Provider-specific thinking dialect (transport hierarchy)
+# ---------------------------------------------------------------------------
+
+
+def test_generic_transport_drops_thinking_silently() -> None:
+    """Catch-all for OpenAI-compat providers without a thinking dial — the
+    flag is dropped per the plugins_api/llm.py contract."""
+    t = GenericOpenAITransport(
+        api_key="dummy", base_url="https://api.deepseek.com", timeout=10
+    )
+    assert t._provider_extra_body(thinking=True) == {}
+    assert t._provider_extra_body(thinking=False) == {}
+
+
+def test_dashscope_transport_always_emits_enable_thinking() -> None:
+    """DashScope qwen3.x defaults to thinking=ON; the framework MUST send
+    `enable_thinking=False` explicitly to disable it. Sending only on True
+    (or using Anthropic's `thinking={"type":"enabled"}` shape) leaves
+    thinking on, which manifests as request timeouts on long-output prompts.
+    """
+    t = DashScopeTransport(
+        api_key="dummy",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        timeout=10,
+    )
+    assert t._provider_extra_body(thinking=True) == {"enable_thinking": True}
+    assert t._provider_extra_body(thinking=False) == {"enable_thinking": False}
+
+
+def test_dashscope_transport_sends_enable_thinking_through_chat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end wire-shape regression — the kwargs handed to OpenAI's
+    chat.completions.create() must carry `extra_body={"enable_thinking": ...}`
+    for DashScope, even when thinking=False."""
+    from types import SimpleNamespace
+
+    captured: dict[str, Any] = {}
+
+    def fake_create(**kwargs: Any) -> Any:
+        captured.update(kwargs)
+        choice = SimpleNamespace(message=SimpleNamespace(content='{"k": 1}'))
+        return SimpleNamespace(
+            choices=[choice],
+            usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5),
+        )
+
+    t = DashScopeTransport(
+        api_key="dummy",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        timeout=10,
+    )
+    monkeypatch.setattr(t._client.chat.completions, "create", fake_create)
+
+    t.chat(
+        model="qwen3.6-plus",
+        system="s",
+        user="u",
+        temperature=0.1,
+        max_tokens=128,
+        thinking=False,
+        reasoning_effort="medium",
+    )
+    assert captured["extra_body"] == {"enable_thinking": False}
+
+
+def test_select_transport_class_routes_dashscope_by_base_url() -> None:
+    assert (
+        _select_transport_class("https://dashscope.aliyuncs.com/compatible-mode/v1")
+        is DashScopeTransport
+    )
+
+
+def test_select_transport_class_defaults_to_generic() -> None:
+    """Unknown base_urls fall back to GenericOpenAITransport — this preserves
+    the v0.6 behavior (no thinking knob) for every previously-supported
+    provider, so no migration of stored configs is required."""
+    assert _select_transport_class("https://api.deepseek.com") is GenericOpenAITransport
+    assert _select_transport_class("https://api.openai.com/v1") is GenericOpenAITransport
+    assert _select_transport_class("https://api.moonshot.cn/v1") is GenericOpenAITransport

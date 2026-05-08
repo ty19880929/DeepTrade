@@ -34,7 +34,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from deeptrade.core.llm_client import LLMClient, OpenAIClientTransport
+from deeptrade.core.llm_client import LLMClient, _select_transport_class
 
 if TYPE_CHECKING:  # pragma: no cover
     from deeptrade.core.config import ConfigService
@@ -153,7 +153,8 @@ class LLMManager:
                 f"run `deeptrade config set-llm` and choose {name!r}"
             )
 
-        transport = OpenAIClientTransport(
+        transport_cls = _select_transport_class(provider.base_url)
+        transport = transport_cls(
             api_key=str(api_key),
             base_url=provider.base_url,
             timeout=provider.timeout,

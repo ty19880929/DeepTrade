@@ -1,7 +1,9 @@
 """Strategy event model.
 
-DESIGN §8.5: full enumeration of EventType values; runner persists every
-event into ``strategy_events`` and (optionally) drives the Live dashboard.
+DESIGN §8.5: full enumeration of EventType values. v0.5+: each plugin owns
+its own ``<prefix>_events`` table (e.g. ``lub_events`` / ``va_events``) and
+decides whether/how to persist these — the framework no longer provides a
+unified ``strategy_events`` table or a runner that writes into one.
 """
 
 from __future__ import annotations

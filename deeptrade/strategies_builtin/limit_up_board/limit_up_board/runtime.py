@@ -105,6 +105,53 @@ def build_tushare_client(
     )
 
 
+def open_worker_runtime(
+    plugin_id: str,
+    run_id: str,
+    *,
+    config: ConfigService,
+    is_intraday: bool = False,
+) -> tuple[Database, LubRuntime]:
+    """Construct an isolated runtime for a debate-mode worker thread.
+
+    Each worker gets its own DuckDB connection + ``LLMManager`` so that
+    concurrent ``LLMClient.complete_json`` calls don't share the lock /
+    audit-write bookkeeping. Same-process multiple ``duckdb.connect()`` calls
+    against the same file share the underlying DB instance, so writes still
+    land in the same physical file (run history visible across all workers).
+
+    The ``ConfigService`` (and its ``SecretStore``) is **shared** with the
+    main thread on purpose: ``SecretStore`` probes the OS keyring at
+    construction time with a side-effecting set/get/delete round-trip, and
+    running that probe per worker is both wasteful and racy — concurrent
+    workers overwrite each other's probe key, causing false negatives that
+    silently demote keyring-stored secrets to "no api_key set".
+
+    Sharing implies that ``ConfigService`` reads (e.g. ``get_app_config``)
+    are issued against the **main thread's** ``Database._conn`` from worker
+    threads. ``Database.fetchone`` / ``fetchall`` MUST therefore hold their
+    write lock across the full execute+fetch round-trip; otherwise concurrent
+    workers race on the connection's result set and trigger a native heap
+    corruption (Windows 0xC0000374). See ``deeptrade.core.db``.
+
+    The worker MUST close ``db`` when done.
+    """
+    from deeptrade.core import paths
+    from deeptrade.core.db import Database
+    from deeptrade.core.llm_manager import LLMManager
+
+    db = Database(paths.db_path())
+    rt = LubRuntime(
+        db=db,
+        config=config,
+        llms=LLMManager(db, config),
+        plugin_id=plugin_id,
+        run_id=run_id,
+        is_intraday=is_intraday,
+    )
+    return db, rt
+
+
 def pick_llm_provider(rt: LubRuntime) -> str:
     """Pick which configured LLM provider to use for this run.
 

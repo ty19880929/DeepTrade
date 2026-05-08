@@ -1,8 +1,8 @@
 # DeepTrade
 
-> 本地运行的 A 股（沪深主板）选股 CLI 工具：tushare 行情 + DeepSeek V4 LLM + DuckDB 单机仓库 + 插件式 CLI 框架。
+> 本地运行的 A 股（沪深主板）选股 CLI 工具：tushare 行情 + OpenAI 兼容 LLM（DeepSeek / Qwen / Kimi …）+ DuckDB 单机仓库 + 插件式 CLI 框架。
 
-[![tests](https://img.shields.io/badge/tests-114%20passing-brightgreen)](#) [![python](https://img.shields.io/badge/python-3.11+-blue)](#) [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![tests](https://img.shields.io/badge/tests-passing-brightgreen)](#) [![python](https://img.shields.io/badge/python-3.11+-blue)](#) [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 ## ✨ 主要特性
 
@@ -10,6 +10,7 @@
 - **纯透传式插件 CLI**：框架命令面**封闭**——只管 `init / config / plugin / data`；其余命令一律按 `deeptrade <plugin_id> <argv...>` 透传给插件，插件自管 `--help`、子命令、参数、持久化。新增插件类型（皮肤、新数据源、回测、IM 渠道……）零框架改动。
 - **数据隔离（Plan A）**：每个插件在自己的 migrations 里声明并拥有自己的表（含 tushare 派生数据），框架不持有任何业务表。`tushare_sync_state` / `tushare_calls` / `llm_calls` 都按 `plugin_id` 维度隔离。
 - **顶层通知 API**：`from deeptrade import notify, notification_session` 一行发推送；框架根据已安装的 channel 插件自动路由，无 channel 时自动 noop。
+- **多 LLM Provider 共存**：`llm.providers` 字典化配置，多个 OpenAI 兼容服务并存；插件通过 `LLMManager.get_client(name=...)` 按名取用，单次 run 内可调多家。
 - **LLM 强约束**：JSON 模式 + Pydantic 双层校验；**永远**不传 tools / function calls。
 - **盘中数据隔离**：`--allow-intraday` 模式下同步的不完整数据写入 `data_completeness='intraday'`，日终模式严格拒绝命中。
 
@@ -32,8 +33,9 @@ pip install -e ".[dev]"
 ```bash
 deeptrade init                            # 建库 + 应用 core migrations
 deeptrade config set-tushare              # 交互式输入 tushare token
-deeptrade config set-deepseek             # 交互式输入 deepseek api key
-deeptrade config test                     # 全链路自检
+deeptrade config set-llm                  # 交互式增/改/删 LLM provider（deepseek / qwen / kimi …）
+deeptrade config list-llm                 # 列出已配置且可用的 provider
+deeptrade config test-llm                 # 对所有 provider 做连通性自检（也可加 <name> 单测）
 deeptrade config show                     # 表格展示当前配置（密钥脱敏）
 ```
 
@@ -71,7 +73,7 @@ deeptrade stdout-channel test
 | `deeptrade --version` / `-V` | 显示版本 |
 | `deeptrade --help` / `-h` | 框架命令清单（**不**枚举插件子命令） |
 | `deeptrade init [--no-prompts]` | 建库 + 应用 core migrations |
-| `deeptrade config {show, set, set-tushare, set-deepseek, test}` | 全局配置 |
+| `deeptrade config {show, set, set-tushare, set-llm, list-llm, test-llm}` | 全局配置 |
 | `deeptrade plugin install <path> [-y]` | 本地路径安装（绝不联网） |
 | `deeptrade plugin list / info <id>` | 列表 / 详情 |
 | `deeptrade plugin enable <id> / disable <id>` | 启 / 停 |

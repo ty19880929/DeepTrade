@@ -58,12 +58,23 @@ class Database:
     def fetchone(
         self, sql: str, params: tuple[Any, ...] | list[Any] | None = None
     ) -> tuple[Any, ...] | None:
-        return self.execute(sql, params).fetchone()
+        # Lock must span execute + fetch: duckdb's `_conn.execute()` returns the
+        # connection itself with the result set attached. Releasing the lock
+        # between execute and fetch lets another thread issue a new execute on
+        # the same connection, overwriting our pending result and triggering a
+        # native heap corruption (Windows 0xC0000374) on fetchone.
+        with self._write_lock:
+            if params is None:
+                return self._conn.execute(sql).fetchone()
+            return self._conn.execute(sql, params).fetchone()
 
     def fetchall(
         self, sql: str, params: tuple[Any, ...] | list[Any] | None = None
     ) -> list[tuple[Any, ...]]:
-        return self.execute(sql, params).fetchall()
+        with self._write_lock:
+            if params is None:
+                return self._conn.execute(sql).fetchall()
+            return self._conn.execute(sql, params).fetchall()
 
     @contextmanager
     def transaction(self) -> Iterator[None]:

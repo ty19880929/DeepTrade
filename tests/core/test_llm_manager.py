@@ -135,3 +135,41 @@ def test_multiple_providers_coexist(svc: ConfigService, mgr: LLMManager) -> None
     # Each is independently a working LLMClient
     assert isinstance(a, LLMClient)
     assert isinstance(b, LLMClient)
+
+
+# ---------------------------------------------------------------------------
+# Transport routing — base_url decides the OpenAI-compat subclass
+# ---------------------------------------------------------------------------
+
+
+def test_get_client_uses_dashscope_transport_for_dashscope_base_url(
+    svc: ConfigService, mgr: LLMManager
+) -> None:
+    """A qwen-plus provider configured against DashScope must end up wired to
+    DashScopeTransport so ``StageProfile.thinking=False`` actually disables
+    qwen3's default-on thinking mode (otherwise long-output batches time out).
+    """
+    from deeptrade.core.llm_client import DashScopeTransport
+
+    svc.set_llm_provider(
+        "qwen-plus",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        model="qwen3.6-plus",
+        api_key="sk-x",
+    )
+    client = mgr.get_client("qwen-plus", plugin_id="P", run_id="R")
+    assert isinstance(client._transport, DashScopeTransport)  # type: ignore[attr-defined]
+
+
+def test_get_client_uses_generic_transport_for_unknown_base_url(
+    svc: ConfigService, mgr: LLMManager
+) -> None:
+    """Anything not in the routing table falls back to GenericOpenAITransport;
+    pre-existing providers (DeepSeek/Kimi/...) keep their v0.6 behavior."""
+    from deeptrade.core.llm_client import GenericOpenAITransport
+
+    svc.set_llm_provider(
+        "deepseek", base_url="https://api.deepseek.com", model="m", api_key="sk-1"
+    )
+    client = mgr.get_client("deepseek", plugin_id="P", run_id="R")
+    assert isinstance(client._transport, GenericOpenAITransport)  # type: ignore[attr-defined]

@@ -26,19 +26,23 @@ from deeptrade.plugins_api import StageProfile
 from deeptrade.plugins_api.events import EventLevel, EventType, StrategyEvent
 
 from .data import Round1Bundle, SectorStrength
-from .profiles import STAGE_FINAL, STAGE_R1, STAGE_R2, resolve_profile
+from .profiles import STAGE_FINAL, STAGE_R1, STAGE_R2, STAGE_R3, resolve_profile
 from .prompts import (
     FINAL_RANKING_SYSTEM,
     R1_SYSTEM,
     R2_SYSTEM,
+    R3_DEBATE_SYSTEM,
     final_ranking_user_prompt,
     r1_user_prompt,
     r2_user_prompt,
+    r3_user_prompt,
 )
 from .schemas import (
     ContinuationCandidate,
     ContinuationResponse,
     FinalRankingResponse,
+    RevisedContinuationCandidate,
+    RevisionResponse,
     StrongAnalysisResponse,
     StrongCandidate,
 )
@@ -686,13 +690,20 @@ def _r2_row_from_selected(
     We re-attach the normalized fields so the LLM doesn't have to re-derive them.
     """
     base = next((r for r in all_candidates if r["candidate_id"] == sc.candidate_id), {})
-    return {
+    row: dict[str, Any] = {
         **base,
         "r1_score": sc.score,
         "r1_strength_level": sc.strength_level,
         "r1_themes": [],
         "r1_rationale": sc.rationale,
     }
+    # Flatten list-valued source fields to scalar siblings so the LLM can cite
+    # them in EvidenceItem.value (which is scalar-only: str|int|float|None).
+    seats = row.pop("lhb_famous_seats", None)
+    seats_list = seats if isinstance(seats, list) else []
+    row["lhb_famous_seats_count"] = len(seats_list)
+    row["lhb_famous_seats_text"] = "; ".join(str(s) for s in seats_list)
+    return row
 
 
 def _final_row_from_pred(p: ContinuationCandidate) -> dict[str, Any]:
@@ -709,6 +720,149 @@ def _final_row_from_pred(p: ContinuationCandidate) -> dict[str, Any]:
             for e in p.key_evidence[:3]
         ],
     }
+
+
+# ---------------------------------------------------------------------------
+# R3 — Debate-mode revision (each LLM revises its own R2 after seeing peers)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class DebateRoundResult:
+    """Outcome of a single LLM's R3 (debate-revision) phase."""
+
+    success: bool = False
+    error: str | None = None
+    candidates_in: int = 0
+    revision_summary: str = ""
+    revised: list[RevisedContinuationCandidate] = field(default_factory=list)
+
+
+def run_r3_debate(
+    *,
+    llm: LLMClient,
+    bundle: Round1Bundle,
+    own_predictions: list[ContinuationCandidate],
+    peers: list[tuple[str, list[ContinuationCandidate]]],
+    preset: str,
+    self_label: str = "you",
+) -> Iterable[tuple[StrategyEvent, DebateRoundResult | None]]:
+    """Single-batch R3 revision; yields events + a terminal result.
+
+    The revising LLM receives its own ``own_predictions`` (full view) plus a
+    trimmed view of every entry in ``peers`` (already anonymised). The output
+    candidate_id set is enforced to equal the input ``own_predictions`` set.
+    """
+    profile = resolve_profile(preset, STAGE_R3)
+    n = len(own_predictions)
+    yield (
+        StrategyEvent(
+            type=EventType.LIVE_STATUS,
+            message=f"[辩论修订] 待修订 {n} 只，参考同行 {len(peers)} 位...",
+        ),
+        None,
+    )
+    yield (
+        StrategyEvent(
+            type=EventType.STEP_STARTED,
+            message="Step 4.7: R3 debate revision",
+            payload={"n_candidates": n, "n_peers": len(peers), "self_label": self_label},
+        ),
+        None,
+    )
+
+    result = DebateRoundResult(candidates_in=n)
+    if n == 0:
+        yield (
+            StrategyEvent(
+                type=EventType.STEP_FINISHED,
+                message="Step 4.7: R3 debate revision",
+                payload={"success": False, "reason": "empty own_predictions"},
+            ),
+            result,
+        )
+        return
+
+    user = r3_user_prompt(
+        trade_date=bundle.trade_date,
+        next_trade_date=bundle.next_trade_date,
+        own_predictions=own_predictions,
+        peers=peers,
+        market_context=bundle.market_summary,
+    )
+    expected_ids = {c.candidate_id for c in own_predictions}
+    yield (
+        StrategyEvent(
+            type=EventType.LLM_BATCH_STARTED,
+            message="R3 debate (single batch)",
+            payload={"size": n},
+        ),
+        None,
+    )
+    try:
+        obj, meta = _complete_with_set_check(
+            llm,
+            system=R3_DEBATE_SYSTEM,
+            user=user,
+            schema=RevisionResponse,
+            profile=profile,
+            expected_ids=expected_ids,
+            envelope_defaults={
+                "stage": "limit_up_continuation_revision",
+                "trade_date": bundle.trade_date,
+                "next_trade_date": bundle.next_trade_date,
+                "revision_summary": "",
+            },
+        )
+    except (LLMValidationError, LLMTransportError, _SetMismatchError) as e:
+        result.error = f"{type(e).__name__}: {e}"
+        yield (
+            StrategyEvent(
+                type=EventType.VALIDATION_FAILED,
+                level=EventLevel.ERROR,
+                message=f"R3 debate failed: {e}",
+            ),
+            None,
+        )
+        yield (
+            StrategyEvent(
+                type=EventType.STEP_FINISHED,
+                message="Step 4.7: R3 debate revision",
+                payload={"success": False},
+            ),
+            result,
+        )
+        return
+
+    result.success = True
+    result.revised = list(obj.candidates)
+    result.revision_summary = obj.revision_summary
+    yield (
+        StrategyEvent(
+            type=EventType.LLM_BATCH_FINISHED,
+            message="R3 debate ok",
+            payload={
+                "input_tokens": meta["input_tokens"],
+                "output_tokens": meta["output_tokens"],
+            },
+        ),
+        None,
+    )
+    yield (
+        StrategyEvent(
+            type=EventType.LIVE_STATUS,
+            message=f"[辩论修订] 完成 — 修订 {len(result.revised)} 只",
+        ),
+        None,
+    )
+    yield (
+        StrategyEvent(
+            type=EventType.STEP_FINISHED,
+            message="Step 4.7: R3 debate revision",
+            payload={"success": True, "revised": len(result.revised)},
+        ),
+        result,
+    )
 
 
 # Suppress unused-import warning for fields we re-export indirectly via tests

@@ -110,6 +110,43 @@ class ContinuationResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# R3 — Debate-mode revision (each LLM revises its own R2 after seeing peers)
+# ---------------------------------------------------------------------------
+
+
+class RevisedContinuationCandidate(ContinuationCandidate):
+    """R2 fields + ``revision_note`` recording why the prediction shifted
+    after reviewing peer LLM outputs."""
+
+    model_config = ConfigDict(extra="forbid")
+    revision_note: str = Field(..., max_length=120)
+
+
+class RevisionResponse(BaseModel):
+    """R3 output. ``candidates`` keeps the same candidate_id set as the LLM's
+    own R2 (set-equality enforced by the pipeline); ranks are 1..N dense
+    within this single batch."""
+
+    model_config = ConfigDict(extra="forbid")
+    stage: Literal["limit_up_continuation_revision"]
+    trade_date: str
+    next_trade_date: str
+    revision_summary: str = Field(..., max_length=200)
+    candidates: list[RevisedContinuationCandidate]
+
+    @field_validator("candidates")
+    @classmethod
+    def ranks_must_be_dense_1_to_n(
+        cls, v: list[RevisedContinuationCandidate]
+    ) -> list[RevisedContinuationCandidate]:
+        ranks = sorted(c.rank for c in v)
+        expected = list(range(1, len(ranks) + 1))
+        if ranks != expected:
+            raise ValueError(f"candidate ranks must be a dense permutation 1..N; got {ranks}")
+        return v
+
+
+# ---------------------------------------------------------------------------
 # Final-ranking — global re-rank when R2 was multi-batch (M4 + S5)
 # ---------------------------------------------------------------------------
 

@@ -7,36 +7,20 @@ metadata, just like any other plugin.
 Channel plugins are EXPLICITLY EXEMPTED from the "no direct external API" rule
 that applies to other plugins: a channel IS an HTTP client by nature, so it may
 ``import httpx``/``requests`` directly. They still go through ``PluginContext``
-for DB and config access.
+(defined in :mod:`deeptrade.plugins_api.base`) for DB and config access.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
-from deeptrade.plugins_api.base import Plugin
+from deeptrade.plugins_api.base import Plugin, PluginContext
 
 if TYPE_CHECKING:  # pragma: no cover
-    from deeptrade.core.config import ConfigService
-    from deeptrade.core.db import Database
     from deeptrade.plugins_api.metadata import PluginMetadata
     from deeptrade.plugins_api.notify import NotificationPayload
 
-
-@dataclass
-class PluginContext:
-    """Minimal services bundle the framework hands to a plugin's
-    ``validate_static`` (during install) and to a channel plugin's ``push``
-    (during notify).
-
-    Plugins that need richer services (TushareClient, LLMManager / LLMClient, etc.)
-    construct them inside their own ``dispatch`` from these primitives.
-    """
-
-    db: Database
-    config: ConfigService
-    plugin_id: str | None = None
+__all__ = ["ChannelPlugin", "PluginContext"]
 
 
 @runtime_checkable
