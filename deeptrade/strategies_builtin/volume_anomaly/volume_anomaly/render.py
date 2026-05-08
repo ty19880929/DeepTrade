@@ -12,7 +12,8 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import asdict, is_dataclass
+import math
+from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
 from typing import Any
 
@@ -80,13 +81,23 @@ def write_screen_report(
         f"- intraday: `{is_intraday}`\n"
     )
     md.append(_render_rules_md(rules))
+    upper_shadow_label = (
+        f"上影线≤{rules.upper_shadow_ratio_max:.2f}"
+        if rules.upper_shadow_ratio_max is not None
+        else "上影线过滤(关闭)"
+    )
+    if rules.turnover_buckets is not None:
+        turnover_label = "换手率(按流通市值分桶)"
+    else:
+        turnover_label = f"换手率{rules.turnover_min}-{rules.turnover_max}%"
     md.append(
         "\n## 筛选漏斗\n"
         f"- 主板池: **{result.n_main_board}**\n"
         f"- 排除 ST/停牌后: **{result.n_after_st_susp}**\n"
         f"- 满足『阳线 + 实体≥{rules.body_ratio_min} + 涨幅"
         f"{rules.pct_chg_min}-{rules.pct_chg_max}%』: **{result.n_after_t_day_rules}**\n"
-        f"- 满足『换手率{rules.turnover_min}-{rules.turnover_max}%』: "
+        f"- 满足『{upper_shadow_label}』: **{result.n_after_upper_shadow}**\n"
+        f"- 满足『{turnover_label}』: "
         f"**{result.n_after_turnover}**\n"
         f"- 满足『({rules.vol_max_short_window}日最大量 OR "
         f"{rules.lookback_trade_days}日top{rules.vol_top_n_long}) + "
@@ -236,13 +247,13 @@ def write_analyze_report(
 
     md.append(f"\n## 即将启动 · imminent_launch ({len(by_pred['imminent_launch'])} 只)\n")
     if by_pred["imminent_launch"]:
-        md.append("| # | Code | Name | 已追踪 | Score | Pattern | 洗盘 | Conf | Rationale |\n")
-        md.append("|---|------|------|-------|-------|---------|------|------|-----------|\n")
+        md.append("| # | Code | Name | 已追踪 | Score | W/P/C/S/H/R | Pattern | 洗盘 | Conf | Rationale |\n")
+        md.append("|---|------|------|-------|-------|-------------|---------|------|------|-----------|\n")
         for c in by_pred["imminent_launch"]:
             td = tracked_days_lookup.get(c.candidate_id, 0)
             md.append(
                 f"| {c.rank} | `{c.ts_code}` | {c.name} | {td}日 | "
-                f"{c.launch_score:.1f} | {c.pattern} | {c.washout_quality} | "
+                f"{c.launch_score:.1f} | {_dim_compact(c)} | {c.pattern} | {c.washout_quality} | "
                 f"{c.confidence} | {c.rationale} |\n"
             )
     else:
@@ -250,13 +261,13 @@ def write_analyze_report(
 
     md.append(f"\n## 持续观察 · watching ({len(by_pred['watching'])} 只)\n")
     if by_pred["watching"]:
-        md.append("| # | Code | Name | 已追踪 | Score | Pattern | 洗盘 | Conf |\n")
-        md.append("|---|------|------|-------|-------|---------|------|------|\n")
+        md.append("| # | Code | Name | 已追踪 | Score | W/P/C/S/H/R | Pattern | 洗盘 | Conf |\n")
+        md.append("|---|------|------|-------|-------|-------------|---------|------|------|\n")
         for c in by_pred["watching"]:
             td = tracked_days_lookup.get(c.candidate_id, 0)
             md.append(
                 f"| {c.rank} | `{c.ts_code}` | {c.name} | {td}日 | "
-                f"{c.launch_score:.1f} | {c.pattern} | {c.washout_quality} | "
+                f"{c.launch_score:.1f} | {_dim_compact(c)} | {c.pattern} | {c.washout_quality} | "
                 f"{c.confidence} |\n"
             )
     else:
@@ -367,6 +378,109 @@ def write_prune_report(
 
 
 # ---------------------------------------------------------------------------
+# EVALUATE report (v0.4.0 P1-3)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class EvaluateOutcome:
+    """Summary of one evaluate run — fed to ``write_evaluate_report``."""
+    today: str
+    n_targets: int
+    n_skipped_complete: int
+    n_complete: int
+    n_partial: int
+    n_pending: int
+    lookback_days: int
+    backfill_all: bool = False
+
+
+def write_evaluate_report(
+    run_id: str,
+    *,
+    outcome: EvaluateOutcome,
+    reports_root: Path | None = None,
+) -> Path:
+    root = (reports_root or paths.reports_dir()) / str(run_id)
+    root.mkdir(parents=True, exist_ok=True)
+    md = []
+    md.append("# 成交量异动策略 — T+N 实际收益评估\n")
+    md.append(
+        f"- mode: **evaluate**\n"
+        f"- today: **{outcome.today}**\n"
+        f"- lookback: **{outcome.lookback_days}** 天 "
+        f"{'(`--backfill-all`)' if outcome.backfill_all else ''}\n"
+        f"- 评估目标: **{outcome.n_targets}** 条 hit "
+        f"(跳过已 complete: **{outcome.n_skipped_complete}**)\n"
+    )
+    md.append(
+        "\n## 状态分布\n"
+        f"- complete: **{outcome.n_complete}**\n"
+        f"- partial:  **{outcome.n_partial}**\n"
+        f"- pending:  **{outcome.n_pending}**\n"
+    )
+    md.append(
+        "\n_说明：`complete` = max horizon 已到 today 且全部 horizon 拉到收盘；"
+        "`partial` = max horizon 未到 today 或部分 horizon 因停牌缺数据；"
+        "`pending` = 连 T+1 都还在未来。下次 evaluate 会重算 partial / pending。_\n"
+    )
+    md.append("\n---\n*免责声明：本报告仅用于策略研究，不构成投资建议。*\n")
+    (root / "summary.md").write_text("".join(md), encoding="utf-8")
+    (root / "evaluate_summary.json").write_text(
+        json.dumps(asdict(outcome), ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    (root / "llm_calls.jsonl").touch(exist_ok=True)
+    return root
+
+
+# ---------------------------------------------------------------------------
+# Stats query renderer (v0.4.0 P1-3 — read-only aggregation)
+# ---------------------------------------------------------------------------
+
+
+def render_stats_table(
+    rows: list[dict[str, Any]],
+    *,
+    by: str,
+    title: str,
+    console: Any | None = None,
+) -> None:
+    """Print a stats-by-X aggregation table to stdout.
+
+    ``rows`` is a list of dicts with keys: bucket, n_samples, t3_mean,
+    t3_winrate, t5_max_ret_mean. Format aligns with ``stats`` CLI subcommand.
+    """
+    from rich.console import Console
+    from rich.table import Table
+
+    from deeptrade.theme import EVA_THEME
+
+    if console is None:
+        console = Console(theme=EVA_THEME)
+
+    if not rows:
+        console.print(f"[k.label]{title}[/k.label] _(no samples in range)_")
+        return
+
+    t = Table(title=title, title_style="title", border_style="panel.border.ok",
+              header_style="k.label")
+    t.add_column(by, style="k.value", no_wrap=True)
+    t.add_column("样本数", justify="right")
+    t.add_column("T+3 均收益", justify="right")
+    t.add_column("T+3 胜率", justify="right")
+    t.add_column("T+5 最大涨幅均", justify="right")
+    for r in rows:
+        t.add_row(
+            str(r.get("bucket", "?")),
+            str(r.get("n_samples", 0)),
+            f"{r['t3_mean']:+.2f}%" if r.get("t3_mean") is not None else "—",
+            f"{r['t3_winrate']:.1f}%" if r.get("t3_winrate") is not None else "—",
+            f"{r['t5_max_ret_mean']:+.2f}%" if r.get("t5_max_ret_mean") is not None else "—",
+        )
+    console.print(t)
+
+
+# ---------------------------------------------------------------------------
 # Terminal summary (concise post-run print)
 # ---------------------------------------------------------------------------
 
@@ -399,6 +513,8 @@ def render_terminal_summary(
         _render_screen_terminal(root, console, Table, Panel)
     elif (root / "pruned_codes.json").is_file():
         _render_prune_terminal(root, console, Table, Panel)
+    elif (root / "evaluate_summary.json").is_file():
+        _render_evaluate_terminal(root, console)
 
     console.print(f"\n[k.label]报告目录:[/k.label] [k.value]{root}[/k.value]")
     console.print(
@@ -519,6 +635,18 @@ def _render_analyze_terminal(root: Path, console: Any, Table: Any, _Panel: Any) 
         console.print(t)
 
 
+def _render_evaluate_terminal(root: Path, console: Any) -> None:
+    summary = _safe_load_json(root / "evaluate_summary.json", default={})
+    console.print(
+        f"[title]T+N 评估[/title]  "
+        f"[k.label]today=[/k.label][k.value]{summary.get('today', '?')}[/k.value]  "
+        f"[k.label]targets=[/k.label][k.value]{summary.get('n_targets', 0)}[/k.value]  "
+        f"[k.label]complete=[/k.label][k.value]{summary.get('n_complete', 0)}[/k.value]  "
+        f"[k.label]partial=[/k.label][k.value]{summary.get('n_partial', 0)}[/k.value]  "
+        f"[k.label]pending=[/k.label][k.value]{summary.get('n_pending', 0)}[/k.value]"
+    )
+
+
 def _render_prune_terminal(root: Path, console: Any, Table: Any, _Panel: Any) -> None:
     pruned = _safe_load_json(root / "pruned_codes.json", default=[])
     console.print(
@@ -622,6 +750,30 @@ def _render_diagnostics_md(diag: ScreenDiagnostics, rules: ScreenRules) -> str:
         sample = diag.adj_factor_missing_codes[:10]
         ellipsis = "..." if len(diag.adj_factor_missing_codes) > 10 else ""
         out.append(f"  - adj_factor(T) 缺失代码样本: `{sample}{ellipsis}`\n")
+
+    # v0.3.0 P0-1 — upper-shadow filter status.
+    if diag.upper_shadow_filter_enabled:
+        out.append(
+            f"- 上影线过滤: 阈值 ≤ **{diag.upper_shadow_filter_threshold:.2f}** "
+            f"(T-day 规则后剩 → 过滤后 **{diag.n_after_upper_shadow}** 只)\n"
+        )
+    else:
+        out.append("- 上影线过滤: `disabled`\n")
+
+    # v0.3.0 P0-2 — circ_mv-bucketed turnover distribution.
+    if diag.turnover_buckets_enabled:
+        out.append(f"- 流通市值分桶换手率命中分布 (n_missing_circ_mv={diag.n_missing_circ_mv}):\n")
+        if diag.turnover_bucket_hits:
+            for label, n in diag.turnover_bucket_hits.items():
+                out.append(f"  - {label}: **{n}**\n")
+        else:
+            out.append("  _(本次无候选进入分桶判定)_\n")
+        if diag.circ_mv_missing_codes:
+            sample = diag.circ_mv_missing_codes[:10]
+            ellipsis = "..." if len(diag.circ_mv_missing_codes) > 10 else ""
+            out.append(f"  - circ_mv 缺失代码样本: `{sample}{ellipsis}`\n")
+    else:
+        out.append("- 流通市值分桶换手率: `disabled` (使用全局 turnover_min/max)\n")
     return "".join(out)
 
 
@@ -652,17 +804,46 @@ def _diagnostics_to_dict(diag: ScreenDiagnostics) -> dict[str, Any]:
         "adj_factor_actual_days": diag.adj_factor_actual_days,
         "adj_factor_missing_dates": diag.adj_factor_missing_dates,
         "adj_factor_missing_codes": diag.adj_factor_missing_codes,
+        # v0.3.0 P0-1 / P0-2
+        "upper_shadow_filter_enabled": diag.upper_shadow_filter_enabled,
+        "upper_shadow_filter_threshold": diag.upper_shadow_filter_threshold,
+        "n_after_upper_shadow": diag.n_after_upper_shadow,
+        "turnover_buckets_enabled": diag.turnover_buckets_enabled,
+        "turnover_bucket_hits": diag.turnover_bucket_hits,
+        "n_missing_circ_mv": diag.n_missing_circ_mv,
+        "circ_mv_missing_codes": diag.circ_mv_missing_codes,
     }
 
 
 def _render_rules_md(rules: ScreenRules) -> str:
     """Render the本次使用的筛选阈值 section (transparent + auditable)."""
+    if rules.upper_shadow_ratio_max is None:
+        upper_shadow_line = "- 上影线过滤: **关闭** (`upper_shadow_ratio_max=null`)\n"
+    else:
+        upper_shadow_line = f"- 上影线占振幅 ≤: **{rules.upper_shadow_ratio_max}**\n"
+    if rules.turnover_buckets is None:
+        turnover_line = (
+            f"- 换手率区间: **[{rules.turnover_min}%, {rules.turnover_max}%]** (全局)\n"
+        )
+    else:
+        rows = []
+        prev_max = 0.0
+        for b_max, t_min, t_max in rules.turnover_buckets:
+            label = (
+                f">{int(prev_max)}亿"
+                if math.isinf(b_max)
+                else (f"≤{int(b_max)}亿" if prev_max <= 0 else f"{int(prev_max)}-{int(b_max)}亿")
+            )
+            rows.append(f"  - {label}: [{t_min}%, {t_max}%]")
+            prev_max = b_max
+        turnover_line = "- 换手率(按流通市值分桶):\n" + "\n".join(rows) + "\n"
     return (
         "\n## 筛选阈值（本次使用）\n"
         f"- 涨幅区间: **[{rules.pct_chg_min}%, {rules.pct_chg_max}%]**\n"
         f"- K线实体占比 ≥: **{rules.body_ratio_min}**\n"
-        f"- 换手率区间: **[{rules.turnover_min}%, {rules.turnover_max}%]**\n"
-        f"- 5日量比 ≥: **{rules.vol_ratio_5d_min}** "
+        + upper_shadow_line
+        + turnover_line
+        + f"- 5日量比 ≥: **{rules.vol_ratio_5d_min}** "
         f"_(严格使用 T 之前最近 5 个连续交易日)_\n"
         f"- 量价规则: **{rules.vol_max_short_window}日最大量** OR "
         f"**{rules.lookback_trade_days}日 vol 排名前 {rules.vol_top_n_long}**\n"
@@ -685,12 +866,19 @@ def _conf_short(c: str) -> str:
     return {"high": "高", "medium": "中", "low": "低"}.get(c, c[:1].upper() if c else "?")
 
 
+def _dim_compact(c: VATrendCandidate) -> str:
+    """Render dimension_scores as W/P/C/S/H/R (washout / pattern / capital /
+    sector / historical / risk). v0.6.0 P1-2."""
+    d = c.dimension_scores
+    return f"{d.washout}/{d.pattern}/{d.capital}/{d.sector}/{d.historical}/{d.risk}"
+
+
 def export_llm_calls(run_id: str, db: Any, *, reports_root: Path | None = None) -> int:
     """Pull this run's llm_calls rows into reports/<run_id>/llm_calls.jsonl."""
     root = (reports_root or paths.reports_dir()) / str(run_id)
     root.mkdir(parents=True, exist_ok=True)
     rows = db.fetchall(
-        "SELECT call_id, stage, model, prompt_hash, input_tokens, output_tokens, "
+        "SELECT call_id, model, prompt_hash, input_tokens, output_tokens, "
         "latency_ms, validation_status, error, created_at "
         "FROM llm_calls WHERE run_id = ? ORDER BY created_at",
         (run_id,),
@@ -702,15 +890,14 @@ def export_llm_calls(run_id: str, db: Any, *, reports_root: Path | None = None) 
                 json.dumps(
                     {
                         "call_id": str(row[0]),
-                        "stage": row[1],
-                        "model": row[2],
-                        "prompt_hash": row[3],
-                        "input_tokens": row[4],
-                        "output_tokens": row[5],
-                        "latency_ms": row[6],
-                        "validation_status": row[7],
-                        "error": row[8],
-                        "created_at": str(row[9]),
+                        "model": row[1],
+                        "prompt_hash": row[2],
+                        "input_tokens": row[3],
+                        "output_tokens": row[4],
+                        "latency_ms": row[5],
+                        "validation_status": row[6],
+                        "error": row[7],
+                        "created_at": str(row[8]),
                     },
                     ensure_ascii=False,
                 )

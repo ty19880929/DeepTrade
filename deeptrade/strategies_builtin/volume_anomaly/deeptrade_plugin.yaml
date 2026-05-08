@@ -1,6 +1,6 @@
 plugin_id: volume-anomaly
 name: 成交量异动策略
-version: 0.2.0
+version: 0.6.0
 type: strategy
 api_version: "1"
 entrypoint: volume_anomaly.plugin:VolumeAnomalyPlugin
@@ -23,6 +23,7 @@ permissions:
       - top_list
       - anns_d
       - adj_factor
+      - index_daily
   llm: true
   llm_tools: false
 
@@ -30,6 +31,12 @@ migrations:
   - version: "20260430_001"
     file: migrations/20260430_001_init.sql
     checksum: "sha256:62787c9ef661d0ddd6054b656fcc310f5e139dd9d1dfea70dc3b0359c321bd5f"
+  - version: "20260601_001"
+    file: migrations/20260601_001_realized_returns.sql
+    checksum: "sha256:da2b1a80fb87c2261224c7efb04de9e95bf1d274db32eab73a6e162b8bb9931c"
+  - version: "20260601_002"
+    file: migrations/20260601_002_dimension_scores.sql
+    checksum: "sha256:5fc53bc4de649b884337014b4f6c9a872b4178173fdbc8dcc9fcb56b14a2b5b9"
 
 tables:
   - name: va_watchlist
@@ -46,4 +53,7 @@ tables:
     purge_on_uninstall: true
   - name: va_events
     description: 本插件 run 事件流（替代框架 strategy_events）
+    purge_on_uninstall: true
+  - name: va_realized_returns
+    description: T+N 事后实际收益指标（PK=anomaly_date+ts_code）
     purge_on_uninstall: true

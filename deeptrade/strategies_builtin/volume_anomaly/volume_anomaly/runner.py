@@ -20,21 +20,33 @@ from deeptrade.plugins_api.events import EventLevel, EventType, StrategyEvent
 
 from .calendar import TradeCalendar
 from .data import (
+    EVALUATE_DEFAULT_LOOKBACK_DAYS,
+    EVALUATE_HORIZONS,
+    EVALUATE_WINDOW_5D,
+    EVALUATE_WINDOW_10D,
     AnalyzeBundle,
     ScreenResult,
     ScreenRules,
+    _classify_data_status,
+    _compute_realized_returns,
+    _resolve_horizon_dates,
     append_anomaly_history,
     collect_analyze_bundle,
+    fetch_anomaly_dates_within_lookback,
+    fetch_completed_realized_keys,
     prune_watchlist,
     resolve_trade_date,
     screen_anomalies,
+    upsert_realized_return,
     upsert_watchlist,
 )
 from .pipeline import run_analyze
 from .render import (
+    EvaluateOutcome,
     export_llm_calls,
     render_terminal_summary,
     write_analyze_report,
+    write_evaluate_report,
     write_prune_report,
     write_screen_report,
 )
@@ -69,6 +81,17 @@ class PruneParams:
 
 
 @dataclass
+class EvaluateParams:
+    """v0.4.0 P1-3 — evaluate mode: compute T+N realised returns for past hits."""
+    trade_date: str | None = None
+    allow_intraday: bool = False
+    lookback_days: int = EVALUATE_DEFAULT_LOOKBACK_DAYS
+    backfill_all: bool = False         # F12 — when True, ignore lookback_days
+    force_recompute: bool = False      # re-evaluate rows that are already 'complete'
+    force_sync: bool = False
+
+
+@dataclass
 class RunOutcome:
     run_id: str
     status: RunStatus
@@ -91,6 +114,11 @@ class VaRunner:
 
     def execute_prune(self, params: PruneParams) -> RunOutcome:
         return self._drive("prune", params, self._iter_prune(params))
+
+    def execute_evaluate(self, params: EvaluateParams) -> RunOutcome:
+        # G10 — evaluate writes va_runs / va_events with mode='evaluate' so it
+        # appears in `deeptrade volume-anomaly history` alongside other modes.
+        return self._drive("evaluate", params, self._iter_evaluate(params))
 
     # ----- driver --------------------------------------------------------
 
@@ -265,6 +293,16 @@ class VaRunner:
             )
             raise
         yield from self._drain_pending()
+        # G8 — explicit WARN log when index_daily is unavailable so users notice
+        # the alpha-field degradation rather than silently losing the signal.
+        for entry in bundle.data_unavailable:
+            if entry.startswith("index_daily"):
+                yield rt.emit(
+                    EventType.LOG,
+                    entry,
+                    level=EventLevel.WARN,
+                )
+                break
         yield rt.emit(
             EventType.STEP_FINISHED,
             f"Step 1: {len(bundle.candidates)} candidates from watchlist",
@@ -410,6 +448,205 @@ class VaRunner:
             },
         )
 
+    # ----- evaluate (v0.4.0 P1-3) ----------------------------------------
+
+    def _iter_evaluate(self, params: EvaluateParams) -> Iterable[StrategyEvent]:
+        rt = self._rt
+        rt.tushare = build_tushare_client(
+            rt, intraday=params.allow_intraday, event_cb=self._on_tushare_event
+        )
+        cfg = rt.config.get_app_config()
+
+        yield rt.emit(EventType.STEP_STARTED, "Step 0: resolve today")
+        cal_df = rt.tushare.call("trade_cal")
+        cal = TradeCalendar(cal_df)
+        today, _ = resolve_trade_date(
+            datetime.now(),
+            cal,
+            user_specified=params.trade_date,
+            allow_intraday=params.allow_intraday,
+            close_after=cfg.app_close_after if cfg is not None else time(18, 0),
+        )
+        yield rt.emit(
+            EventType.STEP_FINISHED,
+            f"Step 0: today={today}",
+            payload={"today": today},
+        )
+
+        # F12 — backfill_all overrides lookback_days; everyone gets re-evaluated.
+        lookback = 365 * 10 if params.backfill_all else params.lookback_days
+        anomaly_pairs = fetch_anomaly_dates_within_lookback(
+            rt.db, today=today, lookback_days=lookback
+        )
+        completed = (
+            set() if params.force_recompute else fetch_completed_realized_keys(rt.db)
+        )
+        # Skip already-complete rows unless --force-recompute.
+        targets = [pair for pair in anomaly_pairs if pair not in completed]
+        yield rt.emit(
+            EventType.STEP_FINISHED,
+            f"Step 1: {len(targets)} target hits "
+            f"({len(anomaly_pairs)} total within lookback, "
+            f"{len(anomaly_pairs) - len(targets)} already complete)",
+            payload={
+                "targets": len(targets),
+                "total_in_lookback": len(anomaly_pairs),
+                "skipped_complete": len(anomaly_pairs) - len(targets),
+                "lookback_days": lookback,
+            },
+        )
+
+        # Group target codes by anomaly_date so we can batch the tushare calls.
+        by_date: dict[str, list[str]] = {}
+        for adate, code in targets:
+            by_date.setdefault(adate, []).append(code)
+
+        # Resolve required future trade_dates for every distinct anomaly_date.
+        # We'll fetch each unique trade_date (T + horizon) once via daily(td=...)
+        # and cache the per-code close lookup.
+        all_dates_to_fetch: set[str] = set()
+        anomaly_horizon_dates: dict[str, dict[int, str]] = {}
+        for adate in by_date:
+            try:
+                horizon_dates = _resolve_horizon_dates(cal, adate, EVALUATE_HORIZONS)
+            except ValueError as e:
+                logger.warning("evaluate: cannot resolve horizons for %s (%s)", adate, e)
+                horizon_dates = {}
+            anomaly_horizon_dates[adate] = horizon_dates
+            all_dates_to_fetch.add(adate)
+            all_dates_to_fetch.update(
+                d for d in horizon_dates.values() if d is not None and d <= today
+            )
+
+        # Fetch all needed daily(trade_date=X) frames once. The TushareClient
+        # already caches each call as trade_day_immutable so subsequent runs
+        # are zero-incremental.
+        close_by_code_date: dict[tuple[str, str], float] = {}
+        n_fetched = 0
+        for d in sorted(all_dates_to_fetch):
+            df = rt.tushare.call("daily", trade_date=d, force_sync=params.force_sync)
+            if df is None or df.empty or "close" not in df.columns:
+                continue
+            n_fetched += 1
+            for r in df[["ts_code", "close"]].itertuples(index=False):
+                if r.close is not None:
+                    close_by_code_date[(str(r.ts_code), str(d))] = float(r.close)
+
+        yield rt.emit(
+            EventType.STEP_FINISHED,
+            f"Step 2: fetched daily for {n_fetched}/{len(all_dates_to_fetch)} unique dates",
+            payload={
+                "dates_fetched": n_fetched,
+                "dates_planned": len(all_dates_to_fetch),
+            },
+        )
+        yield from self._drain_pending()
+
+        # 5d / 10d window dates for max_close / max_dd computation.
+        # We need T+1..T+5 and T+1..T+10 trade dates.
+        n_complete = 0
+        n_partial = 0
+        n_pending = 0
+        for adate, codes in by_date.items():
+            horizon_dates = anomaly_horizon_dates.get(adate, {})
+            window5_dates = self._range_horizon_dates(cal, adate, EVALUATE_WINDOW_5D)
+            window10_dates = self._range_horizon_dates(cal, adate, EVALUATE_WINDOW_10D)
+            # Make sure those window dates are also fetched (they typically
+            # overlap with horizon_dates so we just augment the cache lazily).
+            extra = (set(window5_dates) | set(window10_dates)) - all_dates_to_fetch
+            extra = {d for d in extra if d <= today}
+            for d in extra:
+                df = rt.tushare.call(
+                    "daily", trade_date=d, force_sync=params.force_sync
+                )
+                if df is None or df.empty or "close" not in df.columns:
+                    continue
+                for r in df[["ts_code", "close"]].itertuples(index=False):
+                    if r.close is not None:
+                        close_by_code_date[(str(r.ts_code), str(d))] = float(r.close)
+            for code in codes:
+                t_close = close_by_code_date.get((code, adate))
+                horizon_closes = {
+                    n: close_by_code_date.get((code, d))
+                    for n, d in horizon_dates.items()
+                }
+                window5_closes = [
+                    close_by_code_date.get((code, d)) for d in window5_dates
+                ]
+                window10_closes = [
+                    close_by_code_date.get((code, d)) for d in window10_dates
+                ]
+                metrics = _compute_realized_returns(
+                    t_close=t_close,
+                    horizon_closes=horizon_closes,
+                    window_5d_closes=window5_closes,
+                    window_10d_closes=window10_closes,
+                )
+                status = _classify_data_status(
+                    horizon_closes=horizon_closes,
+                    horizons=EVALUATE_HORIZONS,
+                    today=today,
+                    horizon_dates=horizon_dates,
+                )
+                upsert_realized_return(
+                    rt.db,
+                    anomaly_date=adate,
+                    ts_code=code,
+                    t_close=t_close,
+                    horizon_closes=horizon_closes,
+                    metrics=metrics,
+                    data_status=status,
+                )
+                if status == "complete":
+                    n_complete += 1
+                elif status == "partial":
+                    n_partial += 1
+                else:
+                    n_pending += 1
+
+        outcome = EvaluateOutcome(
+            today=today,
+            n_targets=len(targets),
+            n_skipped_complete=len(anomaly_pairs) - len(targets),
+            n_complete=n_complete,
+            n_partial=n_partial,
+            n_pending=n_pending,
+            lookback_days=lookback,
+            backfill_all=params.backfill_all,
+        )
+        report_path = write_evaluate_report(rt.run_id, outcome=outcome)
+        export_llm_calls(rt.run_id, rt.db)
+        yield rt.emit(
+            EventType.RESULT_PERSISTED,
+            f"evaluate done — complete={n_complete}, partial={n_partial}, "
+            f"pending={n_pending}",
+            payload={
+                "report_dir": str(report_path),
+                "n_complete": n_complete,
+                "n_partial": n_partial,
+                "n_pending": n_pending,
+                "lookback_days": lookback,
+                "backfill_all": params.backfill_all,
+            },
+        )
+
+    @staticmethod
+    def _range_horizon_dates(
+        cal: TradeCalendar, anomaly_date: str, n: int
+    ) -> list[str]:
+        """Return the n trade dates immediately AFTER ``anomaly_date``
+        (T+1..T+n). Stops early if the calendar runs out, returning shorter
+        list (caller handles ``None`` for missing entries via the close map)."""
+        out: list[str] = []
+        cursor = anomaly_date
+        for _ in range(n):
+            try:
+                cursor = cal.next_open(cursor)
+            except ValueError:
+                break
+            out.append(cursor)
+        return out
+
     # ----- helpers -------------------------------------------------------
 
     def _on_tushare_event(self, event_type: str, message: str, payload: dict) -> None:
@@ -495,11 +732,15 @@ def _write_stage_results(
     }
     for item in items:
         d = item.model_dump(mode="json")
+        # v0.6.0 P1-2 — split dimension_scores into 6 dedicated DOUBLE columns
+        # so `stats --by dimension_scores` can aggregate via plain SQL (G6).
+        dim = d.get("dimension_scores") or {}
         rt.db.execute(
             "INSERT INTO va_stage_results(run_id, stage, batch_no, trade_date, ts_code, name, "
             "rank, launch_score, confidence, prediction, pattern, rationale, tracked_days, "
-            "evidence_json, risk_flags_json, raw_response_json) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "evidence_json, risk_flags_json, raw_response_json, "
+            "dim_washout, dim_pattern, dim_capital, dim_sector, dim_historical, dim_risk) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 rt.run_id,
                 stage,
@@ -517,6 +758,12 @@ def _write_stage_results(
                 json.dumps(d.get("key_evidence") or [], ensure_ascii=False),
                 json.dumps(d.get("risk_flags") or [], ensure_ascii=False),
                 json.dumps(d, ensure_ascii=False),
+                dim.get("washout"),
+                dim.get("pattern"),
+                dim.get("capital"),
+                dim.get("sector"),
+                dim.get("historical"),
+                dim.get("risk"),
             ),
         )
 

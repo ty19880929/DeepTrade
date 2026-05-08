@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta
 from typing import Any
@@ -198,6 +199,50 @@ def _calendar_days_between(earlier: str, later: str) -> int:
 # without depending on the screen-only ScreenRules dataclass).
 RULE_LOOKBACK_TRADE_DAYS = 60  # ~3 months
 
+# v0.4.0 P1-3 — T+N realized-return evaluation horizons. F6 decision: keep as a
+# module-level constant rather than introducing a new `va_config` table.
+EVALUATE_HORIZONS: tuple[int, ...] = (1, 3, 5, 10)
+EVALUATE_DEFAULT_LOOKBACK_DAYS: int = 30
+EVALUATE_MAX_HORIZON: int = max(EVALUATE_HORIZONS)
+EVALUATE_WINDOW_5D = 5
+EVALUATE_WINDOW_10D = 10
+
+
+# v0.3.0 P0-2 — default circ_mv-bucketed turnover thresholds.
+# Each tuple is (circ_mv_yi_max, turnover_min, turnover_max). The first bucket
+# whose `max` is ≥ the candidate's circ_mv_yi (亿元) wins; boundary values fall
+# into the smaller bucket (E4 — `circ_mv_yi ≤ bucket_max`).
+DEFAULT_TURNOVER_BUCKETS: list[tuple[float, float, float]] = [
+    (50.0, 5.0, 15.0),       # ≤ 50亿 — 微盘
+    (200.0, 3.5, 12.0),      # 50–200亿 — 中小盘
+    (1000.0, 2.5, 9.0),      # 200–1000亿 — 中盘
+    (math.inf, 1.5, 6.0),    # > 1000亿 — 大盘
+]
+
+
+def _bucket_label(bucket_max: float, prev_max: float) -> str:
+    """Render a human-readable bucket label like "≤50亿" / "50-200亿" / ">1000亿"."""
+    if prev_max <= 0:
+        return f"≤{int(bucket_max)}亿"
+    if math.isinf(bucket_max):
+        return f">{int(prev_max)}亿"
+    return f"{int(prev_max)}-{int(bucket_max)}亿"
+
+
+def _resolve_turnover_bucket(
+    circ_mv_yi: float, buckets: list[tuple[float, float, float]]
+) -> tuple[int, str, float, float]:
+    """Return (idx, label, t_min, t_max) for the first bucket where circ_mv_yi ≤ max."""
+    prev_max = 0.0
+    for idx, (b_max, t_min, t_max) in enumerate(buckets):
+        if circ_mv_yi <= b_max:
+            return idx, _bucket_label(b_max, prev_max), t_min, t_max
+        prev_max = b_max
+    # Past the last bucket (only possible if last bucket isn't math.inf —
+    # ScreenRules.__post_init__ guards against that, but be defensive).
+    last_max, t_min, t_max = buckets[-1]
+    return len(buckets) - 1, _bucket_label(last_max, prev_max), t_min, t_max
+
 
 @dataclass
 class ScreenRules:
@@ -231,6 +276,15 @@ class ScreenRules:
     # vol so that vol_max comparisons stay valid across splits/送转 events.
     # Falls back to raw vol when adj_factor is unavailable (with a diagnostic).
     vol_adjust: bool = True
+    # v0.3.0 P0-1 — drop hits whose upper shadow exceeds this fraction of the
+    # day's range (避雷针 / 长上影). None disables the filter entirely.
+    upper_shadow_ratio_max: float | None = 0.35
+    # v0.3.0 P0-2 — circ_mv-bucketed (turnover_min, turnover_max). Each entry is
+    # (circ_mv_yi_max, turnover_min, turnover_max); the first bucket where
+    # circ_mv_yi ≤ max wins. None falls back to the global turnover_min/max.
+    turnover_buckets: list[tuple[float, float, float]] | None = field(
+        default_factory=lambda: list(DEFAULT_TURNOVER_BUCKETS)
+    )
 
     def __post_init__(self) -> None:
         """P1 L2 — fail loud on impossible threshold combos.
@@ -275,6 +329,35 @@ class ScreenRules:
             raise ValueError(
                 f"min_history_coverage must be in (0, 1], got {self.min_history_coverage}"
             )
+        if self.upper_shadow_ratio_max is not None and not (
+            0.0 < self.upper_shadow_ratio_max <= 1.0
+        ):
+            raise ValueError(
+                f"upper_shadow_ratio_max must be in (0, 1] or None, "
+                f"got {self.upper_shadow_ratio_max}"
+            )
+        if self.turnover_buckets is not None:
+            if not self.turnover_buckets:
+                raise ValueError("turnover_buckets, if set, must be non-empty")
+            prev_max = float("-inf")
+            for entry in self.turnover_buckets:
+                if not isinstance(entry, tuple) or len(entry) != 3:
+                    raise ValueError(
+                        f"each turnover_buckets entry must be a 3-tuple "
+                        f"(circ_mv_yi_max, turnover_min, turnover_max); got {entry}"
+                    )
+                b_max, t_min, t_max = entry
+                if b_max <= prev_max:
+                    raise ValueError(
+                        f"turnover_buckets circ_mv_yi_max must be strictly increasing; "
+                        f"{prev_max} → {b_max}"
+                    )
+                if not (0 <= t_min <= t_max):
+                    raise ValueError(
+                        f"turnover_buckets entry has invalid turnover range "
+                        f"[{t_min}, {t_max}] (require 0 ≤ min ≤ max)"
+                    )
+                prev_max = b_max
 
     @classmethod
     def defaults(cls) -> ScreenRules:
@@ -310,12 +393,44 @@ class ScreenRules:
                 kwargs["vol_adjust"] = v.strip().lower() in {"1", "true", "t", "yes", "y"}
             else:
                 kwargs["vol_adjust"] = bool(v)
+        # v0.3.0 P0-1 — `upper_shadow_ratio_max`: explicit `null` → disable filter;
+        # missing key → keep default (0.35).
+        if "upper_shadow_ratio_max" in d:
+            v = d["upper_shadow_ratio_max"]
+            kwargs["upper_shadow_ratio_max"] = float(v) if v is not None else None
+        # v0.3.0 P0-2 — `turnover_buckets`: accept list-of-list (JSON has no tuple);
+        # explicit `null` → fall back to global turnover_min/max; missing key →
+        # keep default DEFAULT_TURNOVER_BUCKETS. The first element of any entry
+        # may be `null` to mean "no upper bound" (math.inf).
+        if "turnover_buckets" in d:
+            raw = d["turnover_buckets"]
+            if raw is None:
+                kwargs["turnover_buckets"] = None
+            else:
+                parsed: list[tuple[float, float, float]] = []
+                for entry in raw:
+                    if len(entry) != 3:
+                        raise ValueError(
+                            f"each turnover_buckets entry must have 3 elements, got {entry}"
+                        )
+                    b_max_raw, t_min, t_max = entry
+                    b_max = math.inf if b_max_raw is None else float(b_max_raw)
+                    parsed.append((b_max, float(t_min), float(t_max)))
+                kwargs["turnover_buckets"] = parsed
         return cls(**kwargs)
 
     def as_dict(self) -> dict[str, Any]:
         from dataclasses import asdict as _asdict  # noqa: PLC0415
 
-        return _asdict(self)
+        out = _asdict(self)
+        # JSON has no `inf`; round-trip-friendly form mirrors what `from_dict`
+        # accepts (`null` for an unbounded last bucket).
+        if self.turnover_buckets is not None:
+            out["turnover_buckets"] = [
+                [None if math.isinf(b_max) else b_max, t_min, t_max]
+                for (b_max, t_min, t_max) in self.turnover_buckets
+            ]
+        return out
 
 
 @dataclass
@@ -357,6 +472,15 @@ class ScreenDiagnostics:
     adj_factor_actual_days: int = 0
     adj_factor_missing_dates: list[str] = field(default_factory=list)
     adj_factor_missing_codes: list[str] = field(default_factory=list)
+    # v0.3.0 P0-1 — upper-shadow filter; `enabled=False` when rules disable it.
+    upper_shadow_filter_enabled: bool = False
+    upper_shadow_filter_threshold: float | None = None
+    n_after_upper_shadow: int = 0
+    # v0.3.0 P0-2 — circ_mv-bucketed turnover bookkeeping.
+    turnover_buckets_enabled: bool = False
+    turnover_bucket_hits: dict[str, int] = field(default_factory=dict)
+    n_missing_circ_mv: int = 0
+    circ_mv_missing_codes: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -367,6 +491,7 @@ class ScreenResult:
     n_main_board: int
     n_after_st_susp: int
     n_after_t_day_rules: int  # pct_chg + body_ratio
+    n_after_upper_shadow: int  # v0.3.0 P0-1
     n_after_turnover: int
     n_after_vol_rules: int  # vol_ratio_5d + dual vol rule
     rules: ScreenRules = field(default_factory=ScreenRules.defaults)
@@ -399,6 +524,10 @@ def screen_anomalies(
     rules = rules or ScreenRules.defaults()
     data_unavailable: list[str] = []
     diag = ScreenDiagnostics()
+    # v0.3.0 P0-1 / P0-2 — surface whether each new filter is engaged this run.
+    diag.upper_shadow_filter_enabled = rules.upper_shadow_ratio_max is not None
+    diag.upper_shadow_filter_threshold = rules.upper_shadow_ratio_max
+    diag.turnover_buckets_enabled = rules.turnover_buckets is not None
 
     # 1. main board pool
     stock_basic = tushare.call("stock_basic", force_sync=force_sync)
@@ -443,6 +572,7 @@ def screen_anomalies(
             n_main_board=n_main,
             n_after_st_susp=n_after_st,
             n_after_t_day_rules=0,
+            n_after_upper_shadow=0,
             n_after_turnover=0,
             n_after_vol_rules=0,
             rules=rules,
@@ -459,6 +589,11 @@ def screen_anomalies(
     daily_t["body"] = daily_t["close"] - daily_t["open"]
     daily_t["range"] = (daily_t["high"] - daily_t["low"]).clip(lower=1e-9)
     daily_t["body_ratio"] = daily_t["body"] / daily_t["range"]
+    # v0.3.0 P0-1 — upper shadow as a fraction of the day's range.
+    # = (high − max(open, close)) / range; pure upper wick → 1.0.
+    daily_t["upper_shadow_ratio"] = (
+        daily_t["high"] - daily_t[["open", "close"]].max(axis=1)
+    ) / daily_t["range"]
     t_day_hits = daily_t[
         (daily_t["close"] > daily_t["open"])
         & (daily_t["body_ratio"] >= rules.body_ratio_min)
@@ -472,6 +607,7 @@ def screen_anomalies(
             n_main_board=n_main,
             n_after_st_susp=n_after_st,
             n_after_t_day_rules=0,
+            n_after_upper_shadow=0,
             n_after_turnover=0,
             n_after_vol_rules=0,
             rules=rules,
@@ -479,20 +615,50 @@ def screen_anomalies(
             data_unavailable=data_unavailable,
         )
 
-    # 4. daily_basic — turnover_rate filter
+    # v0.3.0 P0-1 — upper-shadow filter (skipped when threshold is None).
+    if rules.upper_shadow_ratio_max is not None:
+        t_day_hits = t_day_hits[
+            t_day_hits["upper_shadow_ratio"] <= rules.upper_shadow_ratio_max
+        ].copy()
+    n_after_upper_shadow = len(t_day_hits)
+    diag.n_after_upper_shadow = n_after_upper_shadow
+    if t_day_hits.empty:
+        return ScreenResult(
+            trade_date=trade_date,
+            n_main_board=n_main,
+            n_after_st_susp=n_after_st,
+            n_after_t_day_rules=n_after_t_rules,
+            n_after_upper_shadow=0,
+            n_after_turnover=0,
+            n_after_vol_rules=0,
+            rules=rules,
+            diagnostics=diag,
+            data_unavailable=data_unavailable,
+        )
+
+    # 4. daily_basic — turnover_rate (+ circ_mv for v0.3.0 bucketing) filter
     db_t = tushare.call("daily_basic", trade_date=trade_date, force_sync=force_sync)
     db_t = _normalize_id_cols(db_t)
+    db_lookup: dict[str, dict[str, Any]] = {}
     if db_t is not None and not db_t.empty and "turnover_rate" in db_t.columns:
-        db_lookup = db_t.set_index("ts_code")["turnover_rate"].to_dict()
+        cols = ["turnover_rate"]
+        if "circ_mv" in db_t.columns:
+            cols.append("circ_mv")
+        db_lookup = db_t.set_index("ts_code")[cols].to_dict("index")
         diag.daily_basic_t_total_rows = int(len(db_t))
         diag.daily_basic_t_main_board_rows = int(
             db_t["ts_code"].astype(str).isin(main_codes).sum()
         )
     else:
-        db_lookup = {}
         diag.daily_basic_status = "empty"
         data_unavailable.append("daily_basic.turnover_rate (frame empty)")
-    t_day_hits["turnover_rate"] = t_day_hits["ts_code"].map(db_lookup)
+    t_day_hits["turnover_rate"] = t_day_hits["ts_code"].map(
+        lambda c: db_lookup.get(c, {}).get("turnover_rate")
+    )
+    # v0.3.0 P0-2 — circ_mv lookup (亿元 via normalize_to_yi).
+    t_day_hits["circ_mv_yi"] = t_day_hits["ts_code"].map(
+        lambda c: normalize_to_yi("circ_mv", db_lookup.get(c, {}).get("circ_mv"))
+    )
 
     # P0 M1 — surface candidates whose turnover_rate lookup returned NaN.
     # They will be silently dropped by the comparison below; we make that visible.
@@ -509,10 +675,54 @@ def screen_anomalies(
             f"(silently dropped at turnover step): {sample}{ellipsis}"
         )
 
-    turnover_hits = t_day_hits[
-        (t_day_hits["turnover_rate"] >= rules.turnover_min)
-        & (t_day_hits["turnover_rate"] <= rules.turnover_max)
-    ].copy()
+    # v0.3.0 P0-2 — bucket lookup. circ_mv missing → fall back to global thresholds.
+    buckets = rules.turnover_buckets
+    bucket_label_per_row: dict[Any, str | None] = {}
+    bucket_hit_counter: dict[str, int] = {}
+    circ_mv_missing_codes: list[str] = []
+
+    def _row_passes_turnover(row: Any) -> bool:
+        tr = row.turnover_rate
+        if pd.isna(tr):
+            return False
+        circ = row.circ_mv_yi
+        if buckets is None or circ is None or pd.isna(circ):
+            t_min, t_max = rules.turnover_min, rules.turnover_max
+            label = None
+            if buckets is not None and (circ is None or pd.isna(circ)):
+                circ_mv_missing_codes.append(str(row.ts_code))
+        else:
+            _, label, t_min, t_max = _resolve_turnover_bucket(float(circ), buckets)
+        bucket_label_per_row[row.Index] = label
+        return t_min <= tr <= t_max
+
+    # We need pandas Index access — use `itertuples(index=True)` and rebuild filter mask.
+    keep_mask = []
+    for row in t_day_hits.itertuples(index=True):
+        keep_mask.append(_row_passes_turnover(row))
+    turnover_hits = t_day_hits.loc[keep_mask].copy()
+    turnover_hits["turnover_bucket"] = turnover_hits.index.map(
+        lambda i: bucket_label_per_row.get(i)
+    )
+    # Tally bucket distribution among rows that PASSED the filter.
+    for label in turnover_hits["turnover_bucket"].tolist():
+        if label is None:
+            bucket_hit_counter["fallback (no circ_mv)"] = (
+                bucket_hit_counter.get("fallback (no circ_mv)", 0) + 1
+            )
+        else:
+            bucket_hit_counter[label] = bucket_hit_counter.get(label, 0) + 1
+    diag.turnover_bucket_hits = bucket_hit_counter
+    diag.n_missing_circ_mv = len(circ_mv_missing_codes)
+    diag.circ_mv_missing_codes = circ_mv_missing_codes
+    if circ_mv_missing_codes:
+        sample = circ_mv_missing_codes[:5]
+        ellipsis = "..." if len(circ_mv_missing_codes) > 5 else ""
+        data_unavailable.append(
+            f"daily_basic.circ_mv missing for {len(circ_mv_missing_codes)} candidates "
+            f"(fell back to global turnover thresholds): {sample}{ellipsis}"
+        )
+
     n_after_turnover = len(turnover_hits)
     if turnover_hits.empty:
         return ScreenResult(
@@ -520,6 +730,7 @@ def screen_anomalies(
             n_main_board=n_main,
             n_after_st_susp=n_after_st,
             n_after_t_day_rules=n_after_t_rules,
+            n_after_upper_shadow=n_after_upper_shadow,
             n_after_turnover=0,
             n_after_vol_rules=0,
             rules=rules,
@@ -706,7 +917,10 @@ def screen_anomalies(
                 "vol": round2(row.vol),
                 "amount": round2(row.amount),
                 "body_ratio": round2(row.body_ratio),
+                "upper_shadow_ratio": round2(getattr(row, "upper_shadow_ratio", None)),
                 "turnover_rate": round2(row.turnover_rate),
+                "circ_mv_yi": round2(getattr(row, "circ_mv_yi", None)),
+                "turnover_bucket": getattr(row, "turnover_bucket", None),
                 "vol_ratio_5d": round2(vol_ratio_5d),
                 "vol_rank_in_long_window": days_with_higher_vol + 1,
                 "max_vol_short_window": round2(vol_max_short),
@@ -734,6 +948,7 @@ def screen_anomalies(
         n_main_board=n_main,
         n_after_st_susp=n_after_st,
         n_after_t_day_rules=n_after_t_rules,
+        n_after_upper_shadow=n_after_upper_shadow,
         n_after_turnover=n_after_turnover,
         n_after_vol_rules=len(final_hits),
         rules=rules,
@@ -1075,6 +1290,131 @@ def prune_watchlist(db: Any, *, min_tracked_calendar_days: int, today: str) -> l
 # ---------------------------------------------------------------------------
 
 
+# v0.3.0 P0-3 — VCP feature windows (kept module-level so callers / tests can
+# read them without instantiating AnalyzeBundle).
+ATR_WINDOW = 10                   # 10-day ATR window (simple-average TR)
+ATR_QUANTILE_LOOKBACK = 60        # rank current ATR within the trailing 60-day series
+BBW_WINDOW = 20                   # 20-day Bollinger band width
+BBW_COMPRESSION_LOOKBACK = 60     # current BBW vs trailing 60-day mean BBW
+# v0.3.0 P0-4 — resistance windows (E3-A: only `low_120d`, no `low_250d`).
+RESIST_120D = 120
+RESIST_250D = 250
+# Default extended history window for analyze mode (E2-A: single 250d fetch
+# is sliced internally for verbatim / VCP / resistance consumers).
+DEFAULT_EXTENDED_LOOKBACK_TRADE_DAYS = RESIST_250D
+
+
+def _compute_atr_series(history: list[dict[str, Any]]) -> list[float | None]:
+    """Per-row trailing-10-day simple-average True Range.
+
+    TR_t = max(high_t − low_t, |high_t − close_{t-1}|, |low_t − close_{t-1}|)
+    ATR_10_t = mean(TR over the trailing 10 days, t inclusive)
+
+    Returns a list aligned to ``history``. Entries are ``None`` until enough
+    rows are available or whenever any input value is missing in the window.
+    """
+    n = len(history)
+    if n < 2:
+        return [None] * n
+    trs: list[float | None] = [None]
+    for i in range(1, n):
+        h = history[i].get("high")
+        low = history[i].get("low")
+        c_prev = history[i - 1].get("close")
+        if h is None or low is None or c_prev is None:
+            trs.append(None)
+            continue
+        try:
+            h_f, low_f, cp_f = float(h), float(low), float(c_prev)
+        except (TypeError, ValueError):
+            trs.append(None)
+            continue
+        if any(pd.isna(v) for v in (h_f, low_f, cp_f)):
+            trs.append(None)
+            continue
+        trs.append(max(h_f - low_f, abs(h_f - cp_f), abs(low_f - cp_f)))
+
+    out: list[float | None] = []
+    for i in range(n):
+        start = i - ATR_WINDOW + 1
+        if start < 0:
+            out.append(None)
+            continue
+        slice_ = trs[start : i + 1]
+        if any(t is None for t in slice_):
+            out.append(None)
+            continue
+        out.append(sum(slice_) / ATR_WINDOW)  # type: ignore[arg-type]
+    return out
+
+
+def _compute_bbw_series(history: list[dict[str, Any]]) -> list[float | None]:
+    """Per-row 20-day Bollinger Band Width as a percentage of the 20-day MA.
+
+    BBW = 4 × stdev(close_20) / mean(close_20) × 100
+
+    The factor 4 = upper(MA + 2σ) − lower(MA − 2σ) → 4σ. Returns ``None`` until
+    20 rows are available, or whenever any close in the window is missing /
+    the rolling mean is non-positive.
+    """
+    n = len(history)
+    closes: list[float | None] = []
+    for r in history:
+        c = r.get("close")
+        if c is None:
+            closes.append(None)
+            continue
+        try:
+            f = float(c)
+        except (TypeError, ValueError):
+            closes.append(None)
+            continue
+        closes.append(None if pd.isna(f) else f)
+
+    out: list[float | None] = []
+    for i in range(n):
+        start = i - BBW_WINDOW + 1
+        if start < 0:
+            out.append(None)
+            continue
+        slice_ = closes[start : i + 1]
+        if any(c is None for c in slice_):
+            out.append(None)
+            continue
+        floats: list[float] = [c for c in slice_ if c is not None]
+        mean = sum(floats) / BBW_WINDOW
+        if mean <= 0:
+            out.append(None)
+            continue
+        # Population std — same family as Bollinger's original (close enough
+        # for our discrimination purposes; the choice is uniform across the
+        # series so trend comparisons are unbiased).
+        var = sum((c - mean) ** 2 for c in floats) / BBW_WINDOW
+        std = math.sqrt(var)
+        out.append(4 * std / mean * 100)
+    return out
+
+
+def _quantile_in_window(
+    series: list[float | None], idx: int, lookback: int
+) -> float | None:
+    """Return the [0, 1] quantile of ``series[idx]`` within the trailing
+    ``lookback`` non-None values (idx inclusive). 0 = historical min,
+    1 = historical max. ``None`` when fewer than ``lookback`` non-None values
+    in the window or the current value itself is None."""
+    if idx < 0 or idx >= len(series):
+        return None
+    cur = series[idx]
+    if cur is None:
+        return None
+    start = max(0, idx - lookback + 1)
+    window = [v for v in series[start : idx + 1] if v is not None]
+    if len(window) < lookback:
+        return None
+    less_or_eq = sum(1 for v in window if v <= cur)
+    return (less_or_eq - 1) / (len(window) - 1) if len(window) > 1 else 0.0
+
+
 @dataclass
 class AnalyzeBundle:
     """Everything the走势分析 LLM stage needs."""
@@ -1088,6 +1428,12 @@ class AnalyzeBundle:
     data_unavailable: list[str] = field(default_factory=list)
 
 
+# v0.5.0 P1-1 — RPS / 大盘相对 alpha 配置
+DEFAULT_BASELINE_INDEX_CODE = "000300.SH"
+ALPHA_LEADING_THRESHOLD = 5.0   # alpha_20d_pct > +5 → leading
+ALPHA_LAGGING_THRESHOLD = -5.0  # alpha_20d_pct < -5 → lagging
+
+
 def collect_analyze_bundle(
     *,
     tushare: TushareClient,
@@ -1095,8 +1441,9 @@ def collect_analyze_bundle(
     calendar: TradeCalendar,
     trade_date: str,
     next_trade_date: str,
-    history_lookback: int = RULE_LOOKBACK_TRADE_DAYS,
+    history_lookback: int = DEFAULT_EXTENDED_LOOKBACK_TRADE_DAYS,
     moneyflow_lookback: int = 5,
+    baseline_index_code: str = DEFAULT_BASELINE_INDEX_CODE,
     force_sync: bool = False,
 ) -> AnalyzeBundle:
     """Read watchlist + pull historical windows + assemble compact LLM context.
@@ -1117,13 +1464,15 @@ def collect_analyze_bundle(
 
     candidate_codes = {w["ts_code"] for w in watchlist}
 
-    # -------- historical OHLCV (60 trade days, batch by date) ---------------
+    # -------- historical OHLCV (extended trade-day window, batch by date) ---
     history_dates = _last_n_trade_dates(calendar, trade_date, history_lookback)
     daily_df, missing_history_dates = _fetch_daily_history_by_date(
         tushare, history_dates, candidate_codes, force_sync=force_sync
     )
     if daily_df.empty:
-        data_unavailable.append("daily(60d-window) returned empty")
+        data_unavailable.append(
+            f"daily({history_lookback}d-window) returned empty"
+        )
     elif missing_history_dates:
         sample = missing_history_dates[:5]
         ellipsis = "..." if len(missing_history_dates) > 5 else ""
@@ -1131,6 +1480,38 @@ def collect_analyze_bundle(
             f"daily history missing on {len(missing_history_dates)}/"
             f"{len(history_dates)} planned days: {sample}{ellipsis}"
         )
+
+    # -------- baseline index daily (v0.5.0 P1-1 — alpha computation) --------
+    # F1: 沪深 300; G1: 250d window matched to per-stock daily history.
+    # G8: failures emit a WARN-level mention into data_unavailable; the runner
+    # surfaces it as an EventLevel.WARN LOG instead of silently degrading.
+    baseline_close_by_date: dict[str, float] = {}
+    if history_dates:
+        idx_df, idx_err = _try_optional(
+            tushare,
+            "index_daily",
+            params={
+                "ts_code": baseline_index_code,
+                "start_date": history_dates[0],
+                "end_date": history_dates[-1],
+            },
+            force_sync=force_sync,
+        )
+        if idx_err:
+            data_unavailable.append(
+                f"index_daily ({idx_err}) — alpha 字段降级为 None；"
+                f"如需启用 alpha，请确认 Tushare 账户已开通 index_daily 权限"
+            )
+        else:
+            idx_df = _normalize_id_cols(idx_df)
+            if idx_df is not None and not idx_df.empty and "close" in idx_df.columns:
+                for r in idx_df[["trade_date", "close"]].itertuples(index=False):
+                    if r.close is not None:
+                        baseline_close_by_date[str(r.trade_date)] = float(r.close)
+            else:
+                data_unavailable.append(
+                    f"index_daily({baseline_index_code}) returned empty — alpha 字段降级为 None"
+                )
 
     # -------- daily_basic on T (turnover, circ_mv, pe, pb) -------------------
     db_basic_t = tushare.call("daily_basic", trade_date=trade_date, force_sync=force_sync)
@@ -1230,6 +1611,8 @@ def collect_analyze_bundle(
             daily_basic=db_basic_lookup.get(code, {}),
             moneyflow_5d=mf_by_code.get(code, [])[-moneyflow_lookback:],
             limit_up_dates=sorted(lu_by_code.get(code, [])),
+            baseline_index_code=baseline_index_code,
+            baseline_close_by_date=baseline_close_by_date,
         )
         candidates.append(rec)
 
@@ -1270,6 +1653,46 @@ def _index_moneyflow_by_code(df: pd.DataFrame | None) -> dict[str, list[dict[str
     return out
 
 
+def _compute_alpha_pct(
+    history: list[dict[str, Any]],
+    baseline_close_by_date: dict[str, float],
+    n: int,
+) -> float | None:
+    """alpha_n = stock_pct_chg_n − baseline_pct_chg_n (over the last n trade days).
+
+    Both legs use simple compounded close-to-close return. Returns None when
+    either leg can't be computed (insufficient history / baseline data missing
+    on the required dates).
+    """
+    if len(history) <= n:
+        return None
+    end_row = history[-1]
+    start_row = history[-1 - n]
+    end_close = end_row.get("close")
+    start_close = start_row.get("close")
+    if end_close is None or start_close is None or start_close <= 0:
+        return None
+    end_date = str(end_row.get("trade_date") or "")
+    start_date = str(start_row.get("trade_date") or "")
+    base_end = baseline_close_by_date.get(end_date)
+    base_start = baseline_close_by_date.get(start_date)
+    if base_end is None or base_start is None or base_start <= 0:
+        return None
+    stock_ret = (float(end_close) / float(start_close) - 1.0) * 100.0
+    base_ret = (float(base_end) / float(base_start) - 1.0) * 100.0
+    return round(stock_ret - base_ret, 2)
+
+
+def _classify_rel_strength(alpha_20d: float | None) -> str | None:
+    if alpha_20d is None:
+        return None
+    if alpha_20d > ALPHA_LEADING_THRESHOLD:
+        return "leading"
+    if alpha_20d < ALPHA_LAGGING_THRESHOLD:
+        return "lagging"
+    return "in_line"
+
+
 def _build_candidate_row(
     *,
     watchlist_row: dict[str, Any],
@@ -1278,11 +1701,21 @@ def _build_candidate_row(
     daily_basic: dict[str, Any],
     moneyflow_5d: list[dict[str, Any]],
     limit_up_dates: list[str],
+    baseline_index_code: str = DEFAULT_BASELINE_INDEX_CODE,
+    baseline_close_by_date: dict[str, float] | None = None,
 ) -> dict[str, Any]:
-    """Compress 60-day history → moving averages + base/washout features.
+    """Compress (up to) 250-day history → moving averages + base/washout +
+    VCP / resistance features.
 
-    Reduces token usage from ~60 rows × 6 fields to ~20 scalar features per stock,
-    keeping only the最近 5 row OHLCV verbatim for形态判断 reference.
+    Reduces token usage by emitting compact scalars; the recent 5 OHLCV rows
+    are still passed verbatim for form reference. v0.3.0 (PR-2):
+        * input window widened from 60 → 250 trading days (E2-A) and sliced
+          internally — 60d for MAs / aggregates, full window for VCP and
+          120d / 250d resistance.
+        * new fields: atr_10d_pct / atr_10d_quantile_in_60d / bbw_20d /
+          bbw_compression_ratio (P0-3) and high_120d / high_250d / low_120d /
+          dist_to_120d_high_pct / dist_to_250d_high_pct / is_above_120d_high /
+          is_above_250d_high / pos_in_120d_range (P0-4).
     """
     closes = [float(r["close"]) for r in history if r.get("close") is not None]
     if not closes:
@@ -1295,23 +1728,97 @@ def _build_candidate_row(
             "_missing_history": True,
         }
 
-    # Moving averages (using the最后 N 个收盘价)
+    # The 60d "compressed feature" slice — preserve pre-v0.3.0 semantics for
+    # ma60 / high_60d / low_60d / pct_chg_60d when the input history is now
+    # 250d wide.
+    closes_60 = closes[-60:]
+    last_close = closes[-1]
+
     def _ma(n: int) -> float | None:
         if len(closes) < n:
             return None
         return round(sum(closes[-n:]) / n, 3)
 
     ma5, ma10, ma20, ma60 = _ma(5), _ma(10), _ma(20), _ma(60)
-    last_close = closes[-1]
     above_ma60 = ma60 is not None and last_close > ma60
     above_ma20 = ma20 is not None and last_close > ma20
 
-    # 60d aggregates
-    high_60d = round(max(closes), 3)
-    low_60d = round(min(closes), 3)
+    # 60d aggregates (over the most-recent 60 closes)
+    high_60d = round(max(closes_60), 3)
+    low_60d = round(min(closes_60), 3)
     range_pct_60d = round((high_60d - low_60d) / max(low_60d, 1e-9) * 100, 2)
-    # Cumulative pct since base low ≈ 60d return
-    pct_chg_60d = round((last_close / closes[0] - 1) * 100, 2) if closes[0] > 0 else None
+    pct_chg_60d = (
+        round((last_close / closes_60[0] - 1) * 100, 2)
+        if len(closes_60) >= 60 and closes_60[0] > 0
+        else None
+    )
+
+    # v0.3.0 P0-3 — VCP波动率收敛指标
+    atr_series = _compute_atr_series(history)
+    bbw_series = _compute_bbw_series(history)
+    last_idx = len(history) - 1
+    atr_now = atr_series[last_idx] if atr_series else None
+    bbw_now = bbw_series[last_idx] if bbw_series else None
+    atr_10d_pct: float | None = None
+    if atr_now is not None and last_close > 0:
+        atr_10d_pct = round(atr_now / last_close * 100, 3)
+    atr_10d_quantile_in_60d = _quantile_in_window(
+        atr_series, last_idx, ATR_QUANTILE_LOOKBACK
+    )
+    if atr_10d_quantile_in_60d is not None:
+        atr_10d_quantile_in_60d = round(atr_10d_quantile_in_60d, 3)
+    bbw_20d = round(bbw_now, 3) if bbw_now is not None else None
+    bbw_compression_ratio: float | None = None
+    if bbw_now is not None:
+        prior = [b for b in bbw_series[-BBW_COMPRESSION_LOOKBACK:] if b is not None]
+        if len(prior) >= BBW_COMPRESSION_LOOKBACK:
+            mean_prior = sum(prior) / len(prior)
+            if mean_prior > 0:
+                bbw_compression_ratio = round(bbw_now / mean_prior, 3)
+
+    # v0.3.0 P0-4 — 120d / 250d 阻力位距离 (closes-based to match high_60d).
+    # Compute the raw (unrounded) extremes for comparison against last_close so
+    # boundary cases like "last close IS the 60d high" don't flip on rounding;
+    # round only the emitted scalar field.
+    def _window_extremes(n: int) -> tuple[float | None, float | None]:
+        if len(closes) < n:
+            return None, None
+        sl = closes[-n:]
+        return max(sl), min(sl)
+
+    high_120d_raw, low_120d_raw = _window_extremes(RESIST_120D)
+    high_250d_raw, _ = _window_extremes(RESIST_250D)
+    high_120d = round(high_120d_raw, 3) if high_120d_raw is not None else None
+    high_250d = round(high_250d_raw, 3) if high_250d_raw is not None else None
+    low_120d = round(low_120d_raw, 3) if low_120d_raw is not None else None
+    dist_to_120d_high_pct = (
+        round((last_close - high_120d_raw) / high_120d_raw * 100, 2)
+        if high_120d_raw not in (None, 0)
+        else None
+    )
+    dist_to_250d_high_pct = (
+        round((last_close - high_250d_raw) / high_250d_raw * 100, 2)
+        if high_250d_raw not in (None, 0)
+        else None
+    )
+    is_above_120d_high = high_120d_raw is not None and last_close > high_120d_raw
+    is_above_250d_high = high_250d_raw is not None and last_close > high_250d_raw
+    pos_in_120d_range: float | None = None
+    if (
+        high_120d_raw is not None
+        and low_120d_raw is not None
+        and high_120d_raw > low_120d_raw
+    ):
+        pos_in_120d_range = round(
+            (last_close - low_120d_raw) / (high_120d_raw - low_120d_raw), 3
+        )
+
+    # v0.5.0 P1-1 — RPS / 大盘相对 alpha. F10 — 5d / 20d / 60d。
+    baseline_close_by_date = baseline_close_by_date or {}
+    alpha_5d_pct = _compute_alpha_pct(history, baseline_close_by_date, 5)
+    alpha_20d_pct = _compute_alpha_pct(history, baseline_close_by_date, 20)
+    alpha_60d_pct = _compute_alpha_pct(history, baseline_close_by_date, 60)
+    rel_strength_label = _classify_rel_strength(alpha_20d_pct)
 
     # Base / washout features — find the最近 anomaly day (T) and the platform before it
     # The异动 day is `trade_date` itself (or the最近 row matching T). The "base" is
@@ -1320,7 +1827,14 @@ def _build_candidate_row(
         (i for i, r in enumerate(history) if str(r.get("trade_date")) == trade_date),
         len(history) - 1,
     )
-    base_window_pre_t = history[:t_idx] if t_idx > 0 else []
+    # v0.3.0 PR-2 — keep the base/washout window at 60d even though `history`
+    # is now up to 250d, so `base_*` field semantics stay backward-compatible.
+    base_window_size = 60
+    if t_idx > 0:
+        base_start = max(0, t_idx - base_window_size)
+        base_window_pre_t = history[base_start:t_idx]
+    else:
+        base_window_pre_t = []
 
     # base_days = consecutive days before T where pct_chg is moderate (|pct_chg| < 4)
     base_days = 0
@@ -1424,6 +1938,26 @@ def _build_candidate_row(
         "low_60d": low_60d,
         "range_pct_60d": range_pct_60d,
         "pct_chg_60d": pct_chg_60d,
+        # v0.3.0 P0-3 — VCP波动率收敛
+        "atr_10d_pct": atr_10d_pct,
+        "atr_10d_quantile_in_60d": atr_10d_quantile_in_60d,
+        "bbw_20d": bbw_20d,
+        "bbw_compression_ratio": bbw_compression_ratio,
+        # v0.5.0 P1-1 — RPS / 大盘相对 alpha
+        "alpha_5d_pct": alpha_5d_pct,
+        "alpha_20d_pct": alpha_20d_pct,
+        "alpha_60d_pct": alpha_60d_pct,
+        "baseline_index_code": baseline_index_code,
+        "rel_strength_label": rel_strength_label,
+        # v0.3.0 P0-4 — 120d/250d 阻力位 (E3-A：不补 low_250d / pos_in_250d_range)
+        "high_120d": high_120d,
+        "high_250d": high_250d,
+        "low_120d": low_120d,
+        "dist_to_120d_high_pct": dist_to_120d_high_pct,
+        "dist_to_250d_high_pct": dist_to_250d_high_pct,
+        "is_above_120d_high": is_above_120d_high,
+        "is_above_250d_high": is_above_250d_high,
+        "pos_in_120d_range": pos_in_120d_range,
         # Washout / base features (the user's要求 #7 维度)
         "base_days": base_days,
         "base_max_drawdown_pct": base_max_drawdown_pct,
@@ -1444,3 +1978,177 @@ def _build_candidate_row(
         # Moneyflow摘要 (5d)
         "moneyflow_5d_summary": mf_summary,
     }
+
+
+# ---------------------------------------------------------------------------
+# EVALUATE MODE — T+N realized-return computation (v0.4.0 P1-3)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_horizon_dates(
+    calendar: TradeCalendar,
+    anomaly_date: str,
+    horizons: tuple[int, ...] = EVALUATE_HORIZONS,
+) -> dict[int, str]:
+    """For each horizon n, resolve the trade_date that is n trade days AFTER
+    ``anomaly_date`` (skipping non-open days, including holidays / weekends).
+
+    Returns ``{n: yyyymmdd_string}`` for every requested horizon. Raises
+    ``ValueError`` only when the calendar has no future trade days at all
+    (which would indicate the calendar fixture is too short).
+    """
+    out: dict[int, str] = {}
+    cursor = anomaly_date
+    advanced = 0
+    target_n = max(horizons)
+    while advanced < target_n:
+        cursor = calendar.next_open(cursor)
+        advanced += 1
+        if advanced in horizons:
+            out[advanced] = cursor
+    return out
+
+
+def _compute_realized_returns(
+    *,
+    t_close: float | None,
+    horizon_closes: dict[int, float | None],
+    window_5d_closes: list[float | None],
+    window_10d_closes: list[float | None],
+) -> dict[str, float | None]:
+    """Convert raw OHLCV inputs into the realised-return scalar metrics
+    persisted in ``va_realized_returns``.
+
+    Args:
+        t_close: T-day close (basis for all percentage calcs).
+        horizon_closes: ``{1: c1, 3: c3, 5: c5, 10: c10}``. Any missing horizon
+            value is OK — it surfaces as ``None`` in the result.
+        window_5d_closes: ordered closes for T+1..T+5 (length ≤ 5; may
+            contain ``None`` for suspended days).
+        window_10d_closes: same idea for T+1..T+10.
+
+    Output keys: ``ret_t1`` ``ret_t3`` ``ret_t5`` ``ret_t10`` ``max_close_5d``
+    ``max_close_10d`` ``max_ret_5d`` ``max_ret_10d`` ``max_dd_5d``.
+    """
+
+    def _pct(num: float | None) -> float | None:
+        if num is None or t_close is None or t_close <= 0:
+            return None
+        return round((num / t_close - 1) * 100, 2)
+
+    out: dict[str, float | None] = {
+        "ret_t1": _pct(horizon_closes.get(1)),
+        "ret_t3": _pct(horizon_closes.get(3)),
+        "ret_t5": _pct(horizon_closes.get(5)),
+        "ret_t10": _pct(horizon_closes.get(10)),
+    }
+    valid_5 = [c for c in window_5d_closes if c is not None]
+    valid_10 = [c for c in window_10d_closes if c is not None]
+    out["max_close_5d"] = round(max(valid_5), 3) if valid_5 else None
+    out["max_close_10d"] = round(max(valid_10), 3) if valid_10 else None
+    out["max_ret_5d"] = _pct(out["max_close_5d"])
+    out["max_ret_10d"] = _pct(out["max_close_10d"])
+    # G2 决策: max_dd from T = (min(close[T+1..T+5]) - t_close) / t_close × 100
+    out["max_dd_5d"] = (
+        _pct(min(valid_5)) if valid_5 else None
+    )
+    return out
+
+
+def _classify_data_status(
+    *,
+    horizon_closes: dict[int, float | None],
+    horizons: tuple[int, ...],
+    today: str,
+    horizon_dates: dict[int, str],
+) -> str:
+    """Determine ``data_status`` per the v3 G5 rule:
+
+    * ``pending``  — T+1 trade_date is still in the future (no horizon column
+                     can possibly be filled yet).
+    * ``partial``  — max_horizon trade_date is in the future, OR any reachable
+                     horizon row has missing close (suspension / data gap).
+    * ``complete`` — max_horizon is in the past AND every horizon was filled.
+    """
+    if not horizon_dates:
+        return "pending"
+    h1_date = horizon_dates.get(min(horizons))
+    if h1_date is not None and h1_date > today:
+        return "pending"
+    max_n = max(horizons)
+    max_date = horizon_dates.get(max_n)
+    max_reached = max_date is not None and max_date <= today
+    all_filled = all(horizon_closes.get(n) is not None for n in horizons)
+    if max_reached and all_filled:
+        return "complete"
+    return "partial"
+
+
+def fetch_anomaly_dates_within_lookback(
+    db: Any, *, today: str, lookback_days: int
+) -> list[tuple[str, str]]:
+    """Return ``[(anomaly_date, ts_code)]`` for every va_anomaly_history row
+    whose ``anomaly_date`` is within the trailing ``lookback_days`` calendar
+    days of ``today``."""
+    cutoff = _shift_calendar_days(today, -int(lookback_days))
+    rows = db.fetchall(
+        "SELECT trade_date, ts_code FROM va_anomaly_history "
+        "WHERE trade_date >= ? ORDER BY trade_date, ts_code",
+        (cutoff,),
+    )
+    return [(str(r[0]), str(r[1])) for r in rows]
+
+
+def upsert_realized_return(
+    db: Any,
+    *,
+    anomaly_date: str,
+    ts_code: str,
+    t_close: float | None,
+    horizon_closes: dict[int, float | None],
+    metrics: dict[str, float | None],
+    data_status: str,
+) -> None:
+    """UPSERT one row into ``va_realized_returns``."""
+    db.execute(
+        "DELETE FROM va_realized_returns WHERE anomaly_date=? AND ts_code=?",
+        (anomaly_date, ts_code),
+    )
+    db.execute(
+        "INSERT INTO va_realized_returns(anomaly_date, ts_code, t_close, "
+        "t1_close, t3_close, t5_close, t10_close, "
+        "ret_t1, ret_t3, ret_t5, ret_t10, "
+        "max_close_5d, max_close_10d, max_ret_5d, max_ret_10d, max_dd_5d, "
+        "data_status) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            anomaly_date,
+            ts_code,
+            t_close,
+            horizon_closes.get(1),
+            horizon_closes.get(3),
+            horizon_closes.get(5),
+            horizon_closes.get(10),
+            metrics.get("ret_t1"),
+            metrics.get("ret_t3"),
+            metrics.get("ret_t5"),
+            metrics.get("ret_t10"),
+            metrics.get("max_close_5d"),
+            metrics.get("max_close_10d"),
+            metrics.get("max_ret_5d"),
+            metrics.get("max_ret_10d"),
+            metrics.get("max_dd_5d"),
+            data_status,
+        ),
+    )
+
+
+def fetch_completed_realized_keys(db: Any) -> set[tuple[str, str]]:
+    """Return ``{(anomaly_date, ts_code)}`` for every row with
+    ``data_status='complete'`` — used to skip work on subsequent evaluate
+    runs (idempotency)."""
+    rows = db.fetchall(
+        "SELECT anomaly_date, ts_code FROM va_realized_returns "
+        "WHERE data_status = 'complete'"
+    )
+    return {(str(r[0]), str(r[1])) for r in rows}

@@ -27,6 +27,24 @@ class VAEvidenceItem(BaseModel):
     interpretation: str = Field(..., min_length=1, max_length=120)
 
 
+class VADimensionScores(BaseModel):
+    """v0.6.0 P1-2 — per-dimension explicit scoring (0–100).
+
+    `risk` is reverse-polarity — a higher score means greater risk; every
+    other dimension is positive-polarity (higher = more bullish). The
+    relationship between this sub-object and ``launch_score`` is left to the
+    LLM's own consistency (F3 / F14 — soft constraint via prompt, no formula).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    washout: int = Field(ge=0, le=100)        # 洗盘充分度
+    pattern: int = Field(ge=0, le=100)        # 形态突破有效性
+    capital: int = Field(ge=0, le=100)        # 资金验证（moneyflow / volume）
+    sector: int = Field(ge=0, le=100)         # 板块强度 + 大盘相对（与 P1-1 合流）
+    historical: int = Field(ge=0, le=100)     # 历史浪型位置（越早越好）
+    risk: int = Field(ge=0, le=100)           # 风险（reverse-polarity — 高分 = 高风险）
+
+
 class VATrendCandidate(BaseModel):
     """One LLM verdict per input candidate."""
 
@@ -47,6 +65,9 @@ class VATrendCandidate(BaseModel):
     ]
     washout_quality: Literal["sufficient", "partial", "insufficient", "unclear"]
     rationale: str = Field(..., max_length=200)
+    # v0.6.0 P1-2 — required field (F8). Old persisted responses live in
+    # va_stage_results.raw_response_json so the strict schema is safe.
+    dimension_scores: VADimensionScores
     key_evidence: list[VAEvidenceItem] = Field(min_length=1, max_length=5)
     next_session_watch: list[str] = Field(min_length=1, max_length=4)
     invalidation_triggers: list[str] = Field(min_length=1, max_length=4)

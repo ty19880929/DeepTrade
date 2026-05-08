@@ -40,7 +40,9 @@ logger = logging.getLogger(__name__)
 # Per-candidate cost is higher than limit-up-board's R1 because we ship 60d
 # aggregates + 5d recent OHLCV + moneyflow summary per stock.
 DEFAULT_AVG_INPUT_TOKENS_PER_CANDIDATE = 1_500
-DEFAULT_AVG_OUTPUT_TOKENS_PER_CANDIDATE = 900
+# v0.6.0 — bumped from 900 → 1_100 to absorb dimension_scores (6 ints) +
+# alpha_*_pct fields without crowding output budgets at 25-candidate batches.
+DEFAULT_AVG_OUTPUT_TOKENS_PER_CANDIDATE = 1_100
 DEFAULT_INPUT_BUDGET = 200_000  # matches continuation_prediction stage
 SAFETY_RATIO = 0.85
 
