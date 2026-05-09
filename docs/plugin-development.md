@@ -296,7 +296,7 @@ deeptrade plugin uninstall my-breakout --purge    # DROP 所有 tables
 
 ## 11. 写一个 channel 插件
 
-`type: channel` + 实现 `Plugin` 的全部 + 加一个 `push(ctx, payload)`。参考 `deeptrade/channels_builtin/stdout/stdout_channel/channel.py`。channel 插件被 `deeptrade.notify(...)` 自动发现并路由。
+`type: channel` + 实现 `Plugin` 的全部 + 加一个 `push(ctx, payload)`。参考官方 stdout channel 插件：[`DeepTradePluginOfficial/stdout/stdout_channel/channel.py`](https://github.com/ty19880929/DeepTradePluginOfficial/tree/main/stdout/stdout_channel/channel.py)。channel 插件被 `deeptrade.notify(...)` 自动发现并路由。
 
 ## 12. 写其它类型的插件
 

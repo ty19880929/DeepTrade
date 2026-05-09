@@ -509,19 +509,15 @@ deeptrade volume-anomaly report "$RUN_ID" --full
 ### 4.1 安装
 
 ```bash
-deeptrade plugin install ./deeptrade/strategies_builtin/volume_anomaly -y
+deeptrade plugin install volume-anomaly
 ```
 
-安装时会按 `deeptrade_plugin.yaml` 中的 `migrations` 顺序应用：
-
-- `20260430_001_init.sql` — 创建 `va_watchlist` / `va_anomaly_history` / `va_stage_results` / `va_runs` / `va_events`
-- `20260601_001_realized_returns.sql` — 创建 `va_realized_returns`（v0.4.0 引入）
-- `20260601_002_dimension_scores.sql` — 给 `va_stage_results` 增加 6 个 `dim_*` 列（v0.6.0 引入）
+安装时会按 `deeptrade_plugin.yaml` 中的 `migrations` 顺序应用 SQL（v0.6.0 已合并为单个 `20260509_001_init.sql`，包含全部表与扩展列）。
 
 ### 4.2 升级
 
 ```bash
-deeptrade plugin upgrade ./deeptrade/strategies_builtin/volume_anomaly
+deeptrade plugin upgrade volume-anomaly
 ```
 
 只会增量应用新增的 migration，已有数据不会丢失。**v0.6.0 升级注意**：旧 LLM 响应（无 `dimension_scores`）不再可被新 schema 解析；但 `va_stage_results.raw_response_json` 中的历史 JSON 仍完整保留，仅新写入 require 新 schema。

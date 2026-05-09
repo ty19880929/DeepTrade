@@ -72,23 +72,28 @@ $ uv run deeptrade config test
 - `Permission denied` 类错误 → 检查积分等级 / token 是否正确
 - `Connection refused` → 检查网络
 
-## 4. 安装内置插件
+## 4. 安装官方插件
 
-DeepTrade 自带 3 个内建插件：2 个 strategy 类型 + 1 个 channel 类型。
+官方插件维护在 [DeepTradePluginOfficial](https://github.com/ty19880929/DeepTradePluginOfficial) 仓库。框架通过短名查注册表，自动拉取最新 release tarball 并安装。
 
 ```bash
+# 浏览注册表
+deeptrade plugin search
+
 # strategy 插件
-deeptrade plugin install ./deeptrade/strategies_builtin/limit_up_board -y
-deeptrade plugin install ./deeptrade/strategies_builtin/volume_anomaly -y
+deeptrade plugin install limit-up-board
+deeptrade plugin install volume-anomaly
 
 # channel 插件（推送通道；可选）
-deeptrade plugin install ./deeptrade/channels_builtin/stdout -y
+deeptrade plugin install stdout-channel
 
 # 查看
 deeptrade plugin list
 ```
 
 每个插件在自己的 `deeptrade_plugin.yaml` + `migrations/*.sql` 里声明它需要的全部表（每插件自己拥有自己 tushare 派生数据，零跨插件耦合）。
+
+> **离线 / 自定义版本**：本地路径仍可装：`deeptrade plugin install ./path/to/plugin`。指定 ref：`deeptrade plugin install limit-up-board --ref limit-up-board/v0.3.0`。
 
 ## 5. 跑一次
 

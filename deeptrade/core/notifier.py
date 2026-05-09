@@ -7,8 +7,9 @@ Three layers compose top-down:
               └─ ChannelPlugin instances (loaded from type=channel plugins)
 
 The framework knows nothing about feishu / dingtalk / wechat-work. Channels
-are delivered as plugins (``channels_builtin/`` mirrors ``strategies_builtin/``);
-new channels = new plugin packages, zero framework change.
+are delivered as ``type: channel`` plugins, installed at runtime through
+``deeptrade plugin install`` from the official registry or any local/git
+source. New channels = new plugin packages, zero framework change.
 
 Top-level API (used by any plugin that needs to notify):
 
