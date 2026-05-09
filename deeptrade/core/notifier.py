@@ -30,7 +30,7 @@ import threading
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 
 if TYPE_CHECKING:  # pragma: no cover
     from deeptrade.core.db import Database
@@ -246,7 +246,9 @@ def build_notifier(db: Database, plugin_manager: PluginManager) -> Notifier:
             logger.warning("failed to load channel plugin %s: %s", rec.plugin_id, e)
             continue
         ctx = PluginContext(db=db, config=ConfigService(db), plugin_id=rec.plugin_id)
-        pairs.append((instance, ctx))
+        # Filtered by `r.type == "channel"` above, so instance is a ChannelPlugin
+        # at runtime; cast tells mypy what the filter guarantees.
+        pairs.append((cast("ChannelPlugin", instance), ctx))
 
     if not pairs:
         return NoopNotifier()
