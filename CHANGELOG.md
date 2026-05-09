@@ -2,6 +2,37 @@
 
 All notable changes to DeepTrade. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and SemVer.
 
+## [v0.2.0] — 2026-05-09 — 框架瘦身（builtin 插件物理移除）· PR-8 cutover
+
+本版本完成了框架与插件的物理解耦——`deeptrade-quant` wheel 不再携带任何插件代码。所有官方插件（`limit-up-board` / `volume-anomaly` / `stdout-channel`）必须通过 `deeptrade plugin install <短名>` 从注册表安装。
+
+### Removed
+
+- `deeptrade/strategies_builtin/` 整目录（含 `limit_up_board` / `volume_anomaly`）
+- `deeptrade/channels_builtin/` 整目录（含 `stdout`）
+- `tests/strategies_builtin/` 整目录（140 个测试随插件代码迁移到 `DeepTradePluginOfficial`）
+- `mypy.ini` 中针对 builtin 的 `ignore_errors`（已无需要忽略的目标）
+
+### Changed
+
+- README.md / docs/quick-start.md / docs/plugin-development.md /
+  guide/plugin/strategy/volume-anomaly.md：命令示例从本地 builtin 路径切换为短名（`deeptrade plugin install limit-up-board` 等）。
+- `deeptrade/core/notifier.py` docstring：移除 `channels_builtin/ mirrors strategies_builtin/` 的过期引用。
+
+### Migration notes
+
+- **从 0.1.x 升级**：`pipx upgrade deeptrade-quant`。已通过本地路径安装的 builtin 插件**不会**被升级删除（plugin 数据/代码独立于框架 wheel），可继续使用，也可执行 `deeptrade plugin upgrade <短名>` 切换到注册表版本。
+- **历史快照可回溯**：`git checkout archive/with-builtin-plugins-v0.1.0-preview` 取回含 builtin 的最后状态。
+- **回滚发版**：用户可 `pipx install deeptrade-quant==0.1.0` 锁定上一稳定版本。
+
+### Wheel size impact
+
+| 指标 | v0.1.0 | v0.2.0 |
+|------|--------|--------|
+| wheel 文件数 | 74 | 37 |
+| Python 源文件（mypy 扫描） | 65 | 31 |
+| 内置 .sql migration | 4 | 1（仅框架核心） |
+
 ## [v0.1.0] — 2026-05-09 — 框架与插件解耦 · PyPI 首个稳定发布（PR-1 ~ PR-6）
 
 PyPI distribution name: **`deeptrade-quant`**（CLI 命令仍是 `deeptrade`）。
