@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import pandas as pd
-import pytest
 
 from deeptrade.strategies_builtin.volume_anomaly.volume_anomaly.calendar import (
     TradeCalendar,
@@ -14,7 +13,6 @@ from deeptrade.strategies_builtin.volume_anomaly.volume_anomaly.data import (
     _compute_realized_returns,
     _resolve_horizon_dates,
 )
-
 
 # ---------------------------------------------------------------------------
 # Calendar fixture (Mon-Fri only; covers a few weeks)

@@ -11,7 +11,6 @@ Subcommands:
 from __future__ import annotations
 
 import sys
-from typing import Optional
 
 import typer
 
@@ -48,7 +47,7 @@ def _open_runtime() -> tuple[Database, VaRuntime]:
 
 @app.command("screen")
 def cmd_screen(
-    trade_date: Optional[str] = typer.Option(None, "--trade-date", help="YYYYMMDD"),
+    trade_date: str | None = typer.Option(None, "--trade-date", help="YYYYMMDD"),
     allow_intraday: bool = typer.Option(False, "--allow-intraday"),
     force_sync: bool = typer.Option(False, "--force-sync"),
 ) -> None:
@@ -71,7 +70,7 @@ def cmd_screen(
 
 @app.command("analyze")
 def cmd_analyze(
-    trade_date: Optional[str] = typer.Option(None, "--trade-date", help="YYYYMMDD"),
+    trade_date: str | None = typer.Option(None, "--trade-date", help="YYYYMMDD"),
     allow_intraday: bool = typer.Option(False, "--allow-intraday"),
     force_sync: bool = typer.Option(False, "--force-sync"),
 ) -> None:
@@ -97,7 +96,7 @@ def cmd_prune(
     days: int = typer.Option(
         DEFAULT_PRUNE_DAYS, "--days", help="Drop watchlist rows tracked for ≥ N days (0 = all)."
     ),
-    trade_date: Optional[str] = typer.Option(None, "--trade-date", help="YYYYMMDD"),
+    trade_date: str | None = typer.Option(None, "--trade-date", help="YYYYMMDD"),
     allow_intraday: bool = typer.Option(False, "--allow-intraday"),
 ) -> None:
     """Drop watchlist rows whose tracked age ≥ N calendar days."""
@@ -120,7 +119,7 @@ def cmd_evaluate(
         30, "--lookback-days",
         help="Evaluate hits whose anomaly_date is within the trailing N calendar days.",
     ),
-    trade_date: Optional[str] = typer.Option(None, "--trade-date", help="YYYYMMDD"),
+    trade_date: str | None = typer.Option(None, "--trade-date", help="YYYYMMDD"),
     backfill_all: bool = typer.Option(
         False, "--backfill-all",
         help="Override --lookback-days and evaluate every hit in va_anomaly_history.",
@@ -156,10 +155,10 @@ def cmd_evaluate(
 
 @app.command("stats")
 def cmd_stats(
-    from_date: Optional[str] = typer.Option(
+    from_date: str | None = typer.Option(
         None, "--from", help="Anomaly date lower bound, YYYYMMDD"
     ),
-    to_date: Optional[str] = typer.Option(
+    to_date: str | None = typer.Option(
         None, "--to", help="Anomaly date upper bound, YYYYMMDD"
     ),
     by: str = typer.Option(

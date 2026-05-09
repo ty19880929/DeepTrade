@@ -843,11 +843,14 @@ def screen_anomalies(
         # silently per-row when adj_factor is missing for that row.
         f_T = adj_factor_T_lookup.get(code)
         if rules.vol_adjust and f_T is not None and f_T > 0:
+            # _adj closes over `code` and `f_T` but is only called within this
+            # same loop iteration (vols_long / vols_short below), so the B023
+            # "late binding" risk does not apply here.
             def _adj(d: str, raw: float) -> float:
-                f_d = adj_factor_lookup.get((code, d))
+                f_d = adj_factor_lookup.get((code, d))  # noqa: B023
                 if f_d is None or f_d <= 0:
                     return raw
-                return raw * (f_T / f_d)
+                return raw * (f_T / f_d)  # noqa: B023
             vol_t = float(t_row.iloc[0]["vol"])  # at T, f_d == f_T → no change
             vols_long = [
                 _adj(str(td), float(v))

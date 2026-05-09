@@ -15,7 +15,6 @@ from deeptrade.strategies_builtin.volume_anomaly.volume_anomaly.data import (
     _resolve_turnover_bucket,
 )
 
-
 # ---------------------------------------------------------------------------
 # P0-1 — upper shadow ratio formula
 # ---------------------------------------------------------------------------

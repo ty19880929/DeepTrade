@@ -17,12 +17,6 @@ from typer.testing import CliRunner
 from deeptrade.cli import app
 from deeptrade.core.db import Database, apply_core_migrations
 from deeptrade.core.plugin_manager import PluginManager
-from deeptrade.plugins_api.metadata import (
-    MigrationSpec,
-    PluginMetadata,
-    PluginPermissions,
-    TableSpec,
-)
 
 
 @pytest.fixture

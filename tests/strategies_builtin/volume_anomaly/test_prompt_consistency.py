@@ -21,7 +21,6 @@ from deeptrade.strategies_builtin.volume_anomaly.volume_anomaly.prompts_examples
     VA_TREND_FEWSHOT,
 )
 
-
 # ---------------------------------------------------------------------------
 # Build the legal field set
 # ---------------------------------------------------------------------------

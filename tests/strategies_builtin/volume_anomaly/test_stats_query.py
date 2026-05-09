@@ -12,7 +12,6 @@ from deeptrade.strategies_builtin.volume_anomaly.volume_anomaly.stats import (
     run_stats_query,
 )
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------

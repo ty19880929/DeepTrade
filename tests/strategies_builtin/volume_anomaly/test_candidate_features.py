@@ -18,7 +18,6 @@ from deeptrade.strategies_builtin.volume_anomaly.volume_anomaly.data import (
     _compute_bbw_series,
 )
 
-
 # ---------------------------------------------------------------------------
 # Test fixtures — synthetic OHLC generators
 # ---------------------------------------------------------------------------
