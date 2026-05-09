@@ -25,6 +25,7 @@ dependencies = [
     "keyring>=25.0",
     "pandas>=2.2",
     "click>=8.1",
+    "packaging>=23.0",
 ]
 
 [project.optional-dependencies]
