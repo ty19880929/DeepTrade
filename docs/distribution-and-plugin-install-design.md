@@ -163,32 +163,34 @@ https://raw.githubusercontent.com/ty19880929/DeepTradePluginOfficial/main/regist
       "name": "打板策略",
       "type": "strategy",
       "description": "A 股打板策略：双轮 LLM 漏斗（强势标的分析 → 连板预测）",
-      "repo": "DeepTradePluginOfficial",
+      "repo": "ty19880929/DeepTradePluginOfficial",
       "subdir": "limit_up_board",
       "tag_prefix": "limit-up-board/",
       "min_framework_version": "0.1.0"
     },
     "volume-anomaly": {
-      "name": "放量异动",
+      "name": "成交量异动策略",
       "type": "strategy",
-      "description": "...",
-      "repo": "DeepTradePluginOfficial",
+      "description": "主板成交量异动筛选 + LLM 主升浪启动预测（screen / analyze / prune 三模式）",
+      "repo": "ty19880929/DeepTradePluginOfficial",
       "subdir": "volume_anomaly",
       "tag_prefix": "volume-anomaly/",
       "min_framework_version": "0.1.0"
     },
-    "stdout": {
-      "name": "标准输出通道",
+    "stdout-channel": {
+      "name": "Stdout Channel",
       "type": "channel",
-      "description": "...",
-      "repo": "DeepTradePluginOfficial",
+      "description": "Reference notification channel — fully consumes the payload but only prints '✔ push success' to stdout.",
+      "repo": "ty19880929/DeepTradePluginOfficial",
       "subdir": "stdout",
-      "tag_prefix": "stdout/",
+      "tag_prefix": "stdout-channel/",
       "min_framework_version": "0.1.0"
     }
   }
 }
 ```
+
+> **注**：注册表 key（`stdout-channel`）必须等于子目录 `deeptrade_plugin.yaml` 中的 `plugin_id` 字段（§5.3 字段约束）；`subdir`（`stdout`）则是仓库内的目录名，两者不要求一致。`repo` 字段必须是完整的 `owner/repo` 形式，CLI 会用它拼接 GitHub API URL。
 
 ### 5.3 字段约束
 
@@ -694,7 +696,7 @@ CLI 通过注册表的 `tag_prefix`（如 `limit-up-board/`）筛选属于该插
 |---|----|------|------|------|
 | 1 | 框架 release workflow + PyPI Trusted Publisher | deeptrade | `release.yml` + `ci.yml`，先打一个 patch tag（如 `v0.0.2`）跑通 PyPI 发布链路；项目元数据（urls / author email / LICENSE）补齐 | 低 |
 | 2 | **阶段 A**：归档当前主仓库状态 | deeptrade | 提交 git status 中的 builtin 改动（migration 合并），打 `archive/with-builtin-plugins-v0.0.x` tag 并 push | 极低，只 commit + tag |
-| 3 | **阶段 B-1**：建立 `DeepTradePluginOfficial` 仓库 + 代码迁移 | new repo | 复制 `strategies_builtin/*`、`channels_builtin/*`、`tests/strategies_builtin/*` 到新仓库 monorepo 布局；调整 `tests/*` 的 import 路径为相对；写 `registry/index.json` 草稿（min_framework_version 暂留 `0.0.0`） | 低 — 主仓库零修改 |
+| 3 | **阶段 B-1**：建立 `DeepTradePluginOfficial` 仓库 + 代码迁移 | new repo | 复制 `strategies_builtin/*`、`channels_builtin/*`、`tests/strategies_builtin/*` 到新仓库 monorepo 布局；调整 `tests/*` 的 import 路径为相对；删除外层冗余 `__init__.py`（让 `<plugin_id>/` 不是 Python 包，与运行时 import 模式一致）；写 `registry/index.json`（`min_framework_version` 直接用 `0.1.0`，与 §13 一致） | 低 — 主仓库零修改 |
 | 4 | **阶段 B-2**：官方插件仓库的 CI | DeepTradePluginOfficial | `registry-check.yml` + `plugin-release.yml`；为三个插件打首个 tag（`limit-up-board/v0.4.0` 等），触发 release | 低 |
 | 5 | 注册表客户端 + tarball fetch + source resolver | deeptrade | `registry.py` / `github_fetch.py` / `plugin_source.py` + 单元测试（mock urllib，**不打实际 GitHub**） | 低 — 全是新增模块，零现有功能改动 |
 | 6 | CLI install/upgrade 改造 + `plugin search` | deeptrade | `cmd_install` / `cmd_upgrade` 改签名（`Path` → `str`）、加 search、版本比较、禁止降级、`UpgradeNoop`；保留所有原有错误信息文案 | 中 — 用户面，需通过完整 CLI 集成测试 |
