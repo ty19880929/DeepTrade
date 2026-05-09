@@ -48,8 +48,5 @@ Issues       = "https://github.com/ty19880929/deeptrade/issues"
 [tool.hatch.build.targets.wheel]
 packages = ["deeptrade"]
 
-[tool.hatch.build.targets.wheel.force-include]
-"deeptrade/core/migrations" = "deeptrade/core/migrations"
-
 [tool.hatch.build.targets.sdist]
 include = ["/deeptrade", "/tests", "/README.md", "/DESIGN.md", "/PLAN.md"]
