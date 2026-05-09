@@ -191,13 +191,35 @@ def _set_llm_new(svc: ConfigService) -> None:
         typer.echo(f"Provider {name!r} already exists; pick edit instead.")
         raise typer.Exit(2)
     default_base = _DEFAULT_BASE_URLS.get(name.split("-")[0], "")
-    _prompt_and_save_provider(svc, name, defaults=None, default_base_url=default_base)
+    # Adding into an empty dict auto-promotes to default; offer the choice
+    # only when a default is already in place.
+    promote_default: bool | None = None
+    if cfg.llm_providers:
+        promote_default = bool(
+            questionary.confirm(
+                f"Set {name!r} as the default LLM provider?",
+                default=False,
+            ).ask()
+        )
+    _prompt_and_save_provider(
+        svc,
+        name,
+        defaults=None,
+        default_base_url=default_base,
+        is_default=promote_default,
+    )
 
 
 def _set_llm_edit(svc: ConfigService, name: str) -> None:
     cfg = svc.get_app_config()
     cur = cfg.llm_providers[name]
-    _prompt_and_save_provider(svc, name, defaults=cur.model_dump(), default_base_url=cur.base_url)
+    _prompt_and_save_provider(
+        svc,
+        name,
+        defaults=cur.model_dump(),
+        default_base_url=cur.base_url,
+        is_default=None,
+    )
 
 
 def _prompt_and_save_provider(
@@ -206,6 +228,7 @@ def _prompt_and_save_provider(
     *,
     defaults: dict | None,
     default_base_url: str,
+    is_default: bool | None = None,
 ) -> None:
     base_url_default = defaults.get("base_url", default_base_url) if defaults else default_base_url
     model_default = defaults.get("model", "") if defaults else ""
@@ -251,6 +274,7 @@ def _prompt_and_save_provider(
             model=model,
             timeout=timeout,
             api_key=api_key if api_key else None,
+            is_default=is_default,
         )
     except ValueError as e:
         typer.echo(f"Invalid provider: {e}")
@@ -274,8 +298,48 @@ def _set_llm_delete(svc: ConfigService, existing: list[str]) -> None:
     ).ask()
     if not confirm:
         raise typer.Exit(1)
+    prior_default = svc.get_default_llm_provider()
     svc.delete_llm_provider(name)
     typer.echo(f"✔ Deleted LLM provider {name!r}")
+    new_default = svc.get_default_llm_provider()
+    if prior_default == name and new_default is not None:
+        typer.echo(f"✔ Default LLM provider auto-switched to {new_default!r}")
+
+
+@app.command("set-default-llm")
+def cmd_set_default_llm(
+    name: str = typer.Argument(..., help="Provider name to mark as default."),
+) -> None:
+    """Mark ``name`` as the default LLM provider.
+
+    The default is consumed by ``LLMManager.get_client()`` when callers
+    don't name a provider (non-debate plugin path). Switching default
+    clears the flag on every other provider so the
+    "exactly-one-default" invariant holds.
+    """
+    db, svc = _open_service()
+    try:
+        cfg = svc.get_app_config()
+        provider = cfg.llm_providers.get(name)
+        if provider is None:
+            typer.echo(
+                f"Unknown LLM provider: {name!r}; configured providers: "
+                + (", ".join(sorted(cfg.llm_providers.keys())) or "(none)")
+            )
+            raise typer.Exit(2)
+        if provider.is_default:
+            typer.echo(f"{name!r} is already the default LLM provider")
+            return
+        svc.set_llm_provider(
+            name,
+            base_url=provider.base_url,
+            model=provider.model,
+            timeout=provider.timeout,
+            is_default=True,
+        )
+        typer.echo(f"✔ Default LLM provider set to {name!r}")
+    finally:
+        db.close()
 
 
 @app.command("list-llm")

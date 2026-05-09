@@ -15,6 +15,7 @@ def home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     monkeypatch.setenv("DEEPTRADE_HOME", str(tmp_path))
     runner = CliRunner()
     runner.invoke(app, ["init", "--no-prompts"])  # skip post-init prompts
+    runner.invoke(app, ["db", "init"])
     return tmp_path
 
 

@@ -28,6 +28,9 @@ htmlcov/
 *.swp
 *.swo
 
+# Claude Code workspace
+.claude/
+
 # Environment
 .env
 .env.local

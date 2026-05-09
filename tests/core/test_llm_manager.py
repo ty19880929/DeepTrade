@@ -173,3 +173,36 @@ def test_get_client_uses_generic_transport_for_unknown_base_url(
     )
     client = mgr.get_client("deepseek", plugin_id="P", run_id="R")
     assert isinstance(client._transport, GenericOpenAITransport)  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# v0.8 — get_client(name=None) resolves the framework default
+# ---------------------------------------------------------------------------
+
+
+def test_get_client_with_none_resolves_default_provider(
+    svc: ConfigService, mgr: LLMManager
+) -> None:
+    """Non-debate plugins call get_client(plugin_id=...) without a name —
+    the manager picks the entry with is_default=True."""
+    svc.set_llm_provider("kimi", base_url="u1", model="m1", api_key="sk-1")
+    svc.set_llm_provider("deepseek", base_url="u2", model="m2", api_key="sk-2", is_default=True)
+    default_client = mgr.get_client(plugin_id="P", run_id="R")
+    explicit_client = mgr.get_client("deepseek", plugin_id="P", run_id="R")
+    # Cached by resolved name → same instance for both call shapes.
+    assert default_client is explicit_client
+
+
+def test_get_client_with_none_raises_when_no_provider_configured(mgr: LLMManager) -> None:
+    with pytest.raises(LLMNotConfiguredError, match="No default LLM provider"):
+        mgr.get_client(plugin_id="P", run_id="R")
+
+
+def test_get_client_with_none_raises_when_default_api_key_missing(
+    svc: ConfigService, mgr: LLMManager
+) -> None:
+    """The default exists but has no api_key — surfaces the same friendly
+    error path as get_client('name') would."""
+    svc.set_llm_provider("deepseek", base_url="x", model="m")  # no api_key
+    with pytest.raises(LLMNotConfiguredError, match="api_key"):
+        mgr.get_client(plugin_id="P", run_id="R")

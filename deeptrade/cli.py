@@ -184,14 +184,8 @@ def init(
     fresh = not db_file.exists()
     db = Database(db_file)
     try:
-        applied = apply_core_migrations(db)
         if fresh:
             typer.echo(f"✔ Database created: {db_file}")
-        if applied:
-            for v in applied:
-                typer.echo(f"✔ Schema applied: {v}")
-        else:
-            typer.echo("✔ Database already initialized; schema up-to-date")
     finally:
         db.close()
 
@@ -209,6 +203,39 @@ def init(
 
         cmd_set_llm()
 
+
+
+@app.command(name="db", context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
+def db_cmd(ctx: click.Context) -> None:
+    """Database migration and management commands (legacy stub; use `deeptrade db init` via group if added)."""
+    pass
+
+db_app = typer.Typer(name="db", help="Database migration and management commands.")
+app.add_typer(db_app, name="db")
+
+@db_app.command("init")
+def db_init() -> None:
+    """Initialize the core database tables and apply migrations."""
+    paths.ensure_layout()
+    db_file = paths.db_path()
+    fresh = not db_file.exists()
+    db = Database(db_file)
+    try:
+        applied = apply_core_migrations(db)
+        if fresh:
+            typer.echo(f"✔ Database created: {db_file}")
+        if applied:
+            for v in applied:
+                typer.echo(f"✔ Schema applied: {v}")
+        else:
+            typer.echo("✔ Database already initialized; schema up-to-date")
+    finally:
+        db.close()
+
+@db_app.command("upgrade")
+def db_upgrade() -> None:
+    """Apply any pending core migrations."""
+    db_init()
 
 if __name__ == "__main__":
     app()

@@ -10,7 +10,6 @@
 -- Framework configuration & secrets
 -- ============================================================
 
--- Non-secret app config
 CREATE TABLE IF NOT EXISTS app_config (
     key         VARCHAR PRIMARY KEY,
     value_json  VARCHAR NOT NULL,
@@ -18,7 +17,6 @@ CREATE TABLE IF NOT EXISTS app_config (
     updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- Encrypted secrets (keyring-backed; plaintext fallback when keyring unavailable)
 CREATE TABLE IF NOT EXISTS secret_store (
     key                VARCHAR PRIMARY KEY,
     encrypted_value    BLOB    NOT NULL,
@@ -74,8 +72,6 @@ CREATE TABLE IF NOT EXISTS plugin_schema_migrations (
 -- Framework service audit / cache state
 -- ============================================================
 
--- LLM call audit (LLMClient writes; per-plugin scoped via plugin_id column).
--- v0.7 dropped the `stage` column — see migration 20260501_002.
 CREATE TABLE IF NOT EXISTS llm_calls (
     call_id           UUID PRIMARY KEY,
     run_id            UUID,
@@ -92,14 +88,11 @@ CREATE TABLE IF NOT EXISTS llm_calls (
     created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- Tushare sync idempotency state, per (plugin_id, api_name, trade_date).
--- Each plugin tracks its own sync state — plugins do not share cached
--- payloads with each other (per pure-isolation data model).
 CREATE TABLE IF NOT EXISTS tushare_sync_state (
     plugin_id          VARCHAR NOT NULL,
     api_name           VARCHAR NOT NULL,
-    trade_date         VARCHAR NOT NULL,        -- '*' for non-dated APIs (e.g. stock_basic)
-    status             VARCHAR NOT NULL,        -- ok | partial | failed | unauthorized
+    trade_date         VARCHAR NOT NULL,        -- '*' for non-dated APIs (e.g. stock_basic)  
+    status             VARCHAR NOT NULL,        -- ok | partial | failed | unauthorized       
     row_count          BIGINT,
     cache_class        VARCHAR NOT NULL DEFAULT 'trade_day_immutable',
                                                 -- static | trade_day_immutable | trade_day_mutable | hot_or_anns
@@ -110,7 +103,6 @@ CREATE TABLE IF NOT EXISTS tushare_sync_state (
     PRIMARY KEY (plugin_id, api_name, trade_date)
 );
 
--- Tushare per-call audit (per plugin)
 CREATE TABLE IF NOT EXISTS tushare_calls (
     plugin_id   VARCHAR,
     api_name    VARCHAR,

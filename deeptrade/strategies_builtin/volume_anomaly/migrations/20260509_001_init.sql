@@ -1,20 +1,11 @@
 -- volume-anomaly strategy: full plugin schema (Plan A pure isolation).
---
--- Tables are plugin-owned. va_* prefix throughout. Tushare data is
--- consumed via TushareClient.call(...) returning DataFrames; this plugin
--- does NOT materialize tushare APIs into named SQL tables (its data
--- pipeline operates on the returned DataFrames directly).
-
--- ============================================================
--- Watchlist + audit history
--- ============================================================
 
 CREATE TABLE IF NOT EXISTS va_watchlist (
     ts_code             VARCHAR PRIMARY KEY,
     name                VARCHAR,
     industry            VARCHAR,
-    tracked_since       VARCHAR NOT NULL,    -- YYYYMMDD trade_date when first added
-    last_screened       VARCHAR NOT NULL,    -- YYYYMMDD most recent screening that hit
+    tracked_since       VARCHAR NOT NULL,
+    last_screened       VARCHAR NOT NULL,
     last_pct_chg        DOUBLE,
     last_close          DOUBLE,
     last_vol            DOUBLE,
@@ -47,7 +38,7 @@ CREATE TABLE IF NOT EXISTS va_anomaly_history (
 
 CREATE TABLE IF NOT EXISTS va_stage_results (
     run_id              UUID NOT NULL,
-    stage               VARCHAR NOT NULL,        -- 'analyze'
+    stage               VARCHAR NOT NULL,
     batch_no            INTEGER,
     trade_date          VARCHAR NOT NULL,
     ts_code             VARCHAR NOT NULL,
@@ -62,18 +53,20 @@ CREATE TABLE IF NOT EXISTS va_stage_results (
     evidence_json       VARCHAR,
     risk_flags_json     VARCHAR,
     raw_response_json   VARCHAR,
+    dim_washout         DOUBLE,
+    dim_pattern         DOUBLE,
+    dim_capital         DOUBLE,
+    dim_sector          DOUBLE,
+    dim_historical      DOUBLE,
+    dim_risk            DOUBLE,
     PRIMARY KEY (run_id, stage, ts_code)
 );
 
--- ============================================================
--- Run history & event stream (formerly framework strategy_runs / strategy_events)
--- ============================================================
-
 CREATE TABLE IF NOT EXISTS va_runs (
     run_id        UUID PRIMARY KEY,
-    mode          VARCHAR NOT NULL,             -- screen | analyze | prune
+    mode          VARCHAR NOT NULL,
     trade_date    VARCHAR NOT NULL,
-    status        VARCHAR NOT NULL,             -- running | success | failed | partial_failed | cancelled
+    status        VARCHAR NOT NULL,
     is_intraday   BOOLEAN NOT NULL DEFAULT FALSE,
     started_at    TIMESTAMP NOT NULL,
     finished_at   TIMESTAMP,
@@ -92,3 +85,27 @@ CREATE TABLE IF NOT EXISTS va_events (
     payload_json VARCHAR,
     PRIMARY KEY (run_id, seq)
 );
+
+CREATE TABLE IF NOT EXISTS va_realized_returns (
+    anomaly_date    VARCHAR NOT NULL,
+    ts_code         VARCHAR NOT NULL,
+    t_close         DOUBLE,
+    t1_close        DOUBLE,
+    t3_close        DOUBLE,
+    t5_close        DOUBLE,
+    t10_close       DOUBLE,
+    ret_t1          DOUBLE,
+    ret_t3          DOUBLE,
+    ret_t5          DOUBLE,
+    ret_t10         DOUBLE,
+    max_close_5d    DOUBLE,
+    max_close_10d   DOUBLE,
+    max_ret_5d      DOUBLE,
+    max_ret_10d     DOUBLE,
+    max_dd_5d       DOUBLE,
+    computed_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    data_status     VARCHAR NOT NULL,
+    PRIMARY KEY (anomaly_date, ts_code)
+);
+CREATE INDEX IF NOT EXISTS idx_va_realized_returns_date
+    ON va_realized_returns(anomaly_date, data_status);

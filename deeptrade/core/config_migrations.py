@@ -78,6 +78,7 @@ def migrate_legacy_deepseek_keys(db: Database) -> bool:
             "base_url": base_url,
             "model": model,
             "timeout": timeout,
+            "is_default": True,
         }
     }
 
@@ -107,6 +108,49 @@ def migrate_legacy_deepseek_keys(db: Database) -> bool:
             _LEGACY_KEYS,
         )
 
+    return True
+
+
+def migrate_llm_default_provider(db: Database) -> bool:
+    """Backfill ``is_default`` on existing ``llm.providers`` entries.
+
+    Until v0.8, ``LLMProviderConfig`` had no ``is_default`` field and
+    plugins picked a provider via hardcoded preference. v0.8 promoted
+    "default provider" to a framework-level concept; existing rows
+    therefore have no ``is_default`` flag. This migration enforces the
+    invariant "while llm.providers is non-empty, exactly one entry has
+    is_default=True" by promoting the first entry (insertion order)
+    when none are flagged.
+
+    Idempotent: returns False on a fresh DB, an empty providers dict, or
+    a dict that already has ≥1 default.
+
+    Returns True iff a row was rewritten.
+    """
+    row = db.fetchone("SELECT value_json FROM app_config WHERE key = 'llm.providers'")
+    if row is None:
+        return False
+    providers = json.loads(row[0])
+    if not isinstance(providers, dict) or not providers:
+        return False
+
+    has_default = any(
+        isinstance(v, dict) and bool(v.get("is_default")) for v in providers.values()
+    )
+    if has_default:
+        return False
+
+    first_key = next(iter(providers.keys()))
+    first_cfg = providers[first_key]
+    if not isinstance(first_cfg, dict):
+        return False
+    providers[first_key] = {**first_cfg, "is_default": True}
+
+    with db.transaction():
+        db.execute(
+            "UPDATE app_config SET value_json = ? WHERE key = 'llm.providers'",
+            (json.dumps(providers),),
+        )
     return True
 
 

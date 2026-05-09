@@ -152,21 +152,13 @@ def open_worker_runtime(
     return db, rt
 
 
-def pick_llm_provider(rt: LubRuntime) -> str:
+def pick_llm_provider(rt: LubRuntime) -> str | None:
     """Pick which configured LLM provider to use for this run.
 
-    v0.6 policy: prefer ``deepseek`` (the original default and the target of
-    the legacy-config auto-migration), else fall back to the first available
-    provider. v0.7 will let the user override via a plugin-level config key
-    such as ``limit-up-board.default_llm``.
-
-    Raises ``RuntimeError`` if no provider is configured at all.
+    Returning None defers the choice to the framework default
+    (``LLMProviderConfig.is_default`` resolved by ``LLMManager.get_client``).
+    The plugin keeps this hook so a future revision can reintroduce a
+    plugin-specific override (e.g. ``limit-up-board.default_llm``) without
+    touching the runner.
     """
-    available = rt.llms.list_providers()
-    if not available:
-        raise RuntimeError(
-            "No LLM provider configured; run `deeptrade config set-llm`"
-        )
-    if "deepseek" in available:
-        return "deepseek"
-    return available[0]
+    return None

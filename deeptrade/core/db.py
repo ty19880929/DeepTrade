@@ -166,6 +166,7 @@ def apply_core_migrations(db: Database) -> list[str]:
     from deeptrade.core.config_migrations import (
         migrate_legacy_deepseek_keys,
         migrate_legacy_deepseek_profile_key,
+        migrate_llm_default_provider,
     )
 
     if migrate_legacy_deepseek_keys(db):
@@ -173,4 +174,7 @@ def apply_core_migrations(db: Database) -> list[str]:
     # v0.7 data migration — rename deepseek.profile → app.profile.
     if migrate_legacy_deepseek_profile_key(db):
         newly.append("data:v07_app_profile")
+    # v0.8 data migration — backfill is_default on existing providers.
+    if migrate_llm_default_provider(db):
+        newly.append("data:v08_llm_default_provider")
     return newly

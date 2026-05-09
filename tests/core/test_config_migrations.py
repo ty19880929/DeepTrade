@@ -13,6 +13,7 @@ from deeptrade.core.config import ConfigService
 from deeptrade.core.config_migrations import (
     migrate_legacy_deepseek_keys,
     migrate_legacy_deepseek_profile_key,
+    migrate_llm_default_provider,
 )
 from deeptrade.core.db import Database, apply_core_migrations
 from deeptrade.core.secrets import SecretStore
@@ -180,3 +181,59 @@ def test_profile_key_migration_skips_when_new_already_set(db: Database) -> None:
     row = db.fetchone("SELECT value_json FROM app_config WHERE key = 'app.profile'")
     assert row is not None
     assert json.loads(row[0]) == "fast"
+
+
+# ---------------------------------------------------------------------------
+# v0.8 — backfill is_default on existing llm.providers rows.
+# ---------------------------------------------------------------------------
+
+
+def _seed_providers(db: Database, providers: dict) -> None:
+    db.execute("DELETE FROM app_config WHERE key = 'llm.providers'")
+    db.execute(
+        "INSERT INTO app_config(key, value_json, is_secret) VALUES (?, ?, ?)",
+        ("llm.providers", json.dumps(providers), False),
+    )
+
+
+def test_legacy_deepseek_migration_marks_default(db: Database) -> None:
+    """v0.6 legacy migration must produce a deepseek entry with is_default=True
+    so the v0.8 invariant holds out of the box."""
+    _seed_legacy(db)
+    assert migrate_legacy_deepseek_keys(db) is True
+    svc = ConfigService(db, secret_store=SecretStore(db, force_plaintext=True))
+    assert svc.get_default_llm_provider() == "deepseek"
+
+
+def test_default_provider_migration_promotes_first(db: Database) -> None:
+    """A pre-v0.8 dict (no is_default field anywhere) gets the first key
+    promoted to default."""
+    _seed_providers(
+        db,
+        {
+            "kimi": {"base_url": "u1", "model": "m1", "timeout": 180},
+            "deepseek": {"base_url": "u2", "model": "m2", "timeout": 180},
+        },
+    )
+    assert migrate_llm_default_provider(db) is True
+    svc = ConfigService(db, secret_store=SecretStore(db, force_plaintext=True))
+    assert svc.get_default_llm_provider() == "kimi"
+
+
+def test_default_provider_migration_idempotent_when_default_exists(db: Database) -> None:
+    _seed_providers(
+        db,
+        {
+            "deepseek": {"base_url": "u", "model": "m", "timeout": 180, "is_default": True},
+            "kimi": {"base_url": "u", "model": "m", "timeout": 180, "is_default": False},
+        },
+    )
+    assert migrate_llm_default_provider(db) is False
+
+
+def test_default_provider_migration_no_op_on_empty(db: Database) -> None:
+    """No llm.providers row at all and an empty providers dict are both
+    no-ops — nothing to backfill."""
+    assert migrate_llm_default_provider(db) is False
+    _seed_providers(db, {})
+    assert migrate_llm_default_provider(db) is False

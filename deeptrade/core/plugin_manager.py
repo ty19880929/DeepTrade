@@ -290,18 +290,18 @@ class PluginManager:
     def info(self, plugin_id: str) -> InstalledPlugin:
         rec = self._fetch_one_plugin(plugin_id)
         if rec is None:
-            raise PluginNotFoundError(plugin_id)
+            raise PluginNotFoundError(f"plugin not installed: {plugin_id}")
         return rec
 
     def disable(self, plugin_id: str) -> None:
         if self._fetch_one_plugin(plugin_id) is None:
-            raise PluginNotFoundError(plugin_id)
+            raise PluginNotFoundError(f"plugin not installed: {plugin_id}")
         self._db.execute("UPDATE plugins SET enabled = FALSE WHERE plugin_id = ?", (plugin_id,))
 
     def enable(self, plugin_id: str) -> None:
         rec = self._fetch_one_plugin(plugin_id)
         if rec is None:
-            raise PluginNotFoundError(plugin_id)
+            raise PluginNotFoundError(f"plugin not installed: {plugin_id}")
         # F-L1 — guard against enabling a plugin whose install_path was
         # removed (e.g. by an earlier uninstall without --purge that wiped
         # the on-disk copy). Re-enabling such a record would later crash
@@ -316,7 +316,7 @@ class PluginManager:
     def uninstall(self, plugin_id: str, *, purge: bool = False) -> dict[str, Any]:
         rec = self._fetch_one_plugin(plugin_id)
         if rec is None:
-            raise PluginNotFoundError(plugin_id)
+            raise PluginNotFoundError(f"plugin not installed: {plugin_id}")
 
         dropped: list[str] = []
         if purge:
@@ -351,7 +351,7 @@ class PluginManager:
         meta = _load_metadata_yaml(source_path / "deeptrade_plugin.yaml")
         existing = self._fetch_one_plugin(meta.plugin_id)
         if existing is None:
-            raise PluginNotFoundError(meta.plugin_id)
+            raise PluginNotFoundError(f"plugin not installed: {meta.plugin_id}")
 
         if meta.api_version != CURRENT_API_VERSION:
             raise PluginInstallError(

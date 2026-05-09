@@ -73,18 +73,12 @@ def build_tushare_client(rt: VaRuntime, *, intraday: bool = False, event_cb: Any
     )
 
 
-def pick_llm_provider(rt: VaRuntime) -> str:
+def pick_llm_provider(rt: VaRuntime) -> str | None:
     """Pick which configured LLM provider to use for this run.
 
-    See ``limit_up_board.runtime.pick_llm_provider`` for the policy rationale
-    — kept duplicated here so each plugin can later diverge (per-plugin
-    default LLM in v0.7).
+    Returning None defers the choice to the framework default
+    (``LLMProviderConfig.is_default`` resolved by ``LLMManager.get_client``).
+    Kept as a plugin-side hook so a future revision can reintroduce a
+    plugin-specific override without touching the runner.
     """
-    available = rt.llms.list_providers()
-    if not available:
-        raise RuntimeError(
-            "No LLM provider configured; run `deeptrade config set-llm`"
-        )
-    if "deepseek" in available:
-        return "deepseek"
-    return available[0]
+    return None

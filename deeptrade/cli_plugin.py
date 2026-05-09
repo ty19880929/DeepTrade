@@ -168,7 +168,11 @@ def cmd_upgrade(path: Path = typer.Argument(...)) -> None:
     try:
         try:
             rec = mgr.upgrade(path)
-        except (PluginInstallError, PluginNotFoundError) as e:
+        except PluginNotFoundError as e:
+            meta = _load_metadata_yaml(path / "deeptrade_plugin.yaml")
+            typer.echo(f'✘ 插件 "{meta.plugin_id}" 未安装，请先执行 deeptrade plugin install')
+            raise typer.Exit(2) from e
+        except PluginInstallError as e:
             typer.echo(f"✘ Upgrade failed: {e}")
             raise typer.Exit(2) from e
         typer.echo(f"✔ upgraded: {rec.plugin_id} → v{rec.version}")

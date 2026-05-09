@@ -34,27 +34,9 @@ permissions:
   llm_tools: false
 
 migrations:
-  - version: "20260430_001"
-    file: migrations/20260430_001_init.sql
-    checksum: "sha256:6009465242554848315fcd058b816829161f1f51803db004361995ddf28814c3"
-  - version: "20260501_002"
-    file: migrations/20260501_002_lub_stage_results_llm_provider.sql
-    checksum: "sha256:9db92478a786984b69fa37a143b806357f940bd2471253d7bd4918735c41690f"
-  - version: "20260508_001"
-    file: migrations/20260508_001_lub_lhb_tables.sql
-    checksum: "sha256:12e32fa078874c1b7d30645646a23e345db2937f00534269d282251c9b497f0d"
-  - version: "20260508_002"
-    file: migrations/20260508_002_lub_cyq_perf.sql
-    checksum: "sha256:5558169e6c5f6ae72be026dfac598f9a5d886d01b76a53565796a6f1b5665772"
-  - version: "20260508_003"
-    file: migrations/20260508_003_lub_lhb_pk_fix.sql
-    checksum: "sha256:a5efaf93f1399131610e2d0ee7b23bb00846a0aec72801589b91d6669443f187"
-  - version: "20260508_004"
-    file: migrations/20260508_004_lub_lhb_drop_pk.sql
-    checksum: "sha256:192837aa88f31b985575d73840a516719cf692ae1be0dce447fcd98d0de0667f"
-  - version: "20260508_005"
-    file: migrations/20260508_005_lub_config.sql
-    checksum: "sha256:5971f06666ee96a23a5297290e8bc725dab61debbb64a58925abcc26d8844a3c"
+  - version: "20260509_001"
+    file: migrations/20260509_001_init.sql
+    checksum: "sha256:8f6bc721fedbd94f652fa356779eea7b4ef801483968dabfa6648cf2f639064f"
 
 tables:
   - name: lub_stock_basic

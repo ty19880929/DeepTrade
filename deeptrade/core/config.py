@@ -51,12 +51,20 @@ class LLMProviderConfig(BaseModel):
 
     The api_key is NOT stored here; it lives in ``secret_store`` under the
     key ``llm.<name>.api_key`` and is routed via ``is_secret_key()``.
+
+    ``is_default`` marks the provider used by ``LLMManager.get_client()``
+    when the caller does not name a provider (non-debate plugin path).
+    Invariant: while ``llm_providers`` is non-empty, exactly one entry
+    has ``is_default=True``. ``ConfigService.set_llm_provider`` /
+    ``delete_llm_provider`` maintain this invariant; legacy configs are
+    repaired by ``config_migrations``.
     """
 
     model_config = ConfigDict(extra="forbid")
     base_url: str
     model: str
     timeout: int = Field(default=180, ge=10)
+    is_default: bool = False
 
 
 class AppConfig(BaseModel):
@@ -317,9 +325,23 @@ class ConfigService:
         model: str,
         timeout: int = 180,
         api_key: str | None = None,
+        is_default: bool | None = None,
     ) -> None:
         """Insert or update a provider entry. If ``api_key`` is given, also
         persist it to secret_store under ``llm.<name>.api_key``.
+
+        Default-provider invariant (one entry has ``is_default=True`` while
+        ``llm.providers`` is non-empty) is maintained here:
+
+          * Adding the first provider auto-marks it default regardless of
+            the ``is_default`` argument.
+          * ``is_default=True`` on a non-first add or update promotes this
+            provider and clears the flag on every other entry.
+          * ``is_default=None`` on update preserves the existing flag (no
+            silent demotion); on a non-first add it defaults to False.
+          * ``is_default=False`` is honored only when another provider
+            already holds the default flag — never used to leave the dict
+            with zero defaults.
         """
         if not name or "." in name:
             raise ValueError(
@@ -327,18 +349,79 @@ class ConfigService:
             )
         current_raw = self.get("llm.providers")
         current: dict[str, Any] = dict(current_raw) if isinstance(current_raw, dict) else {}
-        current[name] = {"base_url": base_url, "model": model, "timeout": timeout}
+        is_first = len(current) == 0
+        existing = dict(current.get(name) or {})
+        prior_default = bool(existing.get("is_default", False))
+
+        # Resolve the new is_default flag for this provider.
+        if is_first:
+            new_default = True
+        elif is_default is True:
+            new_default = True
+        elif is_default is None:
+            new_default = prior_default
+        else:  # is_default is False
+            # Only honor an explicit demotion if some other provider is
+            # already default; otherwise we'd leave the dict with no
+            # default at all. Preserve prior_default in that case.
+            other_has_default = any(
+                k != name and bool((v or {}).get("is_default"))
+                for k, v in current.items()
+            )
+            new_default = prior_default if not other_has_default else False
+
+        # If this provider is becoming default, demote every other entry so
+        # the invariant "at most one default" holds.
+        if new_default:
+            for other_name, other_cfg in current.items():
+                if other_name != name and isinstance(other_cfg, dict) and other_cfg.get("is_default"):
+                    current[other_name] = {**other_cfg, "is_default": False}
+
+        current[name] = {
+            "base_url": base_url,
+            "model": model,
+            "timeout": timeout,
+            "is_default": new_default,
+        }
         self.set("llm.providers", current)
         if api_key is not None:
             self.set(f"llm.{name}.api_key", api_key)
 
     def delete_llm_provider(self, name: str) -> None:
-        """Remove a provider entry plus its api_key. Idempotent on missing name."""
+        """Remove a provider entry plus its api_key. Idempotent on missing name.
+
+        If the removed provider held ``is_default=True`` and ≥1 entry
+        survives, the first remaining entry (insertion order) is auto-
+        promoted to default to maintain the invariant.
+        """
         current_raw = self.get("llm.providers")
         current: dict[str, Any] = dict(current_raw) if isinstance(current_raw, dict) else {}
-        current.pop(name, None)
+        removed = current.pop(name, None)
+        removed_was_default = bool(isinstance(removed, dict) and removed.get("is_default"))
+
+        if removed_was_default and current:
+            first_key = next(iter(current.keys()))
+            first_cfg = current[first_key]
+            if isinstance(first_cfg, dict):
+                current[first_key] = {**first_cfg, "is_default": True}
+
         if current:
             self.set("llm.providers", current)
         else:
             self.delete("llm.providers")
         self.delete(f"llm.{name}.api_key")
+
+    def get_default_llm_provider(self) -> str | None:
+        """Return the name of the provider with ``is_default=True``, or None
+        if no providers are configured.
+
+        Used by :class:`LLMManager.get_client` to resolve ``name=None`` calls
+        from non-debate plugins. Not exposed as a CLI; the CLI sets the
+        default via ``set-default-llm`` which routes through
+        :meth:`set_llm_provider`.
+        """
+        cfg = self.get_app_config()
+        for provider_name, provider in cfg.llm_providers.items():
+            if provider.is_default:
+                return provider_name
+        return None

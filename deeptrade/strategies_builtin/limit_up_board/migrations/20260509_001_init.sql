@@ -1,13 +1,4 @@
 -- limit-up-board strategy: full plugin schema (Plan A pure isolation).
---
--- All tables are plugin-owned. Tushare-derived "shared" tables (formerly in
--- core migrations) now live here under the lub_* prefix so the plugin owns
--- its own data in line with the no-cross-plugin-coupling principle.
-
--- ============================================================
--- Tushare-derived business tables (plugin-prefixed copies of what used to
--- be in core under the un-prefixed names)
--- ============================================================
 
 CREATE TABLE IF NOT EXISTS lub_stock_basic (
     ts_code VARCHAR PRIMARY KEY,
@@ -53,10 +44,6 @@ CREATE TABLE IF NOT EXISTS lub_moneyflow (
     net_mf_vol      DOUBLE, net_mf_amount   DOUBLE,
     PRIMARY KEY (ts_code, trade_date)
 );
-
--- ============================================================
--- Strategy-specific business tables
--- ============================================================
 
 CREATE TABLE IF NOT EXISTS lub_limit_list_d (
     trade_date     VARCHAR NOT NULL,
@@ -107,7 +94,8 @@ CREATE TABLE IF NOT EXISTS lub_limit_ths (
 
 CREATE TABLE IF NOT EXISTS lub_stage_results (
     run_id              UUID NOT NULL,
-    stage               VARCHAR NOT NULL,           -- 'r1' | 'r2' | 'final_ranking'
+    stage               VARCHAR NOT NULL,
+    llm_provider        VARCHAR,
     batch_no            INTEGER,
     trade_date          VARCHAR NOT NULL,
     ts_code             VARCHAR NOT NULL,
@@ -121,15 +109,13 @@ CREATE TABLE IF NOT EXISTS lub_stage_results (
     raw_response_json   VARCHAR,
     PRIMARY KEY (run_id, stage, ts_code)
 );
-
--- ============================================================
--- Run history & event stream (formerly framework strategy_runs / strategy_events)
--- ============================================================
+CREATE INDEX IF NOT EXISTS ix_lub_stage_results_run_provider
+    ON lub_stage_results(run_id, llm_provider, stage);
 
 CREATE TABLE IF NOT EXISTS lub_runs (
     run_id        UUID PRIMARY KEY,
     trade_date    VARCHAR NOT NULL,
-    status        VARCHAR NOT NULL,             -- running | success | failed | partial_failed | cancelled
+    status        VARCHAR NOT NULL,
     is_intraday   BOOLEAN NOT NULL DEFAULT FALSE,
     started_at    TIMESTAMP NOT NULL,
     finished_at   TIMESTAMP,
@@ -147,4 +133,56 @@ CREATE TABLE IF NOT EXISTS lub_events (
     message      VARCHAR NOT NULL,
     payload_json VARCHAR,
     PRIMARY KEY (run_id, seq)
+);
+
+CREATE TABLE IF NOT EXISTS lub_top_list (
+    trade_date     VARCHAR NOT NULL,
+    ts_code        VARCHAR NOT NULL,
+    reason         VARCHAR NOT NULL,
+    name           VARCHAR,
+    close          DOUBLE,
+    pct_change     DOUBLE,
+    turnover_rate  DOUBLE,
+    amount         DOUBLE,
+    l_sell         DOUBLE,
+    l_buy          DOUBLE,
+    l_amount       DOUBLE,
+    net_amount     DOUBLE,
+    net_rate       DOUBLE,
+    amount_rate    DOUBLE,
+    float_values   DOUBLE
+);
+
+CREATE TABLE IF NOT EXISTS lub_top_inst (
+    trade_date  VARCHAR NOT NULL,
+    ts_code     VARCHAR NOT NULL,
+    exalter     VARCHAR NOT NULL,
+    side        INTEGER NOT NULL,
+    reason      VARCHAR NOT NULL,
+    buy         DOUBLE,
+    buy_rate    DOUBLE,
+    sell        DOUBLE,
+    sell_rate   DOUBLE,
+    net_buy     DOUBLE
+);
+
+CREATE TABLE IF NOT EXISTS lub_cyq_perf (
+    trade_date  VARCHAR NOT NULL,
+    ts_code     VARCHAR NOT NULL,
+    his_low     DOUBLE,
+    his_high    DOUBLE,
+    cost_5pct   DOUBLE,
+    cost_15pct  DOUBLE,
+    cost_50pct  DOUBLE,
+    cost_85pct  DOUBLE,
+    cost_95pct  DOUBLE,
+    weight_avg  DOUBLE,
+    winner_rate DOUBLE,
+    PRIMARY KEY (trade_date, ts_code)
+);
+
+CREATE TABLE IF NOT EXISTS lub_config (
+    key         VARCHAR PRIMARY KEY,
+    value_json  VARCHAR NOT NULL,
+    updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );

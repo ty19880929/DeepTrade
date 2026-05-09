@@ -7,9 +7,13 @@ obtain an ``LLMClient``. It provides:
     * ``get_provider_info()``   — display metadata (no api_key)
     * ``get_client()``          — a fully-wired ``LLMClient`` for one provider
 
-Multiple providers coexist; there is no "default" provider concept. A single
-plugin may call ``get_client("deepseek", ...)`` and ``get_client("kimi", ...)``
-in the same run and treat them as independent clients.
+Multiple providers coexist. A non-debate plugin can omit the provider name
+(``get_client(plugin_id=..., run_id=...)``) and the manager resolves the
+framework-level default (``LLMProviderConfig.is_default``); a debate plugin
+enumerates all providers via ``list_providers()`` and passes each name
+explicitly. A single plugin may call ``get_client("deepseek", ...)`` and
+``get_client("kimi", ...)`` in the same run and treat them as independent
+clients.
 
 Thread safety
 -------------
@@ -118,7 +122,7 @@ class LLMManager:
 
     def get_client(
         self,
-        name: str,
+        name: str | None = None,
         *,
         plugin_id: str,
         run_id: str | None = None,
@@ -126,14 +130,27 @@ class LLMManager:
     ) -> LLMClient:
         """Return an ``LLMClient`` bound to provider ``name``.
 
-        Cached by ``(name, plugin_id, run_id)`` for the lifetime of this
+        When ``name`` is None, resolves to the framework default provider
+        (the entry with ``is_default=True``). Cached by
+        ``(resolved_name, plugin_id, run_id)`` for the lifetime of this
         manager — repeated calls during a single run reuse the same
         transport / httpx pool.
 
         Raises:
-            LLMNotConfiguredError — provider not in ``llm.providers``, or
-                its ``llm.<name>.api_key`` is unset.
+            LLMNotConfiguredError — name is None and no default is
+                configured, the named provider is not in ``llm.providers``,
+                or its ``llm.<name>.api_key`` is unset.
         """
+        if name is None:
+            resolved = self._config.get_default_llm_provider()
+            if resolved is None:
+                raise LLMNotConfiguredError(
+                    "No default LLM provider is configured; run "
+                    "`deeptrade config set-llm` to add one (the first "
+                    "provider added becomes default), or "
+                    "`deeptrade config set-default-llm <name>` to switch."
+                )
+            name = resolved
         cache_key: _CacheKey = (name, plugin_id, run_id)
         cached = self._cache.get(cache_key)
         if cached is not None:
