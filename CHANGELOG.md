@@ -2,6 +2,72 @@
 
 All notable changes to DeepTrade. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and SemVer.
 
+## [v0.1.0] — 2026-05-09 — 框架与插件解耦 · PyPI 首个稳定发布（PR-1 ~ PR-6）
+
+PyPI distribution name: **`deeptrade-quant`**（CLI 命令仍是 `deeptrade`）。
+
+```bash
+pipx install deeptrade-quant      # or: uv tool install deeptrade-quant
+deeptrade plugin search           # browse the official registry
+deeptrade plugin install limit-up-board
+```
+
+参考 `docs/distribution-and-plugin-install-design.md`。本版本是 §10 中
+PR-1~PR-6 的合集；builtin 插件目录仍随 wheel 一起发布（兼容旧的本地路径
+安装），下一个版本（PR-8 cutover）将完成瘦身。
+
+### Added
+
+- **从 PyPI 分发**：项目元数据、LICENSE、GitHub Actions（`ci.yml` /
+  `release.yml`）就位；`tag v*` 触发 OIDC Trusted Publisher 直发 PyPI。
+- **官方插件注册表客户端**（`deeptrade.core.registry`）：从
+  `raw.githubusercontent.com/ty19880929/DeepTradePluginOfficial/main/registry/index.json`
+  拉取，ETag 缓存到 `~/.deeptrade/plugins/registry-cache.json`；网络故障
+  时回退到本地缓存。
+- **GitHub tarball 拉取**（`deeptrade.core.github_fetch`）：stdlib 实现
+  （`urllib` + `tarfile`），无第三方 HTTP 依赖；`GITHUB_TOKEN` 环境变量
+  自动用于 rate-limit / 私有仓库（未来扩展）；解压做 path-traversal
+  防护。
+- **来源解析层**（`deeptrade.core.plugin_source`）：`SourceResolver` 把
+  用户输入（短名 / GitHub URL / 本地路径）统一解析为本地目录，强制
+  `min_framework_version` 校验。
+- **新命令** `deeptrade plugin search [keyword] [--no-cache]`：列出注册
+  表中可用的插件；`--no-cache` 旁路 ETag 缓存。
+- **`plugin info` 注册表 fallback**：未安装但在注册表中时显示注册表条
+  目 + 安装命令提示。
+
+### Changed
+
+- `deeptrade plugin install <SOURCE>` 现支持三种来源：短名（注册表）、
+  完整 git 仓库 URL、本地路径。判定顺序：本地目录存在 → git URL → 短
+  名。`--ref <tag|branch|sha>` 可指定具体 ref（默认拉该插件最新 release
+  tag）。
+- `deeptrade plugin upgrade <SOURCE>` 同上，且加入 SemVer 比较：
+  - 待装 == 已装：`exit 0` + "已是最新版本 vX"
+  - 待装 > 已装：执行升级
+  - 待装 < 已装：`exit 2` + 提示先 `uninstall --purge`（**禁止降级**，
+    因为框架未建模 migration 回滚）
+- `PluginManager.upgrade()` 返回类型改为 `InstalledPlugin | UpgradeNoop`。
+
+### Fixed
+
+- `pyproject.toml` 删除了与 `packages = ["deeptrade"]` 冲突的
+  `[tool.hatch.build.targets.wheel.force-include]` 段（曾导致 wheel 内
+  `deeptrade/core/migrations/` 路径 duplicate name，让 PyPI 上传失败）。
+- `deeptrade.core.notifier`：channel 实例 cast 到 `ChannelPlugin`（mypy
+  narrowing 修复）。
+- 一批预存在的 ruff lint（UP045 / F401 / I001 / W292 / B023）清理。
+
+### Notes
+
+- builtin 插件（`limit-up-board` / `volume-anomaly` / `stdout-channel`）
+  代码已迁移到 [`DeepTradePluginOfficial`](https://github.com/ty19880929/DeepTradePluginOfficial)
+  独立仓库，并发布了首个 release tag（`limit-up-board/v0.4.0` 等）。
+  本版本框架仍然包含旧 builtin 子树作为兼容期保留；下一版本（瘦身后）
+  将物理移除。
+- archive tag `archive/with-builtin-plugins-v0.1.0-preview` 永久保留含
+  builtin 子树的最后状态，可随时 `git checkout` 取回。
+
 ## [volume-anomaly v0.6.0] — 2026-05-08 — 显式分维度评分（PR-6）
 
 > 仅升级 volume-anomaly 插件版本（0.5.0 → 0.6.0）；框架版本不变。
