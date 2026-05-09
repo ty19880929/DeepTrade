@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from packaging.version import InvalidVersion, Version
 
 from deeptrade.core import paths
 from deeptrade.core.db import Database
@@ -66,6 +67,15 @@ class InstalledPlugin:
     install_path: str
     enabled: bool
     metadata: PluginMetadata
+
+
+@dataclass
+class UpgradeNoop:
+    """Returned by :meth:`PluginManager.upgrade` when the candidate version
+    equals the installed version (no-op)."""
+
+    plugin_id: str
+    version: str
 
 
 # ---------------------------------------------------------------------------
@@ -345,13 +355,36 @@ class PluginManager:
 
         return {"purged_tables": dropped, "purge": purge}
 
-    def upgrade(self, source_path: Path) -> InstalledPlugin:
-        """Upgrade an existing plugin: apply only NEW migrations (S5)."""
+    def upgrade(self, source_path: Path) -> InstalledPlugin | UpgradeNoop:
+        """Upgrade an existing plugin: apply only NEW migrations (S5).
+
+        Version semantics (see distribution-and-plugin-install-design.md §7):
+          - candidate == installed → return :class:`UpgradeNoop` (CLI exits 0)
+          - candidate > installed  → run the upgrade
+          - candidate < installed  → raise :class:`PluginInstallError`
+            (downgrade is forbidden because migration rollback is not modeled)
+        """
         source_path = source_path.resolve()
         meta = _load_metadata_yaml(source_path / "deeptrade_plugin.yaml")
         existing = self._fetch_one_plugin(meta.plugin_id)
         if existing is None:
             raise PluginNotFoundError(f"plugin not installed: {meta.plugin_id}")
+
+        try:
+            new_ver = Version(meta.version)
+            cur_ver = Version(existing.version)
+        except InvalidVersion as e:
+            raise PluginInstallError(
+                f"invalid version on {meta.plugin_id}: {e}"
+            ) from e
+
+        if new_ver == cur_ver:
+            return UpgradeNoop(plugin_id=meta.plugin_id, version=existing.version)
+        if new_ver < cur_ver:
+            raise PluginInstallError(
+                f"待装版本 {meta.version} 低于已装 {existing.version}; "
+                f"如需降级，请先 `deeptrade plugin uninstall {meta.plugin_id} --purge`"
+            )
 
         if meta.api_version != CURRENT_API_VERSION:
             raise PluginInstallError(

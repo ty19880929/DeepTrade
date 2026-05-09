@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import questionary
 import typer
 import yaml
@@ -12,15 +10,42 @@ from rich.table import Table
 
 from deeptrade.core import paths
 from deeptrade.core.db import Database
+from deeptrade.core.github_fetch import (
+    GitHubFetchError,
+    NoMatchingReleaseError,
+    TarballFetchError,
+)
 from deeptrade.core.plugin_manager import (
     PluginInstallError,
     PluginManager,
     PluginNotFoundError,
+    UpgradeNoop,
     _load_metadata_yaml,
     summarize_for_install,
 )
+from deeptrade.core.plugin_source import (
+    ResolvedSource,
+    SourceResolveError,
+    SourceResolver,
+)
+from deeptrade.core.registry import (
+    RegistryClient,
+    RegistryFetchError,
+    RegistryNotFoundError,
+    RegistrySchemaError,
+)
 
 app = typer.Typer(help="Install / manage plugins", no_args_is_help=True)
+
+_RESOLVE_ERRORS: tuple[type[Exception], ...] = (
+    RegistryNotFoundError,
+    RegistryFetchError,
+    RegistrySchemaError,
+    NoMatchingReleaseError,
+    TarballFetchError,
+    GitHubFetchError,
+    SourceResolveError,
+)
 
 
 def _open() -> tuple[Database, PluginManager]:
@@ -28,42 +53,67 @@ def _open() -> tuple[Database, PluginManager]:
     return db, PluginManager(db)
 
 
+def _format_origin(resolved: ResolvedSource) -> str:
+    d = resolved.origin_detail
+    if resolved.origin == "local":
+        return f"本地路径 ({d.get('local_path', resolved.path)})"
+    if resolved.origin == "github_registry":
+        return (
+            f"GitHub 注册表 ({d['repo']}@{d['ref']}, subdir={d['subdir']})"
+        )
+    if resolved.origin == "github_url":
+        return f"GitHub URL ({d['repo']}@{d['ref']})"
+    return resolved.origin
+
+
 @app.command("install")
 def cmd_install(
-    path: Path = typer.Argument(..., help="Local path to the plugin source directory"),
+    source: str = typer.Argument(
+        ..., help="短名（注册表）/ 本地路径 / GitHub URL"
+    ),
+    ref: str | None = typer.Option(
+        None, "--ref", help="Tag / branch / sha (默认 = 该插件最新 release)"
+    ),
     yes: bool = typer.Option(False, "-y", "--yes", help="Skip the confirmation prompt"),
 ) -> None:
-    """Install a plugin from a local directory (no network)."""
-    if not path.is_dir():
-        typer.echo(f"Not a directory: {path}")
-        raise typer.Exit(2)
-
-    # Load + validate metadata before any DB access
+    """Install a plugin from the registry, a GitHub URL, or a local directory."""
+    resolver = SourceResolver()
     try:
-        meta = _load_metadata_yaml(path / "deeptrade_plugin.yaml")
-    except PluginInstallError as e:
+        resolved = resolver.resolve(source, ref)
+    except _RESOLVE_ERRORS as e:
         typer.echo(f"✘ {e}")
         raise typer.Exit(2) from e
 
-    typer.echo("─── 即将安装 ─────────────────────────────")
-    typer.echo(summarize_for_install(meta, path))
-    typer.echo("──────────────────────────────────────────")
-    if not yes:
-        ok = questionary.confirm("确认安装?", default=False).ask()
-        if not ok:
-            typer.echo("Aborted.")
-            raise typer.Exit(1)
-
-    db, mgr = _open()
     try:
-        rec = mgr.install(path)
-    except PluginInstallError as e:
-        typer.echo(f"✘ Install failed: {e}")
-        raise typer.Exit(2) from e
-    finally:
-        db.close()
+        try:
+            meta = _load_metadata_yaml(resolved.path / "deeptrade_plugin.yaml")
+        except PluginInstallError as e:
+            typer.echo(f"✘ {e}")
+            raise typer.Exit(2) from e
 
-    typer.echo(f"✔ 已安装: {rec.plugin_id} v{rec.version}")
+        typer.echo("─── 即将安装 ─────────────────────────────")
+        typer.echo(f"来源: {_format_origin(resolved)}")
+        typer.echo(summarize_for_install(meta, resolved.path))
+        typer.echo("──────────────────────────────────────────")
+        if not yes:
+            ok = questionary.confirm("确认安装?", default=False).ask()
+            if not ok:
+                typer.echo("Aborted.")
+                raise typer.Exit(1)
+
+        db, mgr = _open()
+        try:
+            rec = mgr.install(resolved.path)
+        except PluginInstallError as e:
+            typer.echo(f"✘ Install failed: {e}")
+            raise typer.Exit(2) from e
+        finally:
+            db.close()
+
+        typer.echo(f"✔ 已安装: {rec.plugin_id} v{rec.version}")
+    finally:
+        if resolved.cleanup is not None:
+            resolved.cleanup()
 
 
 @app.command("list")
@@ -91,17 +141,40 @@ def cmd_list() -> None:
 
 @app.command("info")
 def cmd_info(plugin_id: str = typer.Argument(...)) -> None:
-    """Show metadata + installed tables for a plugin."""
+    """Show metadata for a plugin.
+
+    If installed locally: shows the full installed metadata.yaml.
+    If not installed: falls back to the registry entry (with an install hint).
+    """
     db, mgr = _open()
     try:
         try:
             rec = mgr.info(plugin_id)
-        except PluginNotFoundError as e:
-            typer.echo(f"✘ {plugin_id} not installed")
-            raise typer.Exit(2) from e
-        typer.echo(yaml.safe_dump(rec.metadata.model_dump(mode="json"), allow_unicode=True))
+            typer.echo(
+                yaml.safe_dump(rec.metadata.model_dump(mode="json"), allow_unicode=True)
+            )
+            return
+        except PluginNotFoundError:
+            pass  # fall through to registry lookup
     finally:
         db.close()
+
+    try:
+        entry = RegistryClient().resolve(plugin_id)
+    except RegistryNotFoundError as e:
+        typer.echo(f"✘ {plugin_id} 既未安装，也不在注册表中")
+        raise typer.Exit(2) from e
+    except (RegistryFetchError, RegistrySchemaError) as e:
+        typer.echo(f"✘ {plugin_id} 未安装；查询注册表失败: {e}")
+        raise typer.Exit(2) from e
+
+    typer.echo(f"(未安装) {entry.plugin_id}")
+    typer.echo(f"  name:        {entry.name}")
+    typer.echo(f"  type:        {entry.type}")
+    typer.echo(f"  description: {entry.description}")
+    typer.echo(f"  repo:        {entry.repo}")
+    typer.echo(f"  subdir:      {entry.subdir}")
+    typer.echo(f"  install:     deeptrade plugin install {entry.plugin_id}")
 
 
 @app.command("disable")
@@ -163,18 +236,95 @@ def cmd_uninstall(
 
 
 @app.command("upgrade")
-def cmd_upgrade(path: Path = typer.Argument(...)) -> None:
-    db, mgr = _open()
+def cmd_upgrade(
+    source: str = typer.Argument(
+        ..., help="短名（注册表）/ 本地路径 / GitHub URL"
+    ),
+    ref: str | None = typer.Option(
+        None, "--ref", help="Tag / branch / sha (默认 = 该插件最新 release)"
+    ),
+) -> None:
+    """Upgrade an installed plugin.
+
+    Exit codes:
+      0 — upgraded, or already at the candidate version
+      2 — not installed / candidate < installed (downgrade forbidden) /
+          network or registry failure
+    """
+    resolver = SourceResolver()
     try:
+        resolved = resolver.resolve(source, ref)
+    except _RESOLVE_ERRORS as e:
+        typer.echo(f"✘ {e}")
+        raise typer.Exit(2) from e
+
+    try:
+        db, mgr = _open()
         try:
-            rec = mgr.upgrade(path)
-        except PluginNotFoundError as e:
-            meta = _load_metadata_yaml(path / "deeptrade_plugin.yaml")
-            typer.echo(f'✘ 插件 "{meta.plugin_id}" 未安装，请先执行 deeptrade plugin install')
-            raise typer.Exit(2) from e
-        except PluginInstallError as e:
-            typer.echo(f"✘ Upgrade failed: {e}")
-            raise typer.Exit(2) from e
-        typer.echo(f"✔ upgraded: {rec.plugin_id} → v{rec.version}")
+            try:
+                result = mgr.upgrade(resolved.path)
+            except PluginNotFoundError as e:
+                try:
+                    meta = _load_metadata_yaml(resolved.path / "deeptrade_plugin.yaml")
+                    pid = meta.plugin_id
+                except PluginInstallError:
+                    pid = source
+                typer.echo(
+                    f'✘ 插件 "{pid}" 未安装，请先执行 deeptrade plugin install'
+                )
+                raise typer.Exit(2) from e
+            except PluginInstallError as e:
+                typer.echo(f"✘ Upgrade failed: {e}")
+                raise typer.Exit(2) from e
+
+            if isinstance(result, UpgradeNoop):
+                typer.echo(f"已是最新版本 v{result.version}")
+                return
+            typer.echo(f"✔ upgraded: {result.plugin_id} → v{result.version}")
+        finally:
+            db.close()
     finally:
-        db.close()
+        if resolved.cleanup is not None:
+            resolved.cleanup()
+
+
+@app.command("search")
+def cmd_search(
+    keyword: str | None = typer.Argument(
+        None, help="可选过滤关键词（匹配 plugin_id / name / description）"
+    ),
+    no_cache: bool = typer.Option(
+        False, "--no-cache", help="强制刷新注册表（旁路 ETag 缓存）"
+    ),
+) -> None:
+    """List plugins available in the official registry."""
+    try:
+        registry = RegistryClient().fetch(force=no_cache)
+    except (RegistryFetchError, RegistrySchemaError) as e:
+        typer.echo(f"✘ {e}")
+        raise typer.Exit(2) from e
+
+    rows = list(registry.plugins.values())
+    if keyword:
+        kw = keyword.lower()
+        rows = [
+            entry
+            for entry in rows
+            if kw in entry.plugin_id.lower()
+            or kw in entry.name.lower()
+            or kw in entry.description.lower()
+        ]
+
+    if not rows:
+        typer.echo("(no plugins matched)" if keyword else "(registry is empty)")
+        return
+
+    console = Console()
+    table = Table(title="Available Plugins")
+    table.add_column("plugin_id", style="cyan")
+    table.add_column("name")
+    table.add_column("type", style="green")
+    table.add_column("description")
+    for entry in sorted(rows, key=lambda x: x.plugin_id):
+        table.add_row(entry.plugin_id, entry.name, entry.type, entry.description)
+    console.print(table)
