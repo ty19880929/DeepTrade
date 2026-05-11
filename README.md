@@ -2,6 +2,8 @@
 
 > 本地运行的 A 股（沪深主板）选股 CLI 工具：tushare 行情 + OpenAI 兼容 LLM（DeepSeek / Qwen / Kimi …）+ DuckDB 单机仓库 + 插件式 CLI 框架。
 
+> 📖 **在线文档**：[deeptrade.tiey.ai](https://deeptrade.tiey.ai) — 用户手册 + 开发者手册 + 官方插件目录
+
 [![tests](https://img.shields.io/badge/tests-passing-brightgreen)](#) [![python](https://img.shields.io/badge/python-3.11+-blue)](#) [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 ## ✨ 主要特性
