@@ -8,15 +8,21 @@ or already-migrated DB is a no-op.
 
 v0.6 — deepseek.* → llm.providers / llm.<name>.api_key (DESIGN §0.7 / §10.5).
 v0.7 — deepseek.profile → app.profile (DESIGN §10.1 update).
+v0.3.0 — purge legacy channel-type plugin installs (channel type removed).
 """
 
 from __future__ import annotations
 
 import json
+import logging
+import shutil
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # pragma: no cover
     from deeptrade.core.db import Database
+
+logger = logging.getLogger(__name__)
 
 
 _LEGACY_KEYS = (
@@ -95,9 +101,7 @@ def migrate_legacy_deepseek_keys(db: Database) -> bool:
         # Rename secret. UPDATE-only avoids re-encrypting; if the destination
         # row already exists (extremely unlikely on a non-migrated DB), prefer
         # the legacy value as canonical and overwrite.
-        existing_dest = db.fetchone(
-            "SELECT 1 FROM secret_store WHERE key = 'llm.deepseek.api_key'"
-        )
+        existing_dest = db.fetchone("SELECT 1 FROM secret_store WHERE key = 'llm.deepseek.api_key'")
         if existing_dest is not None:
             db.execute("DELETE FROM secret_store WHERE key = 'llm.deepseek.api_key'")
         db.execute(
@@ -134,9 +138,7 @@ def migrate_llm_default_provider(db: Database) -> bool:
     if not isinstance(providers, dict) or not providers:
         return False
 
-    has_default = any(
-        isinstance(v, dict) and bool(v.get("is_default")) for v in providers.values()
-    )
+    has_default = any(isinstance(v, dict) and bool(v.get("is_default")) for v in providers.values())
     if has_default:
         return False
 
@@ -152,6 +154,63 @@ def migrate_llm_default_provider(db: Database) -> bool:
             (json.dumps(providers),),
         )
     return True
+
+
+def migrate_purge_non_strategy_plugins(db: Database) -> list[str]:
+    """Remove legacy non-``strategy`` plugin records (v0.3.0).
+
+    The ``channel`` plugin type was retired in v0.3.0 along with the framework
+    notifier. Any plugin row whose ``type`` is not ``'strategy'`` would now
+    fail :class:`PluginMetadata` validation on every ``list_all`` call, which
+    blocks the CLI hard. This migration silently:
+
+      1. Drops each legacy plugin's owned tables (respecting
+         ``purge_on_uninstall``).
+      2. Deletes the rows in ``plugin_tables`` / ``plugin_schema_migrations``
+         / ``plugins``.
+      3. Removes the on-disk install directory.
+
+    Idempotent: returns an empty list when no offending rows exist. Returns
+    the list of purged ``plugin_id`` values otherwise (caller logs them).
+    """
+    rows = db.fetchall("SELECT plugin_id, type, install_path FROM plugins WHERE type != 'strategy'")
+    if not rows:
+        return []
+
+    purged: list[str] = []
+    for plugin_id, plugin_type, install_path in rows:
+        tables = db.fetchall(
+            "SELECT table_name, purge_on_uninstall FROM plugin_tables WHERE plugin_id = ?",
+            (plugin_id,),
+        )
+        with db.transaction():
+            for tname, purge_flag in tables:
+                if purge_flag:
+                    try:
+                        db.execute(f"DROP TABLE IF EXISTS {tname}")  # noqa: S608 — name validated at install
+                    except Exception:  # noqa: BLE001 — best-effort cleanup
+                        logger.warning(
+                            "purge: failed to drop table %s owned by legacy plugin %s",
+                            tname,
+                            plugin_id,
+                        )
+            db.execute("DELETE FROM plugin_tables WHERE plugin_id = ?", (plugin_id,))
+            db.execute("DELETE FROM plugin_schema_migrations WHERE plugin_id = ?", (plugin_id,))
+            db.execute("DELETE FROM plugins WHERE plugin_id = ?", (plugin_id,))
+
+        if install_path:
+            dest = Path(install_path)
+            if dest.exists():
+                shutil.rmtree(dest, ignore_errors=True)
+
+        logger.warning(
+            "purged legacy plugin %r (type=%r) — type retired in v0.3.0",
+            plugin_id,
+            plugin_type,
+        )
+        purged.append(plugin_id)
+
+    return purged
 
 
 def migrate_legacy_deepseek_profile_key(db: Database) -> bool:

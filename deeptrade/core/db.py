@@ -167,6 +167,7 @@ def apply_core_migrations(db: Database) -> list[str]:
         migrate_legacy_deepseek_keys,
         migrate_legacy_deepseek_profile_key,
         migrate_llm_default_provider,
+        migrate_purge_non_strategy_plugins,
     )
 
     if migrate_legacy_deepseek_keys(db):
@@ -177,4 +178,9 @@ def apply_core_migrations(db: Database) -> list[str]:
     # v0.8 data migration — backfill is_default on existing providers.
     if migrate_llm_default_provider(db):
         newly.append("data:v08_llm_default_provider")
+    # v0.3.0 data migration — drop legacy non-strategy (channel) plugin rows
+    # so list_all() / PluginMetadata.model_validate don't crash on the
+    # retired type literal.
+    if migrate_purge_non_strategy_plugins(db):
+        newly.append("data:v030_purge_non_strategy_plugins")
     return newly

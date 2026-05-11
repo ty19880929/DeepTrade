@@ -1,5 +1,6 @@
 """v0.6 — legacy deepseek.* → llm.providers / llm.<name>.api_key migration.
 v0.7 — deepseek.profile → app.profile migration.
+v0.3.0 — purge of non-strategy (channel) plugin rows.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ from deeptrade.core.config_migrations import (
     migrate_legacy_deepseek_keys,
     migrate_legacy_deepseek_profile_key,
     migrate_llm_default_provider,
+    migrate_purge_non_strategy_plugins,
 )
 from deeptrade.core.db import Database, apply_core_migrations
 from deeptrade.core.secrets import SecretStore
@@ -77,9 +79,7 @@ def test_migration_renames_secret_api_key(db: Database) -> None:
 def test_migration_deletes_legacy_app_config_keys(db: Database) -> None:
     _seed_legacy(db)
     migrate_legacy_deepseek_keys(db)
-    rows = db.fetchall(
-        "SELECT key FROM app_config WHERE key LIKE 'deepseek.%'"
-    )
+    rows = db.fetchall("SELECT key FROM app_config WHERE key LIKE 'deepseek.%'")
     # ``deepseek.profile`` migration is handled by a separate function in v0.7;
     # seed didn't write it so this should be empty either way.
     assert rows == []
@@ -237,3 +237,77 @@ def test_default_provider_migration_no_op_on_empty(db: Database) -> None:
     assert migrate_llm_default_provider(db) is False
     _seed_providers(db, {})
     assert migrate_llm_default_provider(db) is False
+
+
+# ---------------------------------------------------------------------------
+# v0.3.0 — purge non-strategy plugin rows
+# ---------------------------------------------------------------------------
+
+
+def _seed_legacy_channel_plugin(db: Database, tmp_path: Path, plugin_id: str) -> Path:
+    """Insert a fake type='channel' plugin row, its tables, migrations, and
+    install dir, mimicking a pre-v0.3.0 stdout-channel install."""
+    install_dir = tmp_path / "plugins" / plugin_id / "0.1.0"
+    install_dir.mkdir(parents=True, exist_ok=True)
+    (install_dir / "marker").write_text("legacy", encoding="utf-8")
+
+    legacy_table = f"{plugin_id.replace('-', '_')}_legacy_t"
+    db.execute(f"CREATE TABLE IF NOT EXISTS {legacy_table} (id INTEGER)")  # noqa: S608
+
+    db.execute(
+        "INSERT INTO plugins(plugin_id, name, version, type, api_version, entrypoint, "
+        "install_path, enabled, metadata_yaml) "
+        "VALUES (?, ?, '0.1.0', 'channel', '1', 'pkg.mod:Cls', ?, TRUE, 'legacy: yaml')",
+        (plugin_id, plugin_id, str(install_dir)),
+    )
+    db.execute(
+        "INSERT INTO plugin_tables(plugin_id, table_name, description, purge_on_uninstall) "
+        "VALUES (?, ?, '', TRUE)",
+        (plugin_id, legacy_table),
+    )
+    db.execute(
+        "INSERT INTO plugin_schema_migrations(plugin_id, version, checksum) "
+        "VALUES (?, '20260101_001', 'sha256:dead')",
+        (plugin_id,),
+    )
+    return install_dir
+
+
+def test_purge_channel_removes_rows_tables_and_install_dir(db: Database, tmp_path: Path) -> None:
+    install_dir = _seed_legacy_channel_plugin(db, tmp_path, "stdout-channel")
+    assert install_dir.exists()
+
+    purged = migrate_purge_non_strategy_plugins(db)
+    assert purged == ["stdout-channel"]
+
+    assert db.fetchone("SELECT 1 FROM plugins WHERE plugin_id = 'stdout-channel'") is None
+    assert db.fetchone("SELECT 1 FROM plugin_tables WHERE plugin_id = 'stdout-channel'") is None
+    assert (
+        db.fetchone("SELECT 1 FROM plugin_schema_migrations WHERE plugin_id = 'stdout-channel'")
+        is None
+    )
+    table_check = db.fetchone(
+        "SELECT 1 FROM information_schema.tables "
+        "WHERE table_schema = 'main' AND table_name = 'stdout_channel_legacy_t'"
+    )
+    assert table_check is None
+    assert not install_dir.exists()
+
+
+def test_purge_channel_is_idempotent(db: Database, tmp_path: Path) -> None:
+    _seed_legacy_channel_plugin(db, tmp_path, "stdout-channel")
+    assert migrate_purge_non_strategy_plugins(db) == ["stdout-channel"]
+    assert migrate_purge_non_strategy_plugins(db) == []
+
+
+def test_purge_leaves_strategy_rows_untouched(db: Database, tmp_path: Path) -> None:
+    _seed_legacy_channel_plugin(db, tmp_path, "stdout-channel")
+    db.execute(
+        "INSERT INTO plugins(plugin_id, name, version, type, api_version, entrypoint, "
+        "install_path, enabled, metadata_yaml) "
+        "VALUES ('limit-up-board', 'limit-up-board', '0.4.0', 'strategy', '1', "
+        "'pkg.mod:Cls', '/tmp/lub', TRUE, 'legacy: yaml')"
+    )
+    purged = migrate_purge_non_strategy_plugins(db)
+    assert purged == ["stdout-channel"]
+    assert db.fetchone("SELECT 1 FROM plugins WHERE plugin_id = 'limit-up-board'") is not None

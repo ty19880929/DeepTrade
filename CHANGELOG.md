@@ -2,6 +2,33 @@
 
 All notable changes to DeepTrade. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and SemVer.
 
+## [v0.3.0] — 2026-05-11 — 移除 channel 插件类型 + 内置 notifier
+
+本版本移除 `channel` 插件类型与框架内置的 notifier 链。IM 推送在实测中需要登录、轮询、发送多步流程，插件一次性 `dispatch(argv)` 的生命周期与之不匹配，整体能力将以框架级 ChatGateway 模块的形式重做（**本版本不含 ChatGateway 实现**，仅完成清理）。
+
+### Removed
+
+- `deeptrade/plugins_api/channel.py`（`ChannelPlugin` Protocol）
+- `deeptrade/plugins_api/notify.py`（`NotificationPayload` / `NotificationSection` / `NotificationItem`）
+- `deeptrade/core/notifier.py`（`NoopNotifier` / `MultiplexNotifier` / `AsyncDispatchNotifier` / `build_notifier` / `notify` / `notification_session`）
+- `tests/core/test_notifier.py` / `tests/plugins_api/test_notify.py` 整文件
+- `tests/plugins_api/test_protocol.py` 中 `ChannelPlugin` 相关 case
+- `deeptrade.notify` / `deeptrade.notification_session` 顶层导出
+
+### Changed
+
+- `PluginMetadata.type` 收窄为 `Literal["strategy"]`（字段保留，便于未来扩展新 plugin 类型）。
+- `apply_core_migrations` 新增 v0.3.0 数据迁移 `migrate_purge_non_strategy_plugins`：启动时清理 `plugins.type != 'strategy'` 的历史记录、`plugin_tables` / `plugin_schema_migrations` 关联行，并删除对应 install 目录。该迁移必须先于 `PluginManager.list_all()` 执行，否则旧 `channel` 行会触发 Pydantic 校验失败。
+- `deeptrade/__init__.py`：版本 bump 至 `0.3.0`，移除 notify 顶层 re-export。
+- README / CLAUDE.md：删除 channel / notify 段落与架构图相关条目；CLAUDE.md 新增"IM / notifications"短段说明能力暂缺、ChatGateway 是计划替代物。
+- 官方 strategy 插件 `limit_up_board` / `volume_anomaly` 的 `runtime.py`：删除未被调用的 `notify()` / `is_notify_enabled()` 方法与 `NotificationPayload` import（这些方法在实际业务流中无任何调用点）。
+
+### Migration notes
+
+- **从 0.2.x 升级**：`pipx upgrade deeptrade-quant`。下次任何 `deeptrade ...` 命令首次落地时，`apply_core_migrations` 会自动清理 `stdout-channel` 等 `type=channel` 的历史插件记录及其 install 目录（行为等价于 `deeptrade plugin uninstall <id> --purge`），并在日志输出对应警告。
+- 官方注册表（`DeepTradePluginOfficial`）的 `stdout-channel` 条目将在配套发版中下线，请勿再尝试安装。
+- 业务流仍需要 IM 推送的用户：临时方案是在策略代码内直接 `import httpx` 自行调用 webhook；统一的 ChatGateway 能力将在后续版本提供。
+
 ## [v0.2.0] — 2026-05-09 — 框架瘦身（builtin 插件物理移除）· PR-8 cutover
 
 本版本完成了框架与插件的物理解耦——`deeptrade-quant` wheel 不再携带任何插件代码。所有官方插件（`limit-up-board` / `volume-anomaly` / `stdout-channel`）必须通过 `deeptrade plugin install <短名>` 从注册表安装。

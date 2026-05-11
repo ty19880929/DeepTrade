@@ -112,9 +112,7 @@ def test_install_local_path_happy_path(home: Path) -> None:
 def test_install_unknown_short_name_exits_2(home: Path) -> None:
     """If the short name is not in the registry, fail cleanly with exit 2."""
     fake_resolver = MagicMock()
-    fake_resolver.resolve.side_effect = RegistryNotFoundError(
-        "plugin 'nope' not in registry"
-    )
+    fake_resolver.resolve.side_effect = RegistryNotFoundError("plugin 'nope' not in registry")
     with patch("deeptrade.cli_plugin.SourceResolver", return_value=fake_resolver):
         result = runner.invoke(app, ["plugin", "install", "nope", "-y"])
     assert result.exit_code == 2
@@ -152,7 +150,9 @@ def test_install_calls_cleanup_on_failure(home: Path) -> None:
     cleanup = MagicMock()
     fake_resolver = MagicMock()
     fake_resolver.resolve.return_value = ResolvedSource(
-        path=bad_src, origin="local", origin_detail={"local_path": str(bad_src)},
+        path=bad_src,
+        origin="local",
+        origin_detail={"local_path": str(bad_src)},
         cleanup=cleanup,
     )
     with patch("deeptrade.cli_plugin.SourceResolver", return_value=fake_resolver):
@@ -217,14 +217,14 @@ def test_search_lists_all_plugins(home: Path) -> None:
         schema_version=1,
         plugins={
             "alpha-strategy": _entry("alpha-strategy"),
-            "beta-channel": RegistryEntry(
-                plugin_id="beta-channel",
-                name="Beta Channel",
-                type="channel",
-                description="A test channel",
+            "beta-helper": RegistryEntry(
+                plugin_id="beta-helper",
+                name="Beta Helper",
+                type="strategy",
+                description="A test helper plugin",
                 repo="ty19880929/DeepTradePluginOfficial",
                 subdir="beta",
-                tag_prefix="beta-channel/",
+                tag_prefix="beta-helper/",
                 min_framework_version="0.1.0",
             ),
         },
@@ -235,7 +235,7 @@ def test_search_lists_all_plugins(home: Path) -> None:
         result = runner.invoke(app, ["plugin", "search"])
     assert result.exit_code == 0, result.output
     assert "alpha-strategy" in result.output
-    assert "beta-channel" in result.output
+    assert "beta-helper" in result.output
 
 
 def test_search_filters_by_keyword(home: Path) -> None:
@@ -243,10 +243,15 @@ def test_search_filters_by_keyword(home: Path) -> None:
         schema_version=1,
         plugins={
             "alpha-strategy": _entry("alpha-strategy"),
-            "beta-channel": RegistryEntry(
-                plugin_id="beta-channel", name="Beta Channel", type="channel",
-                description="A test channel", repo="x/y", subdir="beta",
-                tag_prefix="beta-channel/", min_framework_version="0.1.0",
+            "beta-helper": RegistryEntry(
+                plugin_id="beta-helper",
+                name="Beta Helper",
+                type="strategy",
+                description="A test helper plugin",
+                repo="x/y",
+                subdir="beta",
+                tag_prefix="beta-helper/",
+                min_framework_version="0.1.0",
             ),
         },
     )
@@ -256,7 +261,7 @@ def test_search_filters_by_keyword(home: Path) -> None:
         result = runner.invoke(app, ["plugin", "search", "alpha"])
     assert result.exit_code == 0
     assert "alpha-strategy" in result.output
-    assert "beta-channel" not in result.output
+    assert "beta-helper" not in result.output
 
 
 def test_search_no_match_message(home: Path) -> None:

@@ -29,6 +29,5 @@ def test_help_lists_only_framework_commands() -> None:
     # Framework commands appear
     for cmd in ("init", "config", "plugin", "data"):
         assert cmd in result.stdout
-    # Strategy/channel command groups are gone
+    # Strategy command group is gone (plugins surface via `deeptrade <plugin_id>`)
     assert "strategy" not in result.stdout.lower()
-    assert "channel" not in result.stdout.lower()

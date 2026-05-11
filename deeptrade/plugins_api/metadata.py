@@ -53,9 +53,7 @@ class PluginMetadata(BaseModel):
     plugin_id: str = Field(..., pattern=r"^[a-z][a-z0-9-]{2,31}$")
     name: str
     version: str
-    # v0.4: widened to support channel plugins (DESIGN §18.4). Old yaml with
-    # type='strategy' (or omitted) remains valid via the default.
-    type: Literal["strategy", "channel"] = "strategy"
+    type: Literal["strategy"] = "strategy"
     api_version: str
     entrypoint: str = Field(..., pattern=r"^[A-Za-z_][\w\.]*:[A-Za-z_]\w*$")
     description: str

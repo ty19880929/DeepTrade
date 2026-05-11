@@ -41,7 +41,7 @@ CREATE TABLE IF NOT EXISTS plugins (
     plugin_id     VARCHAR PRIMARY KEY,
     name          VARCHAR NOT NULL,
     version       VARCHAR NOT NULL,
-    type          VARCHAR NOT NULL,             -- 'strategy' | 'channel' | future
+    type          VARCHAR NOT NULL,             -- 'strategy' (reserved for future plugin types)
     api_version   VARCHAR NOT NULL,
     entrypoint    VARCHAR NOT NULL,
     install_path  VARCHAR NOT NULL,

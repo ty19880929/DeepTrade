@@ -6,10 +6,7 @@ NOTHING about the plugin's domain semantics; the plugin owns its own command
 parsing, execution, persistence, and output.
 
 ``PluginContext`` is the minimal services bundle the framework hands to every
-plugin's ``validate_static`` (during install) and to channel plugins' ``push``
-(during notify). It lives here — alongside the base ``Plugin`` Protocol —
-because it is the universal context for the base contract; channel-specific
-extensions live in :mod:`deeptrade.plugins_api.channel`.
+plugin's ``validate_static`` (during install).
 """
 
 from __future__ import annotations
@@ -26,8 +23,7 @@ if TYPE_CHECKING:  # pragma: no cover
 @dataclass
 class PluginContext:
     """Minimal services bundle the framework hands to a plugin's
-    ``validate_static`` (during install) and to a channel plugin's ``push``
-    (during notify).
+    ``validate_static`` (during install).
 
     Plugins that need richer services (TushareClient, LLMManager / LLMClient, etc.)
     construct them inside their own ``dispatch`` from these primitives.

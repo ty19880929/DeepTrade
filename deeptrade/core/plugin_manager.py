@@ -167,10 +167,9 @@ def _load_entrypoint(
 def _build_validate_ctx(db: Database, meta: PluginMetadata) -> Any:
     """Build the framework's minimal ``PluginContext`` for ``validate_static``.
 
-    All plugin types (strategy / channel / future) share the same narrow
-    context shape: db + config + plugin_id. Plugins that need richer services
-    (TushareClient, LLMManager / LLMClient, ...) construct them inside their own
-    ``dispatch`` from these primitives.
+    Every plugin shares the same narrow context shape: db + config + plugin_id.
+    Plugins that need richer services (TushareClient, LLMManager / LLMClient, ...)
+    construct them inside their own ``dispatch`` from these primitives.
     """
     from deeptrade.core.config import ConfigService
     from deeptrade.plugins_api.base import PluginContext
