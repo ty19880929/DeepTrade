@@ -103,8 +103,7 @@ def _build_plugin_command(plugin_id: str) -> click.Command | None:
         )
         def _disabled() -> None:
             typer.echo(
-                f"✘ plugin {plugin_id!r} is disabled; "
-                f"run `deeptrade plugin enable {plugin_id}`"
+                f"✘ plugin {plugin_id!r} is disabled; run `deeptrade plugin enable {plugin_id}`"
             )
             raise typer.Exit(2)
 
@@ -204,14 +203,15 @@ def init(
         cmd_set_llm()
 
 
-
 @app.command(name="db", context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
 def db_cmd(ctx: click.Context) -> None:
     """Database migration and management commands (legacy stub; use `deeptrade db init` via group if added)."""
     pass
 
+
 db_app = typer.Typer(name="db", help="Database migration and management commands.")
 app.add_typer(db_app, name="db")
+
 
 @db_app.command("init")
 def db_init() -> None:
@@ -232,10 +232,12 @@ def db_init() -> None:
     finally:
         db.close()
 
+
 @db_app.command("upgrade")
 def db_upgrade() -> None:
     """Apply any pending core migrations."""
     db_init()
+
 
 if __name__ == "__main__":
     app()

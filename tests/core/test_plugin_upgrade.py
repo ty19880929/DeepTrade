@@ -1,8 +1,8 @@
 """PluginManager.upgrade — version comparison semantics (PR-6).
 
-  - candidate == installed → UpgradeNoop
-  - candidate > installed  → run (covered indirectly by other tests)
-  - candidate < installed  → PluginInstallError with the Chinese guidance
+- candidate == installed → UpgradeNoop
+- candidate > installed  → run (covered indirectly by other tests)
+- candidate < installed  → PluginInstallError with the Chinese guidance
 """
 
 from __future__ import annotations

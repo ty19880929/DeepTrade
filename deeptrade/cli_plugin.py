@@ -58,9 +58,7 @@ def _format_origin(resolved: ResolvedSource) -> str:
     if resolved.origin == "local":
         return f"本地路径 ({d.get('local_path', resolved.path)})"
     if resolved.origin == "github_registry":
-        return (
-            f"GitHub 注册表 ({d['repo']}@{d['ref']}, subdir={d['subdir']})"
-        )
+        return f"GitHub 注册表 ({d['repo']}@{d['ref']}, subdir={d['subdir']})"
     if resolved.origin == "github_url":
         return f"GitHub URL ({d['repo']}@{d['ref']})"
     return resolved.origin
@@ -68,9 +66,7 @@ def _format_origin(resolved: ResolvedSource) -> str:
 
 @app.command("install")
 def cmd_install(
-    source: str = typer.Argument(
-        ..., help="短名（注册表）/ 本地路径 / GitHub URL"
-    ),
+    source: str = typer.Argument(..., help="短名（注册表）/ 本地路径 / GitHub URL"),
     ref: str | None = typer.Option(
         None, "--ref", help="Tag / branch / sha (默认 = 该插件最新 release)"
     ),
@@ -150,9 +146,7 @@ def cmd_info(plugin_id: str = typer.Argument(...)) -> None:
     try:
         try:
             rec = mgr.info(plugin_id)
-            typer.echo(
-                yaml.safe_dump(rec.metadata.model_dump(mode="json"), allow_unicode=True)
-            )
+            typer.echo(yaml.safe_dump(rec.metadata.model_dump(mode="json"), allow_unicode=True))
             return
         except PluginNotFoundError:
             pass  # fall through to registry lookup
@@ -237,9 +231,7 @@ def cmd_uninstall(
 
 @app.command("upgrade")
 def cmd_upgrade(
-    source: str = typer.Argument(
-        ..., help="短名（注册表）/ 本地路径 / GitHub URL"
-    ),
+    source: str = typer.Argument(..., help="短名（注册表）/ 本地路径 / GitHub URL"),
     ref: str | None = typer.Option(
         None, "--ref", help="Tag / branch / sha (默认 = 该插件最新 release)"
     ),
@@ -269,9 +261,7 @@ def cmd_upgrade(
                     pid = meta.plugin_id
                 except PluginInstallError:
                     pid = source
-                typer.echo(
-                    f'✘ 插件 "{pid}" 未安装，请先执行 deeptrade plugin install'
-                )
+                typer.echo(f'✘ 插件 "{pid}" 未安装，请先执行 deeptrade plugin install')
                 raise typer.Exit(2) from e
             except PluginInstallError as e:
                 typer.echo(f"✘ Upgrade failed: {e}")
@@ -293,9 +283,7 @@ def cmd_search(
     keyword: str | None = typer.Argument(
         None, help="可选过滤关键词（匹配 plugin_id / name / description）"
     ),
-    no_cache: bool = typer.Option(
-        False, "--no-cache", help="强制刷新注册表（旁路 ETag 缓存）"
-    ),
+    no_cache: bool = typer.Option(False, "--no-cache", help="强制刷新注册表（旁路 ETag 缓存）"),
 ) -> None:
     """List plugins available in the official registry."""
     try:

@@ -107,9 +107,9 @@ def test_latest_release_tag_empty_prefix_considers_all() -> None:
 
 def test_latest_release_tag_pagination() -> None:
     page1 = _FakeResponse(
-        json.dumps(
-            [_release("limit-up-board/v0.3.0"), _release("limit-up-board/v0.3.1")]
-        ).encode("utf-8"),
+        json.dumps([_release("limit-up-board/v0.3.0"), _release("limit-up-board/v0.3.1")]).encode(
+            "utf-8"
+        ),
         headers={"Link": '<https://api.github.com/page2>; rel="next"'},
     )
     page2 = _releases_response("limit-up-board/v0.5.0")

@@ -373,9 +373,7 @@ class PluginManager:
             new_ver = Version(meta.version)
             cur_ver = Version(existing.version)
         except InvalidVersion as e:
-            raise PluginInstallError(
-                f"invalid version on {meta.plugin_id}: {e}"
-            ) from e
+            raise PluginInstallError(f"invalid version on {meta.plugin_id}: {e}") from e
 
         if new_ver == cur_ver:
             return UpgradeNoop(plugin_id=meta.plugin_id, version=existing.version)

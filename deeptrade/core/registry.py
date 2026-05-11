@@ -22,8 +22,7 @@ from deeptrade.core import paths
 logger = logging.getLogger(__name__)
 
 REGISTRY_URL = (
-    "https://raw.githubusercontent.com/ty19880929/"
-    "DeepTradePluginOfficial/main/registry/index.json"
+    "https://raw.githubusercontent.com/ty19880929/DeepTradePluginOfficial/main/registry/index.json"
 )
 
 _REQUIRED_FIELDS = frozenset(
@@ -81,9 +80,7 @@ def _parse_registry(data: Any) -> Registry:
 
     schema_version = data.get("schema_version")
     if schema_version != 1:
-        raise RegistrySchemaError(
-            f"schema_version must be 1, got {schema_version!r}"
-        )
+        raise RegistrySchemaError(f"schema_version must be 1, got {schema_version!r}")
 
     plugins_raw = data.get("plugins")
     if not isinstance(plugins_raw, dict):
@@ -95,9 +92,7 @@ def _parse_registry(data: Any) -> Registry:
             raise RegistrySchemaError(f"plugins.{plugin_id} must be an object")
         missing = _REQUIRED_FIELDS - set(raw)
         if missing:
-            raise RegistrySchemaError(
-                f"plugins.{plugin_id} missing fields: {sorted(missing)}"
-            )
+            raise RegistrySchemaError(f"plugins.{plugin_id} missing fields: {sorted(missing)}")
         entries[plugin_id] = RegistryEntry(
             plugin_id=plugin_id,
             **{k: raw[k] for k in _REQUIRED_FIELDS},
@@ -144,18 +139,12 @@ class RegistryClient:
             if e.code == 304 and cached is not None:
                 logger.debug("registry: 304 Not Modified, using cache")
                 return _parse_registry(cached["body"])
-            raise RegistryFetchError(
-                f"HTTP {e.code} fetching registry: {e}"
-            ) from e
+            raise RegistryFetchError(f"HTTP {e.code} fetching registry: {e}") from e
         except URLError as e:
             if cached is not None:
-                logger.warning(
-                    "registry: network error %s, falling back to cache", e
-                )
+                logger.warning("registry: network error %s, falling back to cache", e)
                 return _parse_registry(cached["body"])
-            raise RegistryFetchError(
-                f"network error fetching registry: {e}"
-            ) from e
+            raise RegistryFetchError(f"network error fetching registry: {e}") from e
 
         try:
             body = json.loads(raw_bytes.decode("utf-8"))
@@ -171,8 +160,7 @@ class RegistryClient:
         registry = self.fetch()
         if plugin_id not in registry.plugins:
             raise RegistryNotFoundError(
-                f"plugin {plugin_id!r} not in registry. "
-                f"Available: {sorted(registry.plugins)}"
+                f"plugin {plugin_id!r} not in registry. Available: {sorted(registry.plugins)}"
             )
         return registry.plugins[plugin_id]
 
@@ -186,6 +174,4 @@ class RegistryClient:
 
     def _write_cache(self, payload: dict) -> None:
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
-        self.cache_path.write_text(
-            json.dumps(payload, ensure_ascii=False), encoding="utf-8"
-        )
+        self.cache_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")

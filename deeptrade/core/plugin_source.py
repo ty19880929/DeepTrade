@@ -68,9 +68,7 @@ def _is_git_url(s: str) -> bool:
 def _parse_github_url(url: str) -> tuple[str, str]:
     m = _GITHUB_URL_RE.match(url)
     if not m:
-        raise SourceResolveError(
-            f"unsupported URL form (only github.com is supported): {url!r}"
-        )
+        raise SourceResolveError(f"unsupported URL form (only github.com is supported): {url!r}")
     return m.group(1), m.group(2)
 
 
@@ -121,14 +119,11 @@ class SourceResolver:
             top = fetch_tarball(entry.repo, ref, Path(tmp.name))
             plugin_path = top / entry.subdir
             if not plugin_path.is_dir():
-                raise SourceResolveError(
-                    f"subdir {entry.subdir!r} not found in {entry.repo}@{ref}"
-                )
+                raise SourceResolveError(f"subdir {entry.subdir!r} not found in {entry.repo}@{ref}")
             yaml_path = plugin_path / "deeptrade_plugin.yaml"
             if not yaml_path.is_file():
                 raise SourceResolveError(
-                    f"no deeptrade_plugin.yaml in {entry.repo}@{ref} "
-                    f"under {entry.subdir!r}"
+                    f"no deeptrade_plugin.yaml in {entry.repo}@{ref} under {entry.subdir!r}"
                 )
         except Exception:
             tmp.cleanup()

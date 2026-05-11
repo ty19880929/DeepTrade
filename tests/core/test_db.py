@@ -35,6 +35,7 @@ def test_init_creates_db_file_and_dirs(monkeypatch: pytest.MonkeyPatch, tmp_path
     assert (tmp_path / "deeptrade.duckdb").is_file()
     assert (tmp_path / "logs").is_dir()
 
+
 def test_init_is_idempotent(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("DEEPTRADE_HOME", str(tmp_path))
     runner = CliRunner()

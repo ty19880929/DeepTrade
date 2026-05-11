@@ -129,14 +129,10 @@ def test_plugin_migration_lands_in_plugin_schema_migrations(home: Path) -> None:
     db = Database(home / "deeptrade.duckdb")
     try:
         PluginManager(db).install(src)
-        framework_versions = {
-            r[0] for r in db.fetchall("SELECT version FROM schema_migrations")
-        }
+        framework_versions = {r[0] for r in db.fetchall("SELECT version FROM schema_migrations")}
         plugin_versions = {
             (r[0], r[1])
-            for r in db.fetchall(
-                "SELECT plugin_id, version FROM plugin_schema_migrations"
-            )
+            for r in db.fetchall("SELECT plugin_id, version FROM plugin_schema_migrations")
         }
     finally:
         db.close()
@@ -160,9 +156,7 @@ def test_plugin_uninstall_purge_drops_plugin_tables_only(home: Path) -> None:
         assert db.fetchone(
             "SELECT 1 FROM information_schema.tables WHERE table_name='purge_plug_table'"
         )
-        assert db.fetchone(
-            "SELECT 1 FROM information_schema.tables WHERE table_name='app_config'"
-        )
+        assert db.fetchone("SELECT 1 FROM information_schema.tables WHERE table_name='app_config'")
 
         PluginManager(db).uninstall("purge-plug", purge=True)
 
@@ -170,8 +164,6 @@ def test_plugin_uninstall_purge_drops_plugin_tables_only(home: Path) -> None:
         assert not db.fetchone(
             "SELECT 1 FROM information_schema.tables WHERE table_name='purge_plug_table'"
         )
-        assert db.fetchone(
-            "SELECT 1 FROM information_schema.tables WHERE table_name='app_config'"
-        )
+        assert db.fetchone("SELECT 1 FROM information_schema.tables WHERE table_name='app_config'")
     finally:
         db.close()

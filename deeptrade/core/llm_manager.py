@@ -111,8 +111,7 @@ class LLMManager:
         provider = cfg.llm_providers.get(name)
         if provider is None:
             raise LLMNotConfiguredError(
-                f"LLM provider {name!r} is not configured; "
-                "run `deeptrade config set-llm` to add it"
+                f"LLM provider {name!r} is not configured; run `deeptrade config set-llm` to add it"
             )
         return LLMProviderInfo(name=name, model=provider.model, base_url=provider.base_url)
 
@@ -160,8 +159,7 @@ class LLMManager:
         provider = cfg.llm_providers.get(name)
         if provider is None:
             raise LLMNotConfiguredError(
-                f"LLM provider {name!r} is not configured; "
-                "run `deeptrade config set-llm` to add it"
+                f"LLM provider {name!r} is not configured; run `deeptrade config set-llm` to add it"
             )
         api_key = self._config.get(f"llm.{name}.api_key")
         if not api_key:

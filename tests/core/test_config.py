@@ -255,9 +255,7 @@ def test_explicit_default_demotes_existing(svc: ConfigService) -> None:
     """is_default=True on a non-first add must clear the flag on every
     other entry."""
     svc.set_llm_provider("deepseek", base_url="x", model="y", api_key="sk-1")
-    svc.set_llm_provider(
-        "kimi", base_url="x", model="y", api_key="sk-2", is_default=True
-    )
+    svc.set_llm_provider("kimi", base_url="x", model="y", api_key="sk-2", is_default=True)
     cfg = svc.get_app_config()
     assert cfg.llm_providers["deepseek"].is_default is False
     assert cfg.llm_providers["kimi"].is_default is True
@@ -284,9 +282,7 @@ def test_cannot_demote_only_default_via_update(svc: ConfigService) -> None:
     """is_default=False on the only default is silently ignored — leaving
     the dict with zero defaults breaks the invariant."""
     svc.set_llm_provider("deepseek", base_url="x", model="y", api_key="sk-1")
-    svc.set_llm_provider(
-        "deepseek", base_url="x", model="y", api_key="sk-1", is_default=False
-    )
+    svc.set_llm_provider("deepseek", base_url="x", model="y", api_key="sk-1", is_default=False)
     assert svc.get_default_llm_provider() == "deepseek"
 
 

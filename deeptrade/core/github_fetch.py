@@ -95,20 +95,14 @@ def latest_release_tag(repo: str, tag_prefix: str = "", *, timeout: float = 15.0
                 payload = resp.read()
                 link_header = resp.headers.get("Link")
         except HTTPError as e:
-            raise GitHubFetchError(
-                f"HTTP {e.code} listing releases for {repo}: {e}"
-            ) from e
+            raise GitHubFetchError(f"HTTP {e.code} listing releases for {repo}: {e}") from e
         except URLError as e:
-            raise GitHubFetchError(
-                f"network error listing releases for {repo}: {e}"
-            ) from e
+            raise GitHubFetchError(f"network error listing releases for {repo}: {e}") from e
 
         try:
             data = json.loads(payload.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as e:
-            raise GitHubFetchError(
-                f"invalid JSON in releases response for {repo}: {e}"
-            ) from e
+            raise GitHubFetchError(f"invalid JSON in releases response for {repo}: {e}") from e
 
         if not isinstance(data, list):
             raise GitHubFetchError(
@@ -125,7 +119,7 @@ def latest_release_tag(repo: str, tag_prefix: str = "", *, timeout: float = 15.0
                 continue
             if tag_prefix and not tag.startswith(tag_prefix):
                 continue
-            ver_str = tag[len(tag_prefix):] if tag_prefix else tag
+            ver_str = tag[len(tag_prefix) :] if tag_prefix else tag
             ver_str = ver_str.lstrip("v")
             try:
                 candidates.append((Version(ver_str), tag))
@@ -142,9 +136,7 @@ def latest_release_tag(repo: str, tag_prefix: str = "", *, timeout: float = 15.0
     return candidates[0][1]
 
 
-def fetch_tarball(
-    repo: str, ref: str, dest_dir: Path, *, timeout: float = 60.0
-) -> Path:
+def fetch_tarball(repo: str, ref: str, dest_dir: Path, *, timeout: float = 60.0) -> Path:
     """Download ``repo`` at ``ref`` from the GitHub tarball API and extract.
 
     Returns the unique top-level directory created inside ``dest_dir``
@@ -157,9 +149,7 @@ def fetch_tarball(
 
     tmp_path: Path | None = None
     try:
-        with tempfile.NamedTemporaryFile(
-            suffix=".tar.gz", delete=False
-        ) as tmp:
+        with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
             tmp_path = Path(tmp.name)
 
         req = _build_request(url, accept="application/vnd.github+json")
@@ -167,13 +157,9 @@ def fetch_tarball(
             with urlopen(req, timeout=timeout) as resp, tmp_path.open("wb") as fout:
                 shutil.copyfileobj(resp, fout)
         except HTTPError as e:
-            raise TarballFetchError(
-                f"HTTP {e.code} downloading tarball {repo}@{ref}: {e}"
-            ) from e
+            raise TarballFetchError(f"HTTP {e.code} downloading tarball {repo}@{ref}: {e}") from e
         except URLError as e:
-            raise TarballFetchError(
-                f"network error downloading tarball {repo}@{ref}: {e}"
-            ) from e
+            raise TarballFetchError(f"network error downloading tarball {repo}@{ref}: {e}") from e
 
         try:
             with tarfile.open(tmp_path, mode="r:gz") as tf:
@@ -208,9 +194,7 @@ def _safe_extract(tf: tarfile.TarFile, dest: Path) -> None:
         try:
             member_path.relative_to(dest_resolved)
         except ValueError as e:
-            raise tarfile.TarError(
-                f"unsafe path in tarball (would escape dest): {m.name!r}"
-            ) from e
+            raise tarfile.TarError(f"unsafe path in tarball (would escape dest): {m.name!r}") from e
 
     try:
         tf.extractall(dest, filter="data")

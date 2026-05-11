@@ -233,7 +233,9 @@ def test_resolve_url_no_yaml_at_root_raises() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_existing_directory_beats_short_name(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_existing_directory_beats_short_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """If a directory exists matching the input string, treat as local even
     if it would otherwise look like a short name."""
     monkeypatch.chdir(tmp_path)

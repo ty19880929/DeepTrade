@@ -156,10 +156,12 @@ def cmd_set_llm() -> None:
         existing = sorted(cfg.llm_providers.keys())
 
         if existing:
-            choices = ["[+] Add new provider"] + [f"[~] {n}" for n in existing] + ["[x] Delete a provider"]
-            picked = questionary.select(
-                "Pick action:", choices=choices
-            ).ask()
+            choices = (
+                ["[+] Add new provider"]
+                + [f"[~] {n}" for n in existing]
+                + ["[x] Delete a provider"]
+            )
+            picked = questionary.select("Pick action:", choices=choices).ask()
             if picked is None:
                 raise typer.Exit(1)
             if picked.startswith("[+]"):
@@ -177,9 +179,7 @@ def cmd_set_llm() -> None:
 
 
 def _set_llm_new(svc: ConfigService) -> None:
-    name = questionary.text(
-        "Provider name (e.g. deepseek, qwen-plus, kimi):"
-    ).ask()
+    name = questionary.text("Provider name (e.g. deepseek, qwen-plus, kimi):").ask()
     if not name:
         raise typer.Exit(1)
     name = name.strip()
@@ -259,9 +259,7 @@ def _prompt_and_save_provider(
         raise typer.Exit(2) from e
 
     api_key_prompt = (
-        "API key (leave empty to keep existing):"
-        if defaults is not None
-        else "API key:"
+        "API key (leave empty to keep existing):" if defaults is not None else "API key:"
     )
     api_key = questionary.password(api_key_prompt).ask()
     if api_key is None:

@@ -168,9 +168,7 @@ def test_get_client_uses_generic_transport_for_unknown_base_url(
     pre-existing providers (DeepSeek/Kimi/...) keep their v0.6 behavior."""
     from deeptrade.core.llm_client import GenericOpenAITransport
 
-    svc.set_llm_provider(
-        "deepseek", base_url="https://api.deepseek.com", model="m", api_key="sk-1"
-    )
+    svc.set_llm_provider("deepseek", base_url="https://api.deepseek.com", model="m", api_key="sk-1")
     client = mgr.get_client("deepseek", plugin_id="P", run_id="R")
     assert isinstance(client._transport, GenericOpenAITransport)  # type: ignore[attr-defined]
 

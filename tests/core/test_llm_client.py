@@ -160,9 +160,7 @@ def test_complete_json_raises_after_two_failures(
 # ---------------------------------------------------------------------------
 
 
-def test_per_call_max_output_tokens(
-    client: LLMClient, transport: RecordedTransport
-) -> None:
+def test_per_call_max_output_tokens(client: LLMClient, transport: RecordedTransport) -> None:
     transport.register(_ok_response())
     client.complete_json(system="s", user="u", schema=_SchemaResp, profile=THINKING_OFF_32K)
     assert transport.last_call_kwargs["max_tokens"] == 32768
@@ -185,9 +183,7 @@ def test_thinking_off_passes_thinking_false(
     assert transport.last_call_kwargs["thinking"] is False
 
 
-def test_thinking_on_passes_thinking_true(
-    client: LLMClient, transport: RecordedTransport
-) -> None:
+def test_thinking_on_passes_thinking_true(client: LLMClient, transport: RecordedTransport) -> None:
     transport.register(_ok_response())
     client.complete_json(system="s", user="u", schema=_SchemaResp, profile=THINKING_ON_32K)
     assert transport.last_call_kwargs["thinking"] is True
@@ -283,16 +279,12 @@ def test_complete_json_full_audit_mode_keeps_payload(
 # ---------------------------------------------------------------------------
 
 
-def test_recorded_transport_replays_fifo(
-    db: Database, transport: RecordedTransport
-) -> None:
+def test_recorded_transport_replays_fifo(db: Database, transport: RecordedTransport) -> None:
     cli = LLMClient(db, transport, model="deepseek-v4-pro")
     transport.register(_ok_response(n=3))
     transport.register(_ok_response(n=5))
 
-    obj1, _ = cli.complete_json(
-        system="s", user="u", schema=_SchemaResp, profile=THINKING_OFF_32K
-    )
+    obj1, _ = cli.complete_json(system="s", user="u", schema=_SchemaResp, profile=THINKING_OFF_32K)
     obj2, _ = cli.complete_json(
         system="s2", user="u2", schema=_SchemaResp, profile=THINKING_OFF_32K
     )
@@ -323,9 +315,7 @@ def test_transport_error_retried_by_tenacity(db: Database, monkeypatch: pytest.M
             return _ok_response()
 
     cli = LLMClient(db, Flaky(), model="deepseek-v4-pro")
-    obj, _ = cli.complete_json(
-        system="s", user="u", schema=_SchemaResp, profile=THINKING_OFF_32K
-    )
+    obj, _ = cli.complete_json(system="s", user="u", schema=_SchemaResp, profile=THINKING_OFF_32K)
     assert isinstance(obj, _SchemaResp)
 
 
@@ -352,9 +342,7 @@ def test_reasoning_effort_flows_through(client: LLMClient, transport: RecordedTr
 def test_generic_transport_drops_thinking_silently() -> None:
     """Catch-all for OpenAI-compat providers without a thinking dial — the
     flag is dropped per the plugins_api/llm.py contract."""
-    t = GenericOpenAITransport(
-        api_key="dummy", base_url="https://api.deepseek.com", timeout=10
-    )
+    t = GenericOpenAITransport(api_key="dummy", base_url="https://api.deepseek.com", timeout=10)
     assert t._provider_extra_body(thinking=True) == {}
     assert t._provider_extra_body(thinking=False) == {}
 
