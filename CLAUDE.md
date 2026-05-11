@@ -22,6 +22,36 @@ uv run mypy deeptrade               # CI runs mypy on `deeptrade/` only, not `te
 
 CI (`.github/workflows/ci.yml`) runs ruff → mypy → pytest → `python -m build` on Ubuntu/Python 3.11. A pre-existing decision in `mypy.ini` disables `no-untyped-def` for tests; do not enable it project-wide. Tagging `v*` triggers `release.yml` (PyPI Trusted Publisher via OIDC + GitHub Release).
 
+## Releasing
+
+The package version lives in **two** places and they MUST be bumped together:
+
+- `pyproject.toml::project.version` — what hatchling stamps onto the wheel filename and PyPI metadata. **This is the source of truth for the build.**
+- `deeptrade/__init__.py::__version__` — runtime introspection only.
+
+Bumping only `__init__.py` will silently produce a wheel with the previous version in its filename and tank the release at PyPI upload (HTTP 400 "File already exists" — PyPI filenames are immutable, you cannot overwrite). Always grep both files before tagging:
+
+```bash
+grep -n version pyproject.toml deeptrade/__init__.py
+```
+
+Release sequence:
+1. Bump both files + update `CHANGELOG.md` in the same commit (or two adjacent commits).
+2. Push to main and verify CI green.
+3. `git tag -a vX.Y.Z -m "..."` then `git push origin vX.Y.Z` — the tag push is what triggers `release.yml`.
+
+If the upload fails after a tag push (version mismatch, accidental rebuild), recover by moving the tag rather than burning a version number:
+
+```bash
+# fix the underlying issue, commit it
+git tag -d vX.Y.Z                       # delete local
+git push origin :refs/tags/vX.Y.Z       # delete remote
+git tag -a vX.Y.Z -m "..."              # re-create on the fix commit
+git push origin main && git push origin vX.Y.Z
+```
+
+This is safe **only** while the failed release hasn't shipped anything to PyPI (i.e. upload was rejected, not partially succeeded). If any artifact made it through, skip to the next patch version instead.
+
 ## Architecture
 
 ### Top-level CLI is a custom click.Group, not a static command tree
