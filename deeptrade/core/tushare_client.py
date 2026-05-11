@@ -32,10 +32,10 @@ from typing import Any, Literal
 
 import pandas as pd
 from tenacity import (
-    retry,
+    Retrying,
     retry_if_exception_type,
     stop_after_attempt,
-    wait_exponential,
+    wait_exponential_jitter,
 )
 
 from deeptrade.core.db import Database
@@ -133,6 +133,154 @@ class TushareServerError(TushareError):
     """5xx / transient transport error — eligible for retry."""
 
 
+class TushareTransportError(TushareServerError):
+    """Transport-layer transient failure — protocol error, connection reset,
+    response ended prematurely, read timeout, etc.
+
+    Subclass of ``TushareServerError`` so the existing retry whitelist
+    (`retry_if_exception_type((TushareRateLimitError, TushareServerError))`)
+    and the 5xx → cache fallback path (`_fetch_and_store`) both pick it up
+    automatically. New callers don't need any code change.
+    """
+
+
+# ---------------------------------------------------------------------------
+# Exception classifier — type-first, status-code-second, string-last,
+# unknown-defaults-to-transient (so we retry rather than terminate).
+# ---------------------------------------------------------------------------
+
+
+_TRANSIENT_TYPE_KEYWORDS: tuple[str, ...] = (
+    # httpx / h11
+    "RemoteProtocolError",
+    # http.client / requests / stdlib
+    "RemoteDisconnected",
+    "ConnectionError",
+    "ConnectionResetError",
+    "ConnectionAbortedError",
+    # http.client / urllib3
+    "IncompleteRead",
+    # requests
+    "ChunkedEncodingError",
+    # urllib3
+    "ProtocolError",
+    # httpx / requests / urllib3
+    "ReadTimeout",
+    "ReadTimeoutError",
+    "ConnectTimeout",
+    "ConnectTimeoutError",
+    # stdlib / asyncio
+    "TimeoutError",
+    # SSL handshake interruption — most are transient
+    "SSLError",
+)
+
+_TRANSIENT_MSG_KEYWORDS: tuple[str, ...] = (
+    # the original symptom that motivated this classifier
+    "premature",
+    "remote protocol",
+    "remote disconnect",
+    "incomplete read",
+    "chunked",
+    "connection reset",
+    "connection aborted",
+    "connection refused",
+    "connection error",
+    "broken pipe",
+    "timeout",
+    "timed out",
+    "eof occurred",
+)
+
+
+def _is_transient_transport_error(e: BaseException, type_name: str) -> bool:
+    """True if ``e`` is a transport-layer transient failure across httpx /
+    requests / urllib3 / stdlib.
+
+    Type-name match is preferred (fully qualified ``module.QualName`` lets
+    one keyword cover multiple stacks). Message-keyword fallback handles
+    the case where the tushare SDK swallows the original exception type
+    and re-raises a plain ``Exception(str)``.
+    """
+    if any(k in type_name for k in _TRANSIENT_TYPE_KEYWORDS):
+        return True
+    msg = str(e).lower()
+    return any(k in msg for k in _TRANSIENT_MSG_KEYWORDS)
+
+
+def _extract_http_status(e: BaseException) -> int | None:
+    """Best-effort HTTP status extraction.
+
+    Looks at ``e.response.status_code`` (httpx / requests) or the leading
+    three digits of ``str(e)`` (some SDK wrappers prefix the code).
+    """
+    response = getattr(e, "response", None)
+    if response is not None:
+        status = getattr(response, "status_code", None)
+        if status is None:
+            status = getattr(response, "status", None)
+        if isinstance(status, int):
+            return status
+    msg = str(e)
+    if len(msg) >= 3 and msg[:3].isdigit():
+        try:
+            return int(msg[:3])
+        except ValueError:
+            return None
+    return None
+
+
+def _classify_tushare_exception(e: BaseException) -> TushareError:
+    """Map an arbitrary upstream exception to the right TushareError subclass.
+
+    Order matters:
+        1. Exception type — the most reliable signal.
+        2. HTTP status code if present on the exception.
+        3. Tushare business-layer keywords (Chinese / English).
+        4. Default to TushareTransportError (retryable). Inverting the
+           default from "unknown → fatal" to "unknown → transient" is the
+           central design change: a remote network service's unknown
+           errors are far more likely transient than permanent. Worst case
+           we waste a few retries; best case we ride out an outage that
+           used to terminate hours of work.
+    """
+    type_name = f"{type(e).__module__}.{type(e).__qualname__}"
+
+    # 1. Type-based — covers RemoteProtocolError / ChunkedEncodingError / ...
+    if _is_transient_transport_error(e, type_name):
+        return TushareTransportError(str(e))
+
+    # 2. HTTP status code, if available
+    status = _extract_http_status(e)
+    if status is not None:
+        if status == 429:
+            return TushareRateLimitError(str(e))
+        if 500 <= status < 600:
+            return TushareServerError(str(e))
+        if status in (401, 403):
+            return TushareUnauthorizedError(str(e))
+
+    # 3. Tushare business-layer text matching
+    msg = str(e)
+    low = msg.lower()
+    if "权限" in msg or "未开通" in msg or "permission" in low or "no permission" in low:
+        return TushareUnauthorizedError(msg)
+    # Tushare's actual rate-limit response is the long-form
+    # "抱歉，您每分钟最多访问该接口500次" — match the "每分钟" + "次" pair so
+    # those, plus the shorter "频率"/"限流" variants, all funnel here.
+    if (
+        "频率" in msg
+        or "限流" in msg
+        or ("每分钟" in msg and "次" in msg)
+        or "rate" in low
+        or "429" in msg
+    ):
+        return TushareRateLimitError(msg)
+
+    # 4. Default-inverted: unknown is treated as transient, not fatal.
+    return TushareTransportError(f"unclassified: {msg}")
+
+
 # ---------------------------------------------------------------------------
 # Transport abstraction
 # ---------------------------------------------------------------------------
@@ -166,15 +314,7 @@ class TushareSDKTransport(TushareTransport):
         try:
             df = method(**kwargs)
         except Exception as e:  # noqa: BLE001 — translate SDK errors uniformly
-            msg = str(e)
-            low = msg.lower()
-            if "权限" in msg or "permission" in low or "未开通" in msg or "no permission" in low:
-                raise TushareUnauthorizedError(msg) from e
-            if "频率" in msg or "rate" in low or "429" in msg:
-                raise TushareRateLimitError(msg) from e
-            if "5" in msg[:3] or "timeout" in low or "connection" in low:
-                raise TushareServerError(msg) from e
-            raise TushareError(msg) from e
+            raise _classify_tushare_exception(e) from e
         if df is None:
             return pd.DataFrame()
         return df
@@ -296,6 +436,9 @@ class TushareClient:
         intraday: if True, all writes for INTRADAY_SENSITIVE_APIS get
                   data_completeness='intraday'; reads will only accept matching
                   completeness.
+        max_retries: tenacity stop_after_attempt for transient errors
+                     (rate limit + server + transport). Default 7 → worst-case
+                     wait ≈ (1+2+4+8+16+30) ≈ 60s of jittered backoff.
         event_cb: optional callback for surfacing operationally-relevant
                   tushare events (5xx fallback, etc.) to the caller. Signature
                   ``event_cb(event_type, message, payload_dict)``. Kept as
@@ -310,6 +453,7 @@ class TushareClient:
         plugin_id: str,
         rps: float = 6.0,
         intraday: bool = False,
+        max_retries: int = 7,
         event_cb: Callable[[str, str, dict[str, Any]], None] | None = None,
     ) -> None:
         self._db = db
@@ -318,6 +462,18 @@ class TushareClient:
         self._bucket = _TokenBucket(rps)
         self._intraday = intraday
         self._event_cb = event_cb
+        # R1 (HARD CONSTRAINT): the Retrying object wraps `_do_fetch`, whose
+        # FIRST line is `self._bucket.acquire()`. Every retry attempt re-enters
+        # `_do_fetch`, so the token bucket is honored on every attempt — the
+        # tenacity backoff and the bucket throttle compose, never bypass.
+        # Don't move bucket.acquire() out of `_do_fetch` without updating
+        # `tests/core/test_tushare_retry_r1.py`.
+        self._retrying = Retrying(
+            retry=retry_if_exception_type((TushareRateLimitError, TushareServerError)),
+            stop=stop_after_attempt(max_retries),
+            wait=wait_exponential_jitter(initial=1, max=30, jitter=2),
+            reraise=True,
+        )
 
     @property
     def plugin_id(self) -> str:
@@ -614,13 +770,11 @@ class TushareClient:
             self._write_cached(api_name, cache_key_date, params, df)
         return df
 
-    @retry(
-        retry=retry_if_exception_type((TushareRateLimitError, TushareServerError)),
-        stop=stop_after_attempt(5),
-        wait=wait_exponential(multiplier=1, min=1, max=15),
-        reraise=True,
-    )
     def _fetch_with_retries(self, api_name: str, params: dict[str, Any]) -> pd.DataFrame:
+        """Fetch with tenacity retry around `_do_fetch`. See R1 in __init__."""
+        return self._retrying(self._do_fetch, api_name, params)
+
+    def _do_fetch(self, api_name: str, params: dict[str, Any]) -> pd.DataFrame:
         """Fetch the widest payload we'd ever want for this API.
 
         For most APIs tushare returns every column when ``fields`` is omitted,
@@ -628,6 +782,8 @@ class TushareClient:
         ``WIDE_FIELDS`` overrides ``fields=`` per-API so the cache row contains
         every column downstream callers need; ``call()``'s ``_project_fields``
         narrows it back at READ time.
+
+        First line is `self._bucket.acquire()` — see R1 in `__init__`.
         """
         self._bucket.acquire()
         t0 = time.monotonic()

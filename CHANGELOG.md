@@ -2,6 +2,33 @@
 
 All notable changes to DeepTrade. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and SemVer.
 
+## [v0.3.1] — 2026-05-11 — Tushare 传输层韧性修复
+
+`TushareSDKTransport.call` 用字符串关键字判断异常类型，长跑训练下 httpx 的 `RemoteProtocolError("Response ended prematurely")` 等传输层瞬断错误被错归为不可重试的 `TushareError`，绕过了 tenacity 重试白名单和 5xx → 缓存兜底链路，导致打板策略 lightgbm 训练（单轮 3000+ 次 Tushare 调用）频繁因网络抖动终止。本版本重写分类器并扩展重试策略。设计文档见 `docs/DeepTrade/tushare_transport_resilience_plan.md`（仓库外）。
+
+### Added
+
+- `TushareTransportError`（`TushareServerError` 的子类）：传输层瞬态错误的专门异常类型；自动复用现有重试白名单与 5xx 缓存兜底路径，调用方零改动。
+- `_classify_tushare_exception` / `_is_transient_transport_error` / `_extract_http_status` 三个模块级辅助函数，实现"按异常类型 → HTTP 状态码 → 字符串关键字"的三级分类，类型识别覆盖 httpx / requests / urllib3 / stdlib 三栈。
+- `app_config.tushare_max_retries`（默认 7，范围 1-20，dotted key `tushare.max_retries`）：tenacity stop_after_attempt 的最大尝试次数；从原来硬编码 5 提到 7。
+- `TushareClient.__init__` 新增可选 `max_retries: int = 7` 参数。
+- `tests/core/test_tushare_classifier.py`：分类器全套单测（37 个用例），含 "Response ended prematurely" 回归保护。
+- `tests/core/test_tushare_retry_r1.py`：硬约束 R1 回归测试——每次 tenacity 重试都必须重新经过 `_TokenBucket.acquire()`；任何把 `bucket.acquire()` 移出 `_do_fetch` 的重构都会被这个测试拦下。
+
+### Changed
+
+- `TushareSDKTransport.call`：原 `except Exception` 中的字符串匹配块全部替换为对 `_classify_tushare_exception` 的调用；不再有 `"5" in msg[:3]` 这种 in 检查的 bug；未识别的异常默认归类为 `TushareTransportError`（可重试），而非历史的 `TushareError`（终态）——这是核心设计反转，意图是远程网络服务的"未知错"绝大多数是瞬态。
+- `TushareClient._fetch_with_retries`：从 `@retry` 装饰器形式改为显式 `Retrying(...)( _do_fetch, ...)` 调用，便于通过 `__init__` 注入 `max_retries`；函数体拆为 `_do_fetch`，`self._bucket.acquire()` 仍是 `_do_fetch` 的第一行——见 `__init__` 中的 R1 注释。
+- 重试退避策略：`wait_exponential(multiplier=1, min=1, max=15)` → `wait_exponential_jitter(initial=1, max=30, jitter=2)`，加 jitter 散开并发重试的"羊群效应"；`stop_after_attempt(5)` → `stop_after_attempt(max_retries)`（默认 7），最坏等待预算从 ~30s 抬到 ~70s。
+- Tushare 限流文案识别扩展：除 "频率"/"限流"/"rate"/"429" 外，新增对 "每分钟…次"（如 "抱歉，您每分钟最多访问该接口500次"）的匹配。
+- `tests/core/test_tushare_client.py` 中 4 处 `monkeypatch.setattr(TushareClient._fetch_with_retries.retry, "sleep", ...)` 改为 `monkeypatch.setattr(cli._retrying, "sleep", ...)`，配合 `Retrying` 实例化下放到 `__init__`。
+- `deeptrade/__init__.py`：版本 bump 至 `0.3.1`。
+
+### Out of scope (recorded for follow-up)
+
+- `_TokenBucket` 只 decay 不 recover：撞过几次 429 后 rps 单调下降到 0.1，`TushareClient` 实例生命周期内不自愈。lub 训练每轮新建 client 所以单轮内不至于雪崩，但跨长跑场景需在后续版本治理。
+- plugin 侧 `collect_training_window` 缺 per-day try/except、缺中间检查点——属插件韧性，不在框架范围。
+
 ## [v0.3.0] — 2026-05-11 — 移除 channel 插件类型 + 内置 notifier
 
 本版本移除 `channel` 插件类型与框架内置的 notifier 链。IM 推送在实测中需要登录、轮询、发送多步流程，插件一次性 `dispatch(argv)` 的生命周期与之不匹配，整体能力将以框架级 ChatGateway 模块的形式重做（**本版本不含 ChatGateway 实现**，仅完成清理）。

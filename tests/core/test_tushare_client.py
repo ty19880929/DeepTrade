@@ -184,7 +184,9 @@ def test_eod_run_rejects_intraday_cache_and_refetches(
 ) -> None:
     # Step 1: intraday run writes data_completeness='intraday'
     transport.register("limit_list_d", pd.DataFrame({"ts_code": ["X"]}))
-    intraday_client = TushareClient(db, transport, plugin_id=TEST_PLUGIN_ID, rps=1000.0, intraday=True)
+    intraday_client = TushareClient(
+        db, transport, plugin_id=TEST_PLUGIN_ID, rps=1000.0, intraday=True
+    )
     intraday_client.call("limit_list_d", trade_date="20260427")
     assert len(transport.calls) == 1
 
@@ -210,7 +212,9 @@ def test_eod_run_rejects_intraday_cache_and_refetches(
 
 def test_intraday_run_can_use_intraday_cache(db: Database, transport: FixtureTransport) -> None:
     transport.register("limit_list_d", pd.DataFrame({"ts_code": ["X"]}))
-    intraday_client = TushareClient(db, transport, plugin_id=TEST_PLUGIN_ID, rps=1000.0, intraday=True)
+    intraday_client = TushareClient(
+        db, transport, plugin_id=TEST_PLUGIN_ID, rps=1000.0, intraday=True
+    )
     intraday_client.call("limit_list_d", trade_date="20260427")
     intraday_client.call("limit_list_d", trade_date="20260427")
     assert len(transport.calls) == 1  # second call hit cache
@@ -239,15 +243,6 @@ def test_unauthorized_marks_state_and_raises(
 
 
 def test_429_triggers_rps_decay(db: Database, monkeypatch: pytest.MonkeyPatch) -> None:
-    # Skip tenacity backoff sleeps for fast test execution.
-    # tenacity stores `sleep` on the Retrying instance attached as
-    # `_fetch_with_retries.retry`, so we patch there.
-    monkeypatch.setattr(
-        TushareClient._fetch_with_retries.retry,  # type: ignore[attr-defined]
-        "sleep",
-        lambda *_: None,
-    )
-
     # Always rate-limit
     class AlwaysLimited(FixtureTransport):
         def call(self, api_name, params, fields):  # type: ignore[override]
@@ -256,6 +251,10 @@ def test_429_triggers_rps_decay(db: Database, monkeypatch: pytest.MonkeyPatch) -
 
     t = AlwaysLimited()
     cli = TushareClient(db, t, plugin_id=TEST_PLUGIN_ID, rps=10.0)
+    # Skip tenacity backoff sleeps for fast test execution. The Retrying
+    # instance now lives on the client (per-instance) instead of the function
+    # decorator, so patch the instance attribute.
+    monkeypatch.setattr(cli._retrying, "sleep", lambda *_: None)
     initial = cli.rps
     with pytest.raises(TushareRateLimitError):
         cli.call("daily", trade_date="20260427")
@@ -268,12 +267,6 @@ def test_429_triggers_rps_decay(db: Database, monkeypatch: pytest.MonkeyPatch) -
 
 
 def test_5xx_retries_then_succeeds(db: Database, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        TushareClient._fetch_with_retries.retry,  # type: ignore[attr-defined]
-        "sleep",
-        lambda *_: None,
-    )
-
     class FlakyTransport(FixtureTransport):
         def __init__(self) -> None:
             super().__init__()
@@ -288,6 +281,7 @@ def test_5xx_retries_then_succeeds(db: Database, monkeypatch: pytest.MonkeyPatch
 
     t = FlakyTransport()
     cli = TushareClient(db, t, plugin_id=TEST_PLUGIN_ID, rps=1000.0)
+    monkeypatch.setattr(cli._retrying, "sleep", lambda *_: None)
     df = cli.call("daily", trade_date="20260427")
     assert len(df) == 1
     assert len(t.calls) == 3  # 2 failures + 1 success
@@ -388,11 +382,6 @@ def test_5xx_falls_back_to_existing_final_cache(
     db: Database, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """First call ok seeds cache; second call 5xx → fallback returns cached payload."""
-    monkeypatch.setattr(
-        TushareClient._fetch_with_retries.retry,  # type: ignore[attr-defined]
-        "sleep",
-        lambda *_: None,
-    )
 
     class FlakyAfterFirst(FixtureTransport):
         def __init__(self) -> None:
@@ -408,6 +397,7 @@ def test_5xx_falls_back_to_existing_final_cache(
 
     t = FlakyAfterFirst()
     cli = TushareClient(db, t, plugin_id=TEST_PLUGIN_ID, rps=1000.0)
+    monkeypatch.setattr(cli._retrying, "sleep", lambda *_: None)
     cli.call("limit_list_d", trade_date="20260427")  # seeds cache
     # Force re-fetch: the second call would normally hit cache; force_sync triggers network
     df = cli.call("limit_list_d", trade_date="20260427", force_sync=True)
@@ -417,12 +407,6 @@ def test_5xx_falls_back_to_existing_final_cache(
 def test_5xx_no_fallback_when_intraday_state_in_eod_run(
     db: Database, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(
-        TushareClient._fetch_with_retries.retry,  # type: ignore[attr-defined]
-        "sleep",
-        lambda *_: None,
-    )
-
     class FlakyAfterFirst(FixtureTransport):
         def __init__(self) -> None:
             super().__init__()
@@ -437,10 +421,12 @@ def test_5xx_no_fallback_when_intraday_state_in_eod_run(
 
     t = FlakyAfterFirst()
     intraday_cli = TushareClient(db, t, plugin_id=TEST_PLUGIN_ID, rps=1000.0, intraday=True)
+    monkeypatch.setattr(intraday_cli._retrying, "sleep", lambda *_: None)
     intraday_cli.call("limit_list_d", trade_date="20260427")  # state.data_completeness='intraday'
 
     # Daily-mode read of same date with force_sync → fetch → 5xx → fallback rejected
     eod_cli = TushareClient(db, t, plugin_id=TEST_PLUGIN_ID, rps=1000.0, intraday=False)
+    monkeypatch.setattr(eod_cli._retrying, "sleep", lambda *_: None)
     with pytest.raises(TushareServerError):
         eod_cli.call("limit_list_d", trade_date="20260427", force_sync=True)
 

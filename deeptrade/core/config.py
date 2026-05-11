@@ -87,6 +87,11 @@ class AppConfig(BaseModel):
     # tushare.*  (token lives in secret_store)
     tushare_rps: float = Field(default=6.0, gt=0)
     tushare_timeout: int = Field(default=30, ge=1)
+    # Tenacity stop_after_attempt for transient errors (rate limit / server /
+    # transport). Default 7 keeps worst-case wait around one minute of
+    # jittered exponential backoff. Each attempt re-enters the token bucket,
+    # so retries never bypass rate limiting.
+    tushare_max_retries: int = Field(default=7, ge=1, le=20)
 
     # Global preset name. v0.7 — renamed from ``deepseek.profile``; semantics
     # are vendor-agnostic. Per-stage tuning is resolved by each plugin's
@@ -134,6 +139,7 @@ _DOT_TO_FIELD: dict[str, str] = {
     "app.close_after": "app_close_after",
     "tushare.rps": "tushare_rps",
     "tushare.timeout": "tushare_timeout",
+    "tushare.max_retries": "tushare_max_retries",
     "app.profile": "app_profile",
     "llm.providers": "llm_providers",
     "llm.audit_full_payload": "llm_audit_full_payload",
@@ -365,8 +371,7 @@ class ConfigService:
             # already default; otherwise we'd leave the dict with no
             # default at all. Preserve prior_default in that case.
             other_has_default = any(
-                k != name and bool((v or {}).get("is_default"))
-                for k, v in current.items()
+                k != name and bool((v or {}).get("is_default")) for k, v in current.items()
             )
             new_default = prior_default if not other_has_default else False
 
@@ -374,7 +379,11 @@ class ConfigService:
         # the invariant "at most one default" holds.
         if new_default:
             for other_name, other_cfg in current.items():
-                if other_name != name and isinstance(other_cfg, dict) and other_cfg.get("is_default"):
+                if (
+                    other_name != name
+                    and isinstance(other_cfg, dict)
+                    and other_cfg.get("is_default")
+                ):
                     current[other_name] = {**other_cfg, "is_default": False}
 
         current[name] = {
