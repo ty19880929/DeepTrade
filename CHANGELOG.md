@@ -2,6 +2,41 @@
 
 All notable changes to DeepTrade. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and SemVer.
 
+## [v0.4.0] — 2026-05-12 — 插件级依赖管理 + 框架依赖瘦身
+
+两项主线变更合并发布：
+
+1. **插件可以声明并由框架自动安装自己的 Python 依赖**。`deeptrade_plugin.yaml::dependencies` 接受 PEP 508 specifier；`plugin install / upgrade` 期间走 `uv pip install` → `python -m pip install` 两级回退，已装且满足跳过，不满足硬拒绝并归因到具体冲突方。设计文档：`docs/DeepTrade/plugin_dependency_management_design.md`（仓库外）。
+2. **框架主依赖瘦身**：`pandas` / `tushare` 不再是 framework 的 `Requires-Dist`，仅作为 `optional-dependencies.plugin-runtime` / `dev` extras 存在。`deeptrade.core.tushare_client.TushareClient` 这一专为插件准备的 wrapper 行为不变，但其运行时依赖现在由插件自己声明。受影响的插件清单与改造指引见 `docs/DeepTrade/plugin_required_dependencies.md`（仓库外）。
+
+### Added
+
+- `PluginMetadata.dependencies: list[str]`（PEP 508 specifier；`extra="forbid"` 通过默认空列表向后兼容旧 yaml）；Pydantic 校验拒绝非法 spec、VCS/URL 形式、重名包（大小写无关）。
+- `deeptrade/core/dep_installer.py`：`parse_specs / plan_install / detect_installer / run_install`；installer 探测优先 `uv`（带 `--python <sys.executable>` 强制装入框架解释器）→ 回退 `python -m pip`；环境变量 `DEEPTRADE_DEP_INSTALL_TIMEOUT` 覆盖默认 300s 超时；marker 不匹配的 requirement 自动跳过。
+- `PluginManager._handle_dependencies` / `_build_dep_ownership`：在 `install` / `upgrade` 的 `copytree` 之后、migrations 事务之前解析并安装 deps；冲突错误信息归因到"框架核心依赖"或具体 `plugin <id>`（反查既装插件的 `metadata_yaml`）。
+- `plugin install` / `plugin upgrade` CLI 新增 `--no-deps`、`--reinstall-deps`；`summarize_for_install` 增 `dependencies` 行；`--no-deps` 启用时摘要区会显式提示。
+- `pyproject.toml::optional-dependencies.plugin-runtime` extras：把 `tushare>=1.4` / `pandas>=2.2` 显式收集到这个组，便于本地通过 `uv sync --extra plugin-runtime` 调试 TushareClient。
+- `tests/core/test_plugin_dependencies.py`：29 个用例覆盖元数据校验、planning、installer 探测、PluginManager 集成（安装 / 跳过 / 冲突 / 失败清理 / `--no-deps` / `--reinstall-deps` / 归因到其他插件）、upgrade 行为、CLI 摘要 + flag 透传。
+
+### Changed
+
+- `pyproject.toml::dependencies`：移除 `tushare>=1.4` 与 `pandas>=2.2`；其余 11 条框架直接使用的依赖（typer / questionary / rich / duckdb / openai / pydantic / tenacity / pyyaml / keyring / click / packaging）保持不变。
+- `pyproject.toml::optional-dependencies.dev`：补入 `tushare>=1.4` / `pandas>=2.2`，使 `uv sync --all-extras` 仍能跑通 `tests/core/test_tushare_client.py` 等触及 wrapper 的测试。
+- `deeptrade/__init__.py::__version__` → `0.4.0`；`pyproject.toml::project.version` → `0.4.0`（两处同步更新，遵 CLAUDE.md 发版流程）。
+
+### Migration notes
+
+- **框架瘦身的兼容性边界**：升级到 0.4.0 框架但**沿用旧版本插件**的用户，如果之前是用 `pip install deeptrade-quant` 一并装下了 pandas / tushare，环境里这两个库仍在，旧插件依然能跑。但**重新部署 / 新建虚拟环境**时，如果插件 yaml 没声明 `pandas` / `tushare`，运行期会以 `ModuleNotFoundError` 暴露——这就是新的"插件应该自己声明依赖"的预期行为。
+- **官方插件改造**：`DeepTradePluginOfficial` 仓中的 `limit_up_board` / `volume_anomaly` 等策略需要把 `pandas>=2.2` / `tushare>=1.4` 写进自家 `deeptrade_plugin.yaml::dependencies`。具体指引见 `plugin_required_dependencies.md`。
+- **离线 / 私有源用户**：本版本不支持自定义 `index_url`；如需禁用网络安装，用 `deeptrade plugin install <source> --no-deps` 跳过 dep 安装步骤，自行 `pip install` 准备好环境。
+- **回滚不卸 deps**：dep 安装成功但后续 migrations / `validate_static` 失败时，已装的依赖**不会被反向卸载**——共享依赖风险下"装哪些卸哪些"会误伤其他插件。设计文档 §4.5 有详细说明。
+
+### Out of scope (recorded for follow-up)
+
+- `deeptrade.core.tushare_client` 仍位于框架代码树；下一步可考虑把它整体迁出框架（独立 PyPI 包或新的 `type=service` 插件类型），届时框架 wheel 完全不带 tushare 相关代码。
+- 不引入 `requirements.lock` 风格的依赖锁定；当前每次 install 都按 specifier 实时解析。
+- 不引入企业级 `index_url` / 私有 PyPI 源；v1 直接走 PyPI 默认源。
+
 ## [v0.3.1] — 2026-05-11 — Tushare 传输层韧性修复
 
 `TushareSDKTransport.call` 用字符串关键字判断异常类型，长跑训练下 httpx 的 `RemoteProtocolError("Response ended prematurely")` 等传输层瞬断错误被错归为不可重试的 `TushareError`，绕过了 tenacity 重试白名单和 5xx → 缓存兜底链路，导致打板策略 lightgbm 训练（单轮 3000+ 次 Tushare 调用）频繁因网络抖动终止。本版本重写分类器并扩展重试策略。设计文档见 `docs/DeepTrade/tushare_transport_resilience_plan.md`（仓库外）。

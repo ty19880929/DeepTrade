@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "deeptrade-quant"
-version = "0.3.1"
+version = "0.4.0"
 description = "LLM-driven A-share (Shanghai/Shenzhen main board) stock screening CLI"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -17,18 +17,25 @@ dependencies = [
     "questionary>=2.0",
     "rich>=13.7",
     "duckdb>=1.0",
-    "tushare>=1.4",
     "openai>=1.0",
     "pydantic>=2.7",
     "tenacity>=8.0",
     "pyyaml>=6.0",
     "keyring>=25.0",
-    "pandas>=2.2",
     "click>=8.1",
     "packaging>=23.0",
 ]
 
 [project.optional-dependencies]
+# Deps used ONLY by `deeptrade.core.tushare_client` (a plugin-facing service
+# helper not imported by any framework runtime code path). Plugin authors that
+# import TushareClient must declare these in their plugin's
+# `deeptrade_plugin.yaml::dependencies`. Kept here so `uv sync --all-extras`
+# still installs them for local tests of tushare_client.
+plugin-runtime = [
+    "tushare>=1.4",
+    "pandas>=2.2",
+]
 dev = [
     "pytest>=8.0",
     "pytest-mock>=3.12",
@@ -36,6 +43,9 @@ dev = [
     "mypy>=1.10",
     "pre-commit>=3.7",
     "types-PyYAML>=6.0",
+    # Pulled in transitively so the tushare_client test files load.
+    "tushare>=1.4",
+    "pandas>=2.2",
 ]
 
 [project.scripts]

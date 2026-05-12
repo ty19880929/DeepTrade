@@ -301,7 +301,7 @@ wheels = [
 
 [[package]]
 name = "deeptrade-quant"
-version = "0.3.1"
+version = "0.4.0"
 source = { editable = "." }
 dependencies = [
     { name = "click" },
@@ -309,24 +309,28 @@ dependencies = [
     { name = "keyring" },
     { name = "openai" },
     { name = "packaging" },
-    { name = "pandas" },
     { name = "pydantic" },
     { name = "pyyaml" },
     { name = "questionary" },
     { name = "rich" },
     { name = "tenacity" },
-    { name = "tushare" },
     { name = "typer" },
 ]
 
 [package.optional-dependencies]
 dev = [
     { name = "mypy" },
+    { name = "pandas" },
     { name = "pre-commit" },
     { name = "pytest" },
     { name = "pytest-mock" },
     { name = "ruff" },
+    { name = "tushare" },
     { name = "types-pyyaml" },
+]
+plugin-runtime = [
+    { name = "pandas" },
+    { name = "tushare" },
 ]
 
 [package.metadata]
@@ -337,7 +341,8 @@ requires-dist = [
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.10" },
     { name = "openai", specifier = ">=1.0" },
     { name = "packaging", specifier = ">=23.0" },
-    { name = "pandas", specifier = ">=2.2" },
+    { name = "pandas", marker = "extra == 'dev'", specifier = ">=2.2" },
+    { name = "pandas", marker = "extra == 'plugin-runtime'", specifier = ">=2.2" },
     { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=3.7" },
     { name = "pydantic", specifier = ">=2.7" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
@@ -347,11 +352,12 @@ requires-dist = [
     { name = "rich", specifier = ">=13.7" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.5" },
     { name = "tenacity", specifier = ">=8.0" },
-    { name = "tushare", specifier = ">=1.4" },
+    { name = "tushare", marker = "extra == 'dev'", specifier = ">=1.4" },
+    { name = "tushare", marker = "extra == 'plugin-runtime'", specifier = ">=1.4" },
     { name = "typer", specifier = ">=0.12" },
     { name = "types-pyyaml", marker = "extra == 'dev'", specifier = ">=6.0" },
 ]
-provides-extras = ["dev"]
+provides-extras = ["plugin-runtime", "dev"]
 
 [[package]]
 name = "distlib"
