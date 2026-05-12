@@ -126,7 +126,20 @@ def _build_plugin_command(plugin_id: str) -> click.Command | None:
         if not hasattr(plugin, "dispatch"):
             typer.echo(f"✘ plugin {plugin_id!r} does not implement dispatch()")
             raise typer.Exit(2)
-        rc = plugin.dispatch(list(ctx.args))
+        try:
+            rc = plugin.dispatch(list(ctx.args))
+        except (SystemExit, KeyboardInterrupt):
+            # Exit codes / Ctrl-C must propagate unaltered.
+            raise
+        except BaseException as e:  # noqa: BLE001 — final safety net
+            # Plugins are encouraged to install their own dispatch-tail handler
+            # (see plugins_api.render_exception). This catch only fires when a
+            # plugin lets an exception escape — we still want DEEPTRADE_DEBUG=1
+            # to surface the traceback rather than a bare crash.
+            from deeptrade.plugins_api import render_exception
+
+            sys.stderr.write(render_exception(e) + "\n")
+            raise typer.Exit(1) from e
         raise typer.Exit(rc or 0)
 
     return _dispatch
@@ -181,10 +194,16 @@ def init(
     paths.ensure_layout()
     db_file = paths.db_path()
     fresh = not db_file.exists()
-    db = Database(db_file)
+    # auto_migrate=False so we can collect & print the precise list of versions
+    # newly applied below; the auto-migrate path swallows that information by
+    # design (it runs unconditionally on every Database open).
+    db = Database(db_file, auto_migrate=False)
     try:
+        applied = apply_core_migrations(db)
         if fresh:
             typer.echo(f"✔ Database created: {db_file}")
+        for v in applied:
+            typer.echo(f"✔ Schema applied: {v}")
     finally:
         db.close()
 
@@ -219,7 +238,9 @@ def db_init() -> None:
     paths.ensure_layout()
     db_file = paths.db_path()
     fresh = not db_file.exists()
-    db = Database(db_file)
+    # auto_migrate=False so this command reports which versions it applied;
+    # the Database auto-migrate path returns nothing.
+    db = Database(db_file, auto_migrate=False)
     try:
         applied = apply_core_migrations(db)
         if fresh:

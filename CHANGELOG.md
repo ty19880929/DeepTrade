@@ -2,6 +2,29 @@
 
 All notable changes to DeepTrade. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and SemVer.
 
+## [v0.4.2] — 2026-05-12 — Database 构造自动迁移 + DEEPTRADE_DEBUG=1 显示堆栈
+
+定位到一个用户报错：升级到 0.4.1 后第一次跑 `deeptrade limit-up-board lgb train ...` 直接报 `✘ TypeError: list indices must be integers or slices, not str`。链路追到 `TushareClient._restore_cached_frame` —— 0.4.1 改用 `{"version","schema","data"}` 包裹格式读取，但旧裸数组的缓存行没被清掉。根因不是缓存代码本身，而是迁移触发链路：`apply_core_migrations` 只在 `deeptrade db init` / `db upgrade` 显式调用，包升级后用户不手动跑就一直拿不到 `20260512_001_drop_legacy_tushare_cache.sql` 的清空动作。同时报错只有一行无堆栈，定位也很慢——这是双层 swallow（插件 + 框架都没渲染 traceback）。
+
+### Changed
+
+- `deeptrade/core/db.py::Database.__init__` 新增 `auto_migrate: bool = True` kwarg；构造时若未关闭（且 `DEEPTRADE_SKIP_AUTO_MIGRATE` 未置位）就自动调一次 `apply_core_migrations(self)`。任何打开 DB 的代码路径（CLI 插件分发、PluginManager、未来的 SDK 调用）都因此跟进 schema，包升级后无需手动 `db upgrade` 即可避开 0.4.1 那种"新读路径碰旧数据"的尴尬。
+- `deeptrade/cli.py` 的 `init` / `db init` / `db upgrade` 显式传 `auto_migrate=False`，自己调 `apply_core_migrations` 收集"本次新跑了哪些版本"以打印 `✔ Schema applied: <version>` 行；其他命令走默认 auto-migrate 路径。
+- `deeptrade/cli.py::_dispatch` 给插件 `dispatch()` 包了一层兜底：捕获 `BaseException`（放过 `SystemExit` / `KeyboardInterrupt`）后用 `render_exception` 渲染、按 `typer.Exit(1)` 传播。已经自己 catch 的插件不受影响；不 catch 的插件也能在框架层看到一致的输出格式。
+
+### Added
+
+- `deeptrade/plugins_api/errors.py`：`render_exception(exc, *, header_glyph="✘")` 与 `debug_enabled()`。约定环境变量 `DEEPTRADE_DEBUG=1`（接受 `1` / `true` / `yes` / `on`，大小写不敏感）——开启时输出完整 `traceback.format_exception` 文本（自动包含 `__cause__` 链与 exception group），否则维持 `✘ {ExcType}: {msg}` 一行。两者均不带尾部换行，调用方自加。从 `plugins_api/__init__.py` 重导出。
+- 逃生通道 `DEEPTRADE_SKIP_AUTO_MIGRATE=1`：当一次失败的迁移把所有 CLI 命令都堵住时，置位该变量绕过 auto-migrate 还原现场。文档位于 README troubleshooting 段（非主流程）。
+- `tests/core/test_db.py`：5 个新用例覆盖 auto-migrate 行为——新建 DB 自动跑迁移、`auto_migrate=False` 跳过、`DEEPTRADE_SKIP_AUTO_MIGRATE=1` 跳过、迁移失败硬上抛、**预置旧裸数组 `tushare_cache_blob` 行 → 再开 DB 必须被 0.4.1 的 drop 迁移清掉**（本次故事的回归锁）。
+- `tests/plugins_api/test_errors.py`：默认模式一行、`DEEPTRADE_DEBUG=1` 含 `Traceback` + 链式 `__cause__`、自定义 glyph、`0` 视为关闭、`debug_enabled` env 反映。
+
+### Migration notes
+
+- **用户侧零动作**：从 0.4.1 升上来的用户下一次跑任何 `deeptrade <...>` 命令时，`Database()` 都会自动应用 `20260512_001_drop_legacy_tushare_cache.sql`，TypeError 自愈。仍想留旧缓存（不推荐）的用户可用 `DEEPTRADE_SKIP_AUTO_MIGRATE=1 deeptrade ...` 临时绕过。
+- **插件作者**：仍可保留自己的 `except Exception` 兜底；推荐改用 `from deeptrade.plugins_api import render_exception`，写成 `sys.stderr.write(render_exception(e) + "\n")` 即可让 `DEEPTRADE_DEBUG=1` 透传栈信息。`api_version` 不动（"1"）；旧插件不调新工具也照常工作。
+- **测试夹具变更**：`tests/core/test_db.py::fresh_db` 改用 `auto_migrate=False` 以保留"未迁移"语义；其余 `apply_core_migrations(fresh_db)` 用例无须改动（幂等）。
+
 ## [v0.4.1] — 2026-05-12 — Tushare 缓存 dtype 还原 + 消除 pandas FutureWarning
 
 插件在缓存命中路径上反馈 pandas 2.2+ 抛出 `FutureWarning: The behavior of 'to_datetime' with 'unit' when parsing strings is deprecated`。根因在框架侧 `TushareClient._read_cached`：`pd.read_json(..., orient="records")` 默认 `convert_dates=True`，按列名启发式（含 `date / _at / _time / timestamp / modified`）调 `pd.to_datetime(values, errors='ignore', unit='ms')`，tushare 列名几乎全部命中，每次缓存读取都会触发警告；更危险的是 pandas 未来版本会静默改变 string+`unit` 的语义。

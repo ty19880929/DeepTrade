@@ -6,6 +6,7 @@ held by AppContext; writes are serialized on the runner main thread.
 
 from __future__ import annotations
 
+import os
 import re
 import threading
 from collections.abc import Iterator
@@ -20,6 +21,20 @@ from deeptrade.core import paths
 
 _MIGRATION_FILENAME_RE = re.compile(r"^(\d{8}_\d{3,})_.+\.sql$")
 
+# Escape hatch: set DEEPTRADE_SKIP_AUTO_MIGRATE=1 to bypass the auto-migrate
+# step in Database.__init__. Intended for recovery (e.g. a corrupt schema
+# blocking every CLI command); not part of the documented main flow.
+_SKIP_AUTO_MIGRATE_ENV = "DEEPTRADE_SKIP_AUTO_MIGRATE"
+
+
+def _skip_auto_migrate() -> bool:
+    return os.environ.get(_SKIP_AUTO_MIGRATE_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
 
 class Database:
     """Thin wrapper around a single DuckDB connection.
@@ -29,7 +44,7 @@ class Database:
     consumed by the main thread (DESIGN §13.3).
     """
 
-    def __init__(self, db_file: Path | None = None) -> None:
+    def __init__(self, db_file: Path | None = None, *, auto_migrate: bool = True) -> None:
         self._path = db_file or paths.db_path()
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._conn: duckdb.DuckDBPyConnection = duckdb.connect(str(self._path))
@@ -38,6 +53,14 @@ class Database:
         # also acquires the lock. A plain Lock would self-deadlock.
         self._write_lock = threading.RLock()
         self._tx_depth = 0  # for reentrant transaction(); only outermost BEGIN/COMMIT
+
+        # Auto-migrate: any CLI / SDK code path that opens the DB pulls schema
+        # forward so wheel upgrades don't strand stale rows for the new
+        # readers (see v0.4.1 tushare_cache_blob format change). The CLI's own
+        # `init` / `db init` / `db upgrade` commands opt out so they can print
+        # the precise list of versions newly applied.
+        if auto_migrate and not _skip_auto_migrate():
+            apply_core_migrations(self)
 
     @property
     def path(self) -> Path:

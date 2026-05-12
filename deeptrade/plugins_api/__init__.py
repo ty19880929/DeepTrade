@@ -6,11 +6,13 @@ Stable surface (api_version = "1"):
     - Plugin (Protocol), PluginContext — every plugin's contract: metadata + validate_static + dispatch
     - PluginMetadata, TableSpec, MigrationSpec, PluginPermissions, ...
     - StageProfile — LLM 调参档；插件持有 preset → stage 映射表，自行解析
+    - render_exception — uniform DEEPTRADE_DEBUG-aware error formatter for dispatch tails
 """
 
 from __future__ import annotations
 
 from deeptrade.plugins_api.base import Plugin, PluginContext
+from deeptrade.plugins_api.errors import debug_enabled, render_exception
 from deeptrade.plugins_api.llm import StageProfile
 from deeptrade.plugins_api.metadata import (
     MigrationSpec,
@@ -29,4 +31,6 @@ __all__ = [
     "StageProfile",
     "TableSpec",
     "TushareApiPermissions",
+    "debug_enabled",
+    "render_exception",
 ]
