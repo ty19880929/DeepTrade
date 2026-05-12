@@ -50,9 +50,9 @@ def test_init_is_idempotent(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> 
 def test_apply_core_migrations_records_version(fresh_db: Database) -> None:
     """Framework owns no business tables."""
     applied = apply_core_migrations(fresh_db)
-    assert applied == ["20260509_001"]
+    assert applied == ["20260509_001", "20260512_001"]
     rows = fresh_db.fetchall("SELECT version FROM schema_migrations ORDER BY version")
-    assert tuple(rows) == (("20260509_001",),)
+    assert tuple(rows) == (("20260509_001",), ("20260512_001",))
 
 
 def test_apply_core_migrations_skips_applied_versions(fresh_db: Database) -> None:

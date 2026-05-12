@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import warnings
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -452,3 +453,36 @@ def test_cache_hit_requires_payload_present(
     client.call("limit_list_d", trade_date="20260427")
     # Should hit transport (because no payload despite state=ok)
     assert len(transport.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Cache payload round-trip — dtypes preserved, no pandas FutureWarning
+# ---------------------------------------------------------------------------
+
+
+def test_cache_payload_round_trip_preserves_dtypes(client: TushareClient) -> None:
+    """v0.4.1 wrapper format restores dtypes explicitly so plugins don't see
+    pandas' read_json date-heuristic warnings on tushare-style date columns."""
+    df = pd.DataFrame(
+        {
+            "trade_date": ["20260427", "20260428"],  # YYYYMMDD strings — triggers heuristic
+            "ts_code": ["000001.SZ", "000002.SZ"],
+            "close": [12.5, 14.7],
+            "vol": [1000, 2000],
+            "is_st": [True, False],
+            "ann_dt": pd.to_datetime(["2026-04-27", "2026-04-28"]),  # real datetime64[ns]
+        }
+    )
+    api, td, params = "limit_list_d", "20260427", {"trade_date": "20260427"}
+
+    client._write_cached(api, td, params, df)  # noqa: SLF001 — exercising internal contract
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", FutureWarning)
+        out = client._read_cached(api, td, params, fields=None)  # noqa: SLF001
+
+    assert list(out.columns) == list(df.columns)
+    for col in df.columns:
+        assert out[col].dtype == df[col].dtype, f"dtype drift on {col}: {out[col].dtype}"
+    assert out["trade_date"].tolist() == ["20260427", "20260428"]
+    assert (out["ann_dt"] == df["ann_dt"]).all()

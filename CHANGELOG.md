@@ -2,6 +2,26 @@
 
 All notable changes to DeepTrade. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and SemVer.
 
+## [v0.4.1] — 2026-05-12 — Tushare 缓存 dtype 还原 + 消除 pandas FutureWarning
+
+插件在缓存命中路径上反馈 pandas 2.2+ 抛出 `FutureWarning: The behavior of 'to_datetime' with 'unit' when parsing strings is deprecated`。根因在框架侧 `TushareClient._read_cached`：`pd.read_json(..., orient="records")` 默认 `convert_dates=True`，按列名启发式（含 `date / _at / _time / timestamp / modified`）调 `pd.to_datetime(values, errors='ignore', unit='ms')`，tushare 列名几乎全部命中，每次缓存读取都会触发警告；更危险的是 pandas 未来版本会静默改变 string+`unit` 的语义。
+
+### Changed
+
+- `deeptrade/core/tushare_client.py::TushareClient._write_cached` / `_read_cached` 改用 `{"version":1, "schema":{col:dtype_str}, "data":[...records...]}` 的包裹格式存取缓存；读取走 `json.loads + DataFrame.from_records + _restore_cached_frame`，按 schema 显式还原 dtype（`datetime64[*]` → `pd.to_datetime`；非 `object` 数值/布尔列 → `astype`；`object` 跳过）。彻底绕开 `pd.read_json` 的列名启发式，根因消除。
+- 框架不引入任何 tushare 业务字段名清单——`schema` 字典从 `df.dtypes.astype(str).to_dict()` 自动派生，保持"框架不持有业务知识"的原则。
+- 依赖瘦身：删除 `import io`（旧实现唯一用途）。
+
+### Added
+
+- `deeptrade/core/migrations/core/20260512_001_drop_legacy_tushare_cache.sql`：升级时一次性 `DROP TABLE IF EXISTS tushare_cache_blob`；旧裸数组格式的缓存条目与新读取路径不兼容，惰性建表 `_ensure_cache_table` 会在下次写入时重建。
+- `tests/core/test_tushare_client.py::test_cache_payload_round_trip_preserves_dtypes`：以 `trade_date(YYYYMMDD字符串)` + `ts_code(object)` + `close(float64)` + `vol(int64)` + `is_st(bool)` + `ann_dt(datetime64[ns])` 全字段 round-trip，`warnings.simplefilter("error", FutureWarning)` 把 warning 当错误抓，锁住回归。
+
+### Migration notes
+
+- **缓存清空一次**：升级到 0.4.1 后第一次 `apply_core_migrations` 会执行 `DROP TABLE IF EXISTS tushare_cache_blob`；下一次按 `trade_date` 拉取的 API 会走一次远程，之后正常命中新格式缓存。`tushare_sync_state` 不受影响（仍记录 status=ok），但 `_cache_hit` 在缓存表不存在时已会判为 miss，行为安全。
+- **插件无需改动**：`TushareClient.call(...)` 返回的 DataFrame dtype 与首次远程拉取时一致——之前依赖 `.dt` 访问器或显式 dtype 的插件代码无须调整。
+
 ## [v0.4.0] — 2026-05-12 — 插件级依赖管理 + 框架依赖瘦身
 
 两项主线变更合并发布：

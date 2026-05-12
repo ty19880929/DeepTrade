@@ -19,7 +19,6 @@ Cache class buckets:
 from __future__ import annotations
 
 import hashlib
-import io
 import json
 import logging
 import threading
@@ -896,6 +895,15 @@ class TushareClient:
             ")"
         )
 
+    # Payload wrapper format (v0.4.1+):
+    #   {"version": 1, "schema": {col: dtype_str}, "data": [...records...]}
+    # Bypasses pd.read_json's date-column heuristic (which warns on string
+    # columns named like dates — trade_date / cal_date / ann_date) and
+    # restores dtypes explicitly from the recorded schema. Pre-v0.4.1 rows
+    # were a bare records array; those are wiped by core migration
+    # 20260512_001_drop_legacy_tushare_cache.sql, so no legacy branch here.
+    _CACHE_PAYLOAD_VERSION = 1
+
     def _write_cached(
         self,
         api_name: str,
@@ -906,7 +914,14 @@ class TushareClient:
         self._ensure_cache_table()
         body = json.dumps(params, sort_keys=True, default=str)
         h = hashlib.sha256(body.encode("utf-8")).hexdigest()
-        payload = df.to_json(orient="records", date_format="iso")
+        records_json = df.to_json(orient="records", date_format="iso")
+        payload = json.dumps(
+            {
+                "version": self._CACHE_PAYLOAD_VERSION,
+                "schema": {col: str(dt) for col, dt in df.dtypes.items()},
+                "data": json.loads(records_json) if records_json else [],
+            }
+        )
         with self._db.transaction():
             self._db.execute(
                 "DELETE FROM tushare_cache_blob "
@@ -937,10 +952,32 @@ class TushareClient:
         )
         if row is None:
             return pd.DataFrame()
-        df = pd.read_json(io.StringIO(row[0]), orient="records")
+        wrapper = json.loads(row[0])
+        df = self._restore_cached_frame(wrapper)
         if fields:
             cols = [c.strip() for c in fields.split(",") if c.strip() in df.columns]
             df = df[cols]
+        return df
+
+    @classmethod
+    def _restore_cached_frame(cls, wrapper: dict[str, Any]) -> pd.DataFrame:
+        schema: dict[str, str] = wrapper["schema"]
+        data: list[dict[str, Any]] = wrapper["data"]
+        df = pd.DataFrame.from_records(data, columns=list(schema.keys()))
+        for col, dtype_str in schema.items():
+            if col not in df.columns:
+                continue
+            if dtype_str.startswith("datetime"):
+                df[col] = pd.to_datetime(df[col], errors="coerce")
+            elif dtype_str == "object":
+                continue
+            else:
+                try:
+                    df[col] = df[col].astype(dtype_str)
+                except (TypeError, ValueError):
+                    # Best-effort: if a numeric/bool column can't be coerced
+                    # back (e.g. all-null), leave the inferred dtype.
+                    pass
         return df
 
 
