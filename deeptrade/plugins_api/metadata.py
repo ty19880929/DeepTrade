@@ -4,12 +4,18 @@ DESIGN §8.2 (v0.3.1):
     * `tables` declares table names + purge policy ONLY (no inline DDL).
     * `migrations` is the SOLE DDL execution path (S1 fix).
     * `permissions.llm_tools` is fixed False (M3 hard constraint).
+DESIGN v0.4 (plugin dependency management):
+    * `dependencies` declares third-party Python packages the plugin needs.
+      PEP 508 specifier strings; framework installs them at plugin install /
+      upgrade time. See ``docs/plugin_dependency_management_design.md``.
 """
 
 from __future__ import annotations
 
 from typing import Literal
 
+from packaging.requirements import InvalidRequirement, Requirement
+from packaging.utils import canonicalize_name
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
@@ -61,6 +67,31 @@ class PluginMetadata(BaseModel):
     permissions: PluginPermissions = Field(default_factory=PluginPermissions)
     tables: list[TableSpec]
     migrations: list[MigrationSpec]
+    dependencies: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _dependencies_valid(self) -> PluginMetadata:
+        """Each entry must parse as PEP 508 ``Requirement``; no VCS/URL forms;
+        no duplicate package names (canonicalized)."""
+        seen: dict[str, str] = {}
+        for raw in self.dependencies:
+            try:
+                req = Requirement(raw)
+            except InvalidRequirement as e:
+                raise ValueError(f"invalid dependency spec {raw!r}: {e}") from e
+            if req.url:
+                raise ValueError(
+                    f"dependency {raw!r}: VCS/URL forms (git+https://, package @ url) "
+                    f"are not allowed; use PEP 508 version specifiers only"
+                )
+            canonical = canonicalize_name(req.name)
+            if canonical in seen:
+                raise ValueError(
+                    f"duplicate dependency package {req.name!r} "
+                    f"(also declared as {seen[canonical]!r}); combine into a single spec"
+                )
+            seen[canonical] = raw
+        return self
 
     @model_validator(mode="after")
     def _migrations_not_empty(self) -> PluginMetadata:

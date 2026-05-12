@@ -71,6 +71,12 @@ def cmd_install(
         None, "--ref", help="Tag / branch / sha (默认 = 该插件最新 release)"
     ),
     yes: bool = typer.Option(False, "-y", "--yes", help="Skip the confirmation prompt"),
+    no_deps: bool = typer.Option(
+        False, "--no-deps", help="Skip plugin Python dependency installation"
+    ),
+    reinstall_deps: bool = typer.Option(
+        False, "--reinstall-deps", help="Re-run installer for all deps (uv/pip --upgrade)"
+    ),
 ) -> None:
     """Install a plugin from the registry, a GitHub URL, or a local directory."""
     resolver = SourceResolver()
@@ -90,6 +96,8 @@ def cmd_install(
         typer.echo("─── 即将安装 ─────────────────────────────")
         typer.echo(f"来源: {_format_origin(resolved)}")
         typer.echo(summarize_for_install(meta, resolved.path))
+        if no_deps and meta.dependencies:
+            typer.echo("(deps install will be SKIPPED — --no-deps)")
         typer.echo("──────────────────────────────────────────")
         if not yes:
             ok = questionary.confirm("确认安装?", default=False).ask()
@@ -99,7 +107,11 @@ def cmd_install(
 
         db, mgr = _open()
         try:
-            rec = mgr.install(resolved.path)
+            rec = mgr.install(
+                resolved.path,
+                install_deps=not no_deps,
+                reinstall_deps=reinstall_deps,
+            )
         except PluginInstallError as e:
             typer.echo(f"✘ Install failed: {e}")
             raise typer.Exit(2) from e
@@ -235,6 +247,12 @@ def cmd_upgrade(
     ref: str | None = typer.Option(
         None, "--ref", help="Tag / branch / sha (默认 = 该插件最新 release)"
     ),
+    no_deps: bool = typer.Option(
+        False, "--no-deps", help="Skip plugin Python dependency installation"
+    ),
+    reinstall_deps: bool = typer.Option(
+        False, "--reinstall-deps", help="Re-run installer for all deps (uv/pip --upgrade)"
+    ),
 ) -> None:
     """Upgrade an installed plugin.
 
@@ -254,7 +272,11 @@ def cmd_upgrade(
         db, mgr = _open()
         try:
             try:
-                result = mgr.upgrade(resolved.path)
+                result = mgr.upgrade(
+                    resolved.path,
+                    install_deps=not no_deps,
+                    reinstall_deps=reinstall_deps,
+                )
             except PluginNotFoundError as e:
                 try:
                     meta = _load_metadata_yaml(resolved.path / "deeptrade_plugin.yaml")

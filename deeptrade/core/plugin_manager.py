@@ -14,14 +14,23 @@ import sys
 import textwrap
 from collections.abc import Sequence
 from dataclasses import dataclass
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any
 
 import yaml
+from packaging.requirements import InvalidRequirement, Requirement
+from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion, Version
 
 from deeptrade.core import paths
 from deeptrade.core.db import Database
+from deeptrade.core.dep_installer import (
+    DepInstallError,
+    parse_specs,
+    plan_install,
+    run_install,
+)
 from deeptrade.plugins_api.base import Plugin
 from deeptrade.plugins_api.metadata import MigrationSpec, PluginMetadata
 
@@ -190,8 +199,15 @@ class PluginManager:
 
     # --- install -----------------------------------------------------
 
-    def install(self, source_path: Path) -> InstalledPlugin:
-        """Install a plugin from a local directory. Network never touched."""
+    def install(
+        self,
+        source_path: Path,
+        *,
+        install_deps: bool = True,
+        reinstall_deps: bool = False,
+    ) -> InstalledPlugin:
+        """Install a plugin from a local directory. Network never touched
+        by plugin code; framework may run pip/uv if ``install_deps=True``."""
         source_path = source_path.resolve()
         if not source_path.is_dir():
             raise PluginInstallError(f"source path is not a directory: {source_path}")
@@ -232,6 +248,18 @@ class PluginManager:
         if target.exists():
             shutil.rmtree(target)
         shutil.copytree(source_path, target)
+
+        # Resolve & install Python deps BEFORE migrations + entrypoint load.
+        # validate_static imports the plugin module — deps must be importable
+        # by then. On failure, just remove the copied dir; already-installed
+        # deps stay in the env (see design §4.5).
+        if install_deps:
+            try:
+                self._handle_dependencies(meta, reinstall=reinstall_deps)
+            except DepInstallError as e:
+                if target.exists():
+                    shutil.rmtree(target, ignore_errors=True)
+                raise PluginInstallError(str(e)) from e
 
         # Apply migrations + write registries inside ONE transaction.
         try:
@@ -354,7 +382,13 @@ class PluginManager:
 
         return {"purged_tables": dropped, "purge": purge}
 
-    def upgrade(self, source_path: Path) -> InstalledPlugin | UpgradeNoop:
+    def upgrade(
+        self,
+        source_path: Path,
+        *,
+        install_deps: bool = True,
+        reinstall_deps: bool = False,
+    ) -> InstalledPlugin | UpgradeNoop:
         """Upgrade an existing plugin: apply only NEW migrations (S5).
 
         Version semantics (see distribution-and-plugin-install-design.md §7):
@@ -410,6 +444,17 @@ class PluginManager:
         if target.exists():
             shutil.rmtree(target)
         shutil.copytree(source_path, target)
+
+        # Resolve & install plugin deps BEFORE migrations / load. Failure
+        # path mirrors install(): remove the copied dir, leave installed
+        # deps in place (design §4.5).
+        if install_deps:
+            try:
+                self._handle_dependencies(meta, reinstall=reinstall_deps)
+            except DepInstallError as e:
+                if target.exists():
+                    shutil.rmtree(target, ignore_errors=True)
+                raise PluginInstallError(str(e)) from e
 
         # F-M5 — keep a backup of the previous install_path so we can roll back on failure
         prev_install_path = Path(existing.install_path)
@@ -488,6 +533,98 @@ class PluginManager:
             ) from e
 
         return self._compose_record(meta, target, enabled=existing.enabled)
+
+    # --- dep handling ------------------------------------------------
+
+    def _handle_dependencies(self, meta: PluginMetadata, *, reinstall: bool) -> None:
+        """Resolve declared deps, fail loudly on conflict, run installer.
+
+        Pre-conditions: ``meta.dependencies`` already passed Pydantic
+        validation (PEP 508, no URL/VCS, unique names).
+        """
+        if not meta.dependencies:
+            return
+
+        specs = parse_specs(meta.dependencies)
+        ownership = self._build_dep_ownership(exclude_plugin_id=meta.plugin_id)
+
+        def attribute(canonical: str) -> str | None:
+            return ownership.get(canonical)
+
+        plan = plan_install(specs, attribute_conflict=attribute)
+
+        if plan.conflicts:
+            lines = [f"  - {c}" for c in plan.conflicts]
+            raise DepInstallError(
+                "plugin dependency conflicts:\n"
+                + "\n".join(lines)
+                + "\nResolve by uninstalling the conflicting plugin or "
+                + "adjusting this plugin's specifier."
+            )
+
+        targets = specs if reinstall else plan.to_install
+        if plan.skipped and not reinstall:
+            logger.info(
+                "plugin %s: %d dep(s) already satisfied: %s",
+                meta.plugin_id,
+                len(plan.skipped),
+                [f"{r.name}=={v}" for r, v in plan.skipped],
+            )
+        run_install(targets, reinstall=reinstall)
+
+    def _build_dep_ownership(self, *, exclude_plugin_id: str) -> dict[str, str]:
+        """Map canonical package name → human-readable owner attribution.
+
+        Sources, in priority order (first wins):
+          1. Framework's own declared deps (``deeptrade-quant`` distribution).
+          2. Already-installed plugins' declared ``dependencies``
+             (looked up from ``plugins.metadata_yaml``).
+
+        Used only for conflict messages; never gates install decisions.
+        """
+        out: dict[str, str] = {}
+
+        # Framework deps
+        try:
+            dist = importlib_metadata.distribution("deeptrade-quant")
+        except importlib_metadata.PackageNotFoundError:
+            dist = None
+        if dist is not None:
+            for raw in dist.requires or []:
+                try:
+                    req = Requirement(raw)
+                except InvalidRequirement:
+                    continue
+                # Skip extras-only requirements (e.g. dev extras)
+                if req.marker is not None:
+                    try:
+                        if not req.marker.evaluate({"extra": ""}):
+                            continue
+                    except Exception:  # noqa: BLE001 — marker eval edge cases
+                        continue
+                out.setdefault(canonicalize_name(req.name), "framework core dependency")
+
+        # Other plugins
+        try:
+            rows = self._db.fetchall(
+                "SELECT plugin_id, metadata_yaml FROM plugins WHERE plugin_id != ?",
+                (exclude_plugin_id,),
+            )
+        except Exception:  # noqa: BLE001 — DB may be in transitional state
+            rows = []
+        for pid, meta_yaml in rows:
+            try:
+                meta_dict = yaml.safe_load(meta_yaml) or {}
+            except yaml.YAMLError:
+                continue
+            for raw in meta_dict.get("dependencies", []) or []:
+                try:
+                    req = Requirement(raw)
+                except InvalidRequirement:
+                    continue
+                out.setdefault(canonicalize_name(req.name), f"plugin {pid}")
+
+        return out
 
     # --- internal helpers --------------------------------------------
 
@@ -631,16 +768,17 @@ def summarize_for_install(meta: PluginMetadata, source_path: Path) -> str:
     """Render the install confirmation pre-flight summary (CLI only)."""
     lines = textwrap.dedent(
         f"""
-        plugin_id  : {meta.plugin_id}
-        name       : {meta.name}
-        version    : {meta.version}
-        type       : {meta.type}
-        entrypoint : {meta.entrypoint}
-        source     : {source_path}
-        required   : {", ".join(meta.permissions.tushare_apis.required) or "(none)"}
-        optional   : {", ".join(meta.permissions.tushare_apis.optional) or "(none)"}
-        migrations : {", ".join(m.version for m in meta.migrations)}
-        tables ({len(meta.tables)}): {", ".join(t.name for t in meta.tables)}
+        plugin_id    : {meta.plugin_id}
+        name         : {meta.name}
+        version      : {meta.version}
+        type         : {meta.type}
+        entrypoint   : {meta.entrypoint}
+        source       : {source_path}
+        required     : {", ".join(meta.permissions.tushare_apis.required) or "(none)"}
+        optional     : {", ".join(meta.permissions.tushare_apis.optional) or "(none)"}
+        migrations   : {", ".join(m.version for m in meta.migrations)}
+        tables ({len(meta.tables)})   : {", ".join(t.name for t in meta.tables)}
+        dependencies : {", ".join(meta.dependencies) or "(none)"}
         """
     ).strip()
     return lines
