@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import json
 import logging
 import shutil
 import sys
@@ -32,7 +33,11 @@ from deeptrade.core.dep_installer import (
     run_install,
 )
 from deeptrade.plugins_api.base import Plugin
-from deeptrade.plugins_api.metadata import MigrationSpec, PluginMetadata
+from deeptrade.plugins_api.metadata import (
+    RESERVED_TABLE_NAMES,
+    MigrationSpec,
+    PluginMetadata,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +139,20 @@ def _load_entrypoint(
 
     When ``metadata`` is supplied, it is set on the resulting instance so
     plugins can read ``self.metadata`` at runtime.
+
+    v0.5 guards:
+
+    * T07 — capture ``sys.modules["deeptrade"]``'s identity before the
+      import and refuse the install if the plugin's import somehow
+      replaced the framework module object. The metadata-time T04 check
+      already blocks the obvious case (entrypoint top package =
+      ``deeptrade``); this is the runtime backstop for indirect shadowing
+      (e.g. a plugin file that performs its own ``sys.path`` manipulation
+      or imports a sibling ``deeptrade.py``).
+    * T08 — verify the loaded instance satisfies the
+      :class:`~deeptrade.plugins_api.base.Plugin` runtime-checkable
+      Protocol before returning. Without this, a class missing
+      ``dispatch`` only fails much later at first invocation.
     """
     module_path, _, class_name = entrypoint.partition(":")
     if not module_path or not class_name:
@@ -148,6 +167,13 @@ def _load_entrypoint(
         # Try single-file leaf (rare, but supported)
         if not (install_path / (module_path.replace(".", "/") + ".py")).is_file():
             raise PluginInstallError(f"cannot locate module {module_path!r} under {install_path}")
+
+    # T07: snapshot the framework module so we can detect (and undo)
+    # accidental shadowing. ``__file__`` is on every regular Python module;
+    # using it as the comparison key is cheap and immune to a plugin that
+    # re-registers a different object under the same name.
+    framework_mod = sys.modules.get("deeptrade")
+    framework_file = getattr(framework_mod, "__file__", None)
 
     # Evict any cached copy of this plugin's top package so install_path is used
     for cached in [m for m in sys.modules if m == top_pkg_name or m.startswith(top_pkg_name + ".")]:
@@ -164,13 +190,37 @@ def _load_entrypoint(
         if install_str in sys.path:
             sys.path.remove(install_str)
 
+    # T07 check: if the framework module was replaced during import, restore
+    # it and reject the plugin. We cannot continue safely — every subsequent
+    # `from deeptrade.x import y` would resolve against the plugin's tree.
+    post_framework_mod = sys.modules.get("deeptrade")
+    post_framework_file = getattr(post_framework_mod, "__file__", None)
+    if framework_mod is not None and (
+        post_framework_mod is not framework_mod or post_framework_file != framework_file
+    ):
+        sys.modules["deeptrade"] = framework_mod
+        raise PluginInstallError(
+            f"plugin entrypoint {entrypoint!r} replaced the framework "
+            f"'deeptrade' module on import (was {framework_file!r}, "
+            f"became {post_framework_file!r}); refusing to continue"
+        )
+
     if not hasattr(module, class_name):
         raise PluginInstallError(f"{module_path} has no class {class_name}")
     plugin_cls = getattr(module, class_name)
     instance = plugin_cls()
     if metadata is not None:
         instance.metadata = metadata
-    return instance  # type: ignore[no-any-return]
+
+    # T08: verify the plugin contract. Plugin Protocol is @runtime_checkable
+    # so this is a structural check (validate_static + dispatch + metadata
+    # attribute present), not nominal inheritance.
+    if not isinstance(instance, Plugin):
+        raise PluginInstallError(
+            f"entrypoint {entrypoint!r} class {class_name!r} does not implement "
+            f"the Plugin protocol (must define metadata, validate_static, dispatch)"
+        )
+    return instance
 
 
 def _build_validate_ctx(db: Database, meta: PluginMetadata) -> Any:
@@ -264,7 +314,7 @@ class PluginManager:
         # Apply migrations + write registries inside ONE transaction.
         try:
             with self._db.transaction():
-                applied = self._apply_migrations(meta.plugin_id, mig_sql)
+                applied = self._apply_migrations(meta.plugin_id, meta, mig_sql)
                 self._record_plugin(meta, target)
                 self._record_tables(meta)
                 self._record_migrations(meta.plugin_id, applied)
@@ -285,8 +335,12 @@ class PluginManager:
         # Failure → roll back DB rows + remove install copy + raise.
         try:
             instance = _load_entrypoint(target, meta.entrypoint, meta)
-            if hasattr(instance, "validate_static"):
-                instance.validate_static(_build_validate_ctx(self._db, meta))
+            # T08: ``_load_entrypoint`` already verified the Plugin protocol,
+            # so validate_static is guaranteed callable; the explicit nil
+            # check is defense in depth against runtime monkey-patching.
+            validate = getattr(instance, "validate_static", None)
+            if validate is not None:
+                validate(_build_validate_ctx(self._db, meta))
         except Exception as e:
             # Roll back: drop the just-installed plugin tables + delete registry rows + remove copy
             self._rollback_install(meta, target)
@@ -357,20 +411,7 @@ class PluginManager:
 
         dropped: list[str] = []
         if purge:
-            tables = self._db.fetchall(
-                "SELECT table_name, purge_on_uninstall FROM plugin_tables WHERE plugin_id = ?",
-                (plugin_id,),
-            )
-            with self._db.transaction():
-                for tname, purge_flag in tables:
-                    if purge_flag:
-                        self._db.execute(f"DROP TABLE IF EXISTS {tname}")  # noqa: S608 — name validated by Pydantic regex
-                        dropped.append(tname)
-                self._db.execute("DELETE FROM plugin_tables WHERE plugin_id = ?", (plugin_id,))
-                self._db.execute(
-                    "DELETE FROM plugin_schema_migrations WHERE plugin_id = ?", (plugin_id,)
-                )
-                self._db.execute("DELETE FROM plugins WHERE plugin_id = ?", (plugin_id,))
+            dropped = self._purge_plugin_tables(plugin_id)
         else:
             # default: just disable + remove the install copy
             self._db.execute("UPDATE plugins SET enabled = FALSE WHERE plugin_id = ?", (plugin_id,))
@@ -381,6 +422,87 @@ class PluginManager:
             shutil.rmtree(install_path, ignore_errors=True)
 
         return {"purged_tables": dropped, "purge": purge}
+
+    def _purge_plugin_tables(self, plugin_id: str) -> list[str]:
+        """Drop the plugin's tables + delete its registry rows (T06).
+
+        Defense in depth on top of T01 (metadata-time guard) and T05
+        (migration-time guard):
+
+        * If ``plugin_schema_migrations.affected_tables`` is populated for
+          every migration row, the union of those lists is the authoritative
+          set of tables this plugin created — intersect with ``plugin_tables``
+          honoring ``purge_on_uninstall=False`` declarations.
+        * If any row has ``affected_tables IS NULL`` (legacy v0.4 install),
+          fall back to ``plugin_tables`` only — we can't trust an
+          incomplete migration record.
+        * In either case, refuse to DROP anything in
+          :data:`RESERVED_TABLE_NAMES`. This catches corrupted DB state
+          (a row manually INSERTed into ``plugin_tables`` claiming a
+          framework table) that bypassed earlier guards.
+        """
+        mig_rows = self._db.fetchall(
+            "SELECT affected_tables FROM plugin_schema_migrations WHERE plugin_id = ?",
+            (plugin_id,),
+        )
+        has_null = any(r[0] is None for r in mig_rows) or not mig_rows
+        recorded: set[str] = set()
+        for (affected_json,) in mig_rows:
+            if affected_json is None:
+                continue
+            try:
+                names = json.loads(affected_json)
+            except json.JSONDecodeError:
+                logger.warning(
+                    "plugin %s: malformed affected_tables JSON %r; "
+                    "falling back to plugin_tables for purge",
+                    plugin_id,
+                    affected_json,
+                )
+                has_null = True
+                continue
+            if not isinstance(names, list):
+                has_null = True
+                continue
+            recorded.update(str(n) for n in names)
+
+        purge_flags: dict[str, bool] = {
+            r[0]: bool(r[1])
+            for r in self._db.fetchall(
+                "SELECT table_name, purge_on_uninstall FROM plugin_tables WHERE plugin_id = ?",
+                (plugin_id,),
+            )
+        }
+
+        if has_null:
+            # Legacy fallback: drop every table_name in plugin_tables that
+            # asked to be purged on uninstall.
+            candidates = {t for t, p in purge_flags.items() if p}
+        else:
+            # Trust the framework-captured record. Intersect with
+            # plugin_tables so purge_on_uninstall=False is still honored.
+            opt_in = {t for t, p in purge_flags.items() if p}
+            candidates = recorded & opt_in
+
+        dropped: list[str] = []
+        with self._db.transaction():
+            for tname in sorted(candidates):
+                if tname in RESERVED_TABLE_NAMES:
+                    logger.error(
+                        "refusing to DROP framework-reserved table %r during "
+                        "purge of plugin %r (corrupted plugin_tables row?)",
+                        tname,
+                        plugin_id,
+                    )
+                    continue
+                self._db.execute(f"DROP TABLE IF EXISTS {tname}")  # noqa: S608 — name validated upstream
+                dropped.append(tname)
+            self._db.execute("DELETE FROM plugin_tables WHERE plugin_id = ?", (plugin_id,))
+            self._db.execute(
+                "DELETE FROM plugin_schema_migrations WHERE plugin_id = ?", (plugin_id,)
+            )
+            self._db.execute("DELETE FROM plugins WHERE plugin_id = ?", (plugin_id,))
+        return dropped
 
     def upgrade(
         self,
@@ -425,16 +547,33 @@ class PluginManager:
             raise PluginInstallError("permissions.llm_tools=true is forbidden")
 
         # Decide which migrations are new
-        applied_versions = {
-            row[0]
+        applied_checksums: dict[str, str] = {
+            row[0]: row[1]
             for row in self._db.fetchall(
-                "SELECT version FROM plugin_schema_migrations WHERE plugin_id = ?",
+                "SELECT version, checksum FROM plugin_schema_migrations WHERE plugin_id = ?",
                 (meta.plugin_id,),
             )
         }
+
+        # T09 — every migration the plugin claims is *already applied* must
+        # still carry the same checksum it carried at install time. A
+        # silently-edited historical migration is treated as evidence the
+        # plugin source has been tampered with: the on-disk schema reflects
+        # the OLD migration body but the YAML now says the NEW body is what
+        # was applied, so future upgrades / purges will reason about the
+        # wrong state. Refuse the upgrade immediately.
+        for mig in meta.migrations:
+            stored = applied_checksums.get(mig.version)
+            if stored is not None and stored != mig.checksum:
+                raise PluginInstallError(
+                    f"plugin {meta.plugin_id!r} migration {mig.version} "
+                    f"checksum changed from {stored} to {mig.checksum}; "
+                    f"refusing to upgrade — historical migrations are immutable"
+                )
+
         new_migrations: list[tuple[MigrationSpec, str]] = []
         for mig in meta.migrations:
-            if mig.version in applied_versions:
+            if mig.version in applied_checksums:
                 continue
             sql_text = _verify_migration_checksum(source_path, mig)
             new_migrations.append((mig, sql_text))
@@ -465,8 +604,8 @@ class PluginManager:
         try:
             with self._db.transaction():
                 if new_migrations:
-                    self._apply_migrations(meta.plugin_id, new_migrations)
-                    self._record_migrations(meta.plugin_id, new_migrations)
+                    applied = self._apply_migrations(meta.plugin_id, meta, new_migrations)
+                    self._record_migrations(meta.plugin_id, applied)
                 # update the plugins row
                 self._db.execute(
                     "UPDATE plugins SET name=?, version=?, type=?, api_version=?, entrypoint=?, "
@@ -502,8 +641,9 @@ class PluginManager:
         # plugin code). Failure → roll back the plugins row to the previous version.
         try:
             instance = _load_entrypoint(target, meta.entrypoint, meta)
-            if hasattr(instance, "validate_static"):
-                instance.validate_static(_build_validate_ctx(self._db, meta))
+            validate = getattr(instance, "validate_static", None)
+            if validate is not None:
+                validate(_build_validate_ctx(self._db, meta))
         except Exception as e:
             # Roll back the plugins row to the prior version (install_path,
             # metadata_yaml, version, entrypoint). Do NOT touch migrations: the
@@ -629,52 +769,79 @@ class PluginManager:
     # --- internal helpers --------------------------------------------
 
     def _apply_migrations(
-        self, plugin_id: str, migs: Sequence[tuple[MigrationSpec, str]]
-    ) -> list[tuple[MigrationSpec, str]]:
-        """Run each SQL inside the calling transaction. Caller wraps in transaction."""
-        for _mig, sql in migs:
-            # split on ';' is not safe for some DDL but DuckDB supports executing
-            # multi-statement strings via ``execute`` with ``;``-separated bodies.
-            for stmt in self._iter_statements(sql):
-                if stmt.strip():
-                    self._db.execute(stmt)
-        return list(migs)
+        self,
+        plugin_id: str,
+        meta: PluginMetadata,
+        migs: Sequence[tuple[MigrationSpec, str]],
+    ) -> list[tuple[MigrationSpec, list[str]]]:
+        """Run each SQL inside the calling transaction with a per-migration
+        schema-diff (v0.5 T05).
 
-    @staticmethod
-    def _iter_statements(sql: str) -> list[str]:
-        """Split SQL on top-level semicolons. Handles -- comments and quoted strings."""
-        stmts: list[str] = []
-        buf: list[str] = []
-        in_single = False
-        in_double = False
-        i = 0
-        n = len(sql)
-        while i < n:
-            ch = sql[i]
-            # line comment
-            if not in_single and not in_double and ch == "-" and i + 1 < n and sql[i + 1] == "-":
-                # consume to end of line
-                eol = sql.find("\n", i)
-                if eol == -1:
-                    eol = n
-                # don't include comment text in buffer
-                i = eol
-                continue
-            if ch == "'" and not in_double:
-                in_single = not in_single
-            elif ch == '"' and not in_single:
-                in_double = not in_double
-            if ch == ";" and not in_single and not in_double:
-                stmts.append("".join(buf))
-                buf = []
-            else:
-                buf.append(ch)
-            i += 1
-        if buf:
-            tail = "".join(buf).strip()
-            if tail:
-                stmts.append(tail)
-        return [s.strip() for s in stmts if s.strip()]
+        For each migration:
+
+        * Snapshot ``information_schema.tables`` ``before`` and ``after``.
+        * Reject if any newly-created table is not listed in
+          ``meta.tables`` — plugins cannot introduce undeclared tables.
+        * Reject if any dropped table is in :data:`RESERVED_TABLE_NAMES` —
+          plugins cannot drop framework tables even if they sneak past the
+          metadata-time guard (T01).
+        * Reject if any dropped table is not currently recorded as owned
+          by this plugin in ``plugin_tables`` — plugins cannot drop tables
+          owned by *other* plugins.
+
+        Returns ``[(mig, sorted_added_tables), ...]`` so the caller can
+        record the diff to ``plugin_schema_migrations.affected_tables``.
+        Caller must wrap the call in a DB transaction so a rejected
+        migration rolls back the partial SQL.
+        """
+        declared = {t.name for t in meta.tables}
+        out: list[tuple[MigrationSpec, list[str]]] = []
+        for mig, sql in migs:
+            before = self._current_table_names()
+            self._db.execute(sql)
+            after = self._current_table_names()
+            added = after - before
+            removed = before - after
+
+            undeclared = added - declared
+            if undeclared:
+                raise PluginInstallError(
+                    f"migration {mig.version} created table(s) not declared in "
+                    f"metadata.tables: {sorted(undeclared)}"
+                )
+
+            reserved_hit = removed & RESERVED_TABLE_NAMES
+            if reserved_hit:
+                raise PluginInstallError(
+                    f"migration {mig.version} attempted to DROP framework-reserved "
+                    f"table(s): {sorted(reserved_hit)}"
+                )
+
+            if removed:
+                owned = {
+                    r[0]
+                    for r in self._db.fetchall(
+                        "SELECT table_name FROM plugin_tables WHERE plugin_id = ?",
+                        (plugin_id,),
+                    )
+                }
+                foreign = removed - owned
+                if foreign:
+                    raise PluginInstallError(
+                        f"migration {mig.version} attempted to DROP table(s) not "
+                        f"owned by this plugin: {sorted(foreign)}"
+                    )
+
+            out.append((mig, sorted(added)))
+        return out
+
+    def _current_table_names(self) -> set[str]:
+        return {
+            r[0]
+            for r in self._db.fetchall(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema='main'"
+            )
+        }
 
     def _record_plugin(self, meta: PluginMetadata, install_path: Path) -> None:
         self._db.execute(
@@ -705,12 +872,23 @@ class PluginManager:
                 (meta.plugin_id, t.name, t.description, t.purge_on_uninstall),
             )
 
-    def _record_migrations(self, plugin_id: str, migs: Sequence[tuple[MigrationSpec, str]]) -> None:
-        for mig, _ in migs:
+    def _record_migrations(
+        self,
+        plugin_id: str,
+        migs: Sequence[tuple[MigrationSpec, list[str]]],
+    ) -> None:
+        """Write a row per migration to ``plugin_schema_migrations``,
+        including the JSON-serialized list of tables the migration created
+        (v0.5 T05). ``affected_tables`` is set to ``NULL`` when the migration
+        produced no new tables, so we can distinguish "nothing created" from
+        "unknown (pre-v0.5 row)" — the latter is also NULL but originates
+        from an older code path; downstream callers treat both alike."""
+        for mig, affected in migs:
+            affected_json: str | None = json.dumps(affected) if affected else None
             self._db.execute(
-                "INSERT INTO plugin_schema_migrations(plugin_id, version, checksum) "
-                "VALUES (?, ?, ?)",
-                (plugin_id, mig.version, mig.checksum),
+                "INSERT INTO plugin_schema_migrations(plugin_id, version, checksum, "
+                "affected_tables) VALUES (?, ?, ?, ?)",
+                (plugin_id, mig.version, mig.checksum, affected_json),
             )
 
     def _missing_declared_tables(self, meta: PluginMetadata) -> set[str]:
@@ -769,16 +947,16 @@ def summarize_for_install(meta: PluginMetadata, source_path: Path) -> str:
     lines = textwrap.dedent(
         f"""
         plugin_id    : {meta.plugin_id}
-        name         : {meta.name}
-        version      : {meta.version}
-        type         : {meta.type}
+        名称         : {meta.name}
+        版本         : {meta.version}
+        类型         : {meta.type}
         entrypoint   : {meta.entrypoint}
-        source       : {source_path}
-        required     : {", ".join(meta.permissions.tushare_apis.required) or "(none)"}
-        optional     : {", ".join(meta.permissions.tushare_apis.optional) or "(none)"}
-        migrations   : {", ".join(m.version for m in meta.migrations)}
-        tables ({len(meta.tables)})   : {", ".join(t.name for t in meta.tables)}
-        dependencies : {", ".join(meta.dependencies) or "(none)"}
+        来源         : {source_path}
+        必要 API     : {", ".join(meta.permissions.tushare_apis.required) or "（无）"}
+        可选 API     : {", ".join(meta.permissions.tushare_apis.optional) or "（无）"}
+        迁移         : {", ".join(m.version for m in meta.migrations)}
+        声明表 ({len(meta.tables)})  : {", ".join(t.name for t in meta.tables)}
+        依赖         : {", ".join(meta.dependencies) or "（无）"}
         """
     ).strip()
     return lines

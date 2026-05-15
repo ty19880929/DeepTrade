@@ -13,7 +13,7 @@ The returned :class:`ResolvedSource` has ``path`` pointing to a local directory
 containing ``deeptrade_plugin.yaml``. For GitHub sources, ``cleanup()`` removes
 the temporary extraction directory.
 
-See ``docs/distribution-and-plugin-install-design.md`` §4.2 + §6.3.
+See ``CHANGELOG.md`` v0.3 entries for the distribution / install design context.
 """
 
 from __future__ import annotations

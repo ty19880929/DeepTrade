@@ -28,7 +28,7 @@ from deeptrade.core.db import Database
 if TYPE_CHECKING:  # pragma: no cover
     pass
 
-app = typer.Typer(help="View / edit configuration", no_args_is_help=True)
+app = typer.Typer(help="查看 / 编辑配置", no_args_is_help=True)
 
 
 # ---------------------------------------------------------------------------
@@ -49,18 +49,30 @@ def _open_service() -> tuple[Database, ConfigService]:
 
 @app.command("show")
 def cmd_show() -> None:
-    """List all known config keys with values (secrets masked) and source."""
+    """显示所有已知配置项的值（secret 已掩码）与来源。"""
     db, svc = _open_service()
     try:
         console = Console()
-        table = Table(title="DeepTrade Configuration")
-        table.add_column("Key", style="cyan")
-        table.add_column("Value", overflow="fold")
-        table.add_column("Source", style="yellow")
+        table = Table(title="DeepTrade 配置")
+        table.add_column("配置项", style="cyan")
+        table.add_column("值", overflow="fold")
+        table.add_column("来源", style="yellow")
         for key, value, source in svc.list_all():
             display = "" if value is None else str(value)
             table.add_row(key, display, source)
         console.print(table)
+
+        # T13 — surface plaintext-stored secrets right after the table so
+        # users on hosts without an OS keyring (CI containers, headless
+        # Linux, broken `keyring` backend) know their api keys live in the
+        # DuckDB file unencrypted.
+        plaintext_count = svc.count_plaintext_secrets()
+        if plaintext_count > 0:
+            console.print(
+                f"[yellow]⚠ {plaintext_count} 个 secret 以明文存储"
+                f"（当前主机的 OS keyring 不可用）。"
+                f"任何能读取 DuckDB 文件的人都能读到这些密钥。[/yellow]"
+            )
     finally:
         db.close()
 
@@ -72,47 +84,46 @@ def cmd_show() -> None:
 
 @app.command("set")
 def cmd_set(
-    key: str = typer.Argument(..., help="Dotted key (e.g. `app.profile`)"),
-    value: str = typer.Argument(..., help="Value (string-coerced)"),
+    key: str = typer.Argument(..., help="点分键名（如 `app.profile`）"),
+    value: str = typer.Argument(..., help="值（字符串自动转型）"),
 ) -> None:
-    """Set a single config key to a value (scriptable form).
+    """设置单个配置项的值（脚本友好的非交互形式）。
 
-    For multi-provider LLM keys (``llm.<name>.*``), prefer
-    ``deeptrade config set-llm`` — it walks you through the full provider
-    record interactively.
+    对于多 provider 的 LLM 键（``llm.<name>.*``），建议改用
+    ``deeptrade config set-llm``——它会交互式地引导完整的 provider 配置。
     """
     db, svc = _open_service()
     try:
         from deeptrade.core.config import is_secret_key  # noqa: PLC0415
 
         if key not in known_keys() and not is_secret_key(key):
-            typer.echo(f"Unknown key: {key!r}; valid keys:\n  " + "\n  ".join(known_keys()))
+            typer.echo(f"未知 key: {key!r}；可用 key 列表：\n  " + "\n  ".join(known_keys()))
             raise typer.Exit(2)
         try:
             svc.set(key, value)
         except ValueError as e:
-            typer.echo(f"Invalid value for {key!r}: {e}")
+            typer.echo(f"{key!r} 的值非法：{e}")
             raise typer.Exit(2) from e
-        typer.echo(f"✔ Saved {key}")
+        typer.echo(f"✔ 已保存：{key}")
     finally:
         db.close()
 
 
 @app.command("set-tushare")
 def cmd_set_tushare() -> None:
-    """Interactive Tushare configuration."""
+    """交互式配置 Tushare。"""
     db, svc = _open_service()
     try:
         cur = svc.get_app_config()
-        token = questionary.password("Tushare token:").ask()
+        token = questionary.password("Tushare token：").ask()
         if token is None:
             raise typer.Exit(1)
         rps_input = questionary.text(
-            f"Tushare RPS [{cur.tushare_rps}]:",
+            f"Tushare RPS [{cur.tushare_rps}]：",
             default=str(cur.tushare_rps),
         ).ask()
         timeout_input = questionary.text(
-            f"Tushare timeout (s) [{cur.tushare_timeout}]:",
+            f"Tushare 超时秒数 [{cur.tushare_timeout}]：",
             default=str(cur.tushare_timeout),
         ).ask()
         if token:
@@ -121,9 +132,9 @@ def cmd_set_tushare() -> None:
             svc.set("tushare.rps", float(rps_input))
             svc.set("tushare.timeout", int(timeout_input))
         except (ValueError, TypeError) as e:
-            typer.echo(f"Invalid number: {e}")
+            typer.echo(f"数字解析失败：{e}")
             raise typer.Exit(2) from e
-        typer.echo("✔ Saved tushare config")
+        typer.echo("✔ 已保存 Tushare 配置")
     finally:
         db.close()
 
@@ -143,7 +154,7 @@ _DEFAULT_BASE_URLS: dict[str, str] = {
 
 @app.command("set-llm")
 def cmd_set_llm() -> None:
-    """Interactive LLM provider management (new / edit / delete).
+    """交互式管理 LLM provider（新增 / 编辑 / 删除）。
 
     Walks the user through the full provider record (name + api_key +
     base_url + model + timeout). Each provider stored in ``llm.providers``
@@ -156,12 +167,8 @@ def cmd_set_llm() -> None:
         existing = sorted(cfg.llm_providers.keys())
 
         if existing:
-            choices = (
-                ["[+] Add new provider"]
-                + [f"[~] {n}" for n in existing]
-                + ["[x] Delete a provider"]
-            )
-            picked = questionary.select("Pick action:", choices=choices).ask()
+            choices = ["[+] 新增 provider"] + [f"[~] {n}" for n in existing] + ["[x] 删除 provider"]
+            picked = questionary.select("选择操作：", choices=choices).ask()
             if picked is None:
                 raise typer.Exit(1)
             if picked.startswith("[+]"):
@@ -172,23 +179,23 @@ def cmd_set_llm() -> None:
                 name = picked[4:]  # strip "[~] "
                 _set_llm_edit(svc, name)
         else:
-            typer.echo("No LLM providers configured yet — let's add the first one.")
+            typer.echo("尚未配置任何 LLM provider —— 开始添加第一个。")
             _set_llm_new(svc)
     finally:
         db.close()
 
 
 def _set_llm_new(svc: ConfigService) -> None:
-    name = questionary.text("Provider name (e.g. deepseek, qwen-plus, kimi):").ask()
+    name = questionary.text("Provider 名称（如 deepseek、qwen-plus、kimi）：").ask()
     if not name:
         raise typer.Exit(1)
     name = name.strip()
     if "." in name:
-        typer.echo(f"Invalid provider name: {name!r} (must not contain '.')")
+        typer.echo(f"非法的 provider 名称：{name!r}（不可包含 '.'）")
         raise typer.Exit(2)
     cfg = svc.get_app_config()
     if name in cfg.llm_providers:
-        typer.echo(f"Provider {name!r} already exists; pick edit instead.")
+        typer.echo(f"Provider {name!r} 已存在；请选择编辑模式。")
         raise typer.Exit(2)
     default_base = _DEFAULT_BASE_URLS.get(name.split("-")[0], "")
     # Adding into an empty dict auto-promotes to default; offer the choice
@@ -197,7 +204,7 @@ def _set_llm_new(svc: ConfigService) -> None:
     if cfg.llm_providers:
         promote_default = bool(
             questionary.confirm(
-                f"Set {name!r} as the default LLM provider?",
+                f"将 {name!r} 设为默认 LLM provider？",
                 default=False,
             ).ask()
         )
@@ -235,19 +242,19 @@ def _prompt_and_save_provider(
     timeout_default = defaults.get("timeout", 180) if defaults else 180
 
     base_url = questionary.text(
-        f"Base URL [{base_url_default}]:",
+        f"Base URL [{base_url_default}]：",
         default=base_url_default,
     ).ask()
     if not base_url:
         raise typer.Exit(1)
     model = questionary.text(
-        f"Model name [{model_default}]:",
+        f"模型名称 [{model_default}]：",
         default=model_default,
     ).ask()
     if not model:
         raise typer.Exit(1)
     timeout_input = questionary.text(
-        f"Timeout (s) [{timeout_default}]:",
+        f"超时秒数 [{timeout_default}]：",
         default=str(timeout_default),
     ).ask()
     if timeout_input is None:
@@ -255,12 +262,10 @@ def _prompt_and_save_provider(
     try:
         timeout = int(timeout_input)
     except ValueError as e:
-        typer.echo(f"Invalid timeout: {e}")
+        typer.echo(f"超时数值非法：{e}")
         raise typer.Exit(2) from e
 
-    api_key_prompt = (
-        "API key (leave empty to keep existing):" if defaults is not None else "API key:"
-    )
+    api_key_prompt = "API key（留空保留现有）：" if defaults is not None else "API key："
     api_key = questionary.password(api_key_prompt).ask()
     if api_key is None:
         raise typer.Exit(1)
@@ -275,40 +280,40 @@ def _prompt_and_save_provider(
             is_default=is_default,
         )
     except ValueError as e:
-        typer.echo(f"Invalid provider: {e}")
+        typer.echo(f"Provider 配置非法：{e}")
         raise typer.Exit(2) from e
 
     if defaults is None and not api_key:
         typer.echo(
-            f"⚠ Saved provider {name!r} but no api_key was set — it won't appear "
-            "in `list-llm` until you run set-llm again to add the key."
+            f"⚠ 已保存 provider {name!r} 但未配置 api_key —— "
+            "在你重新执行 set-llm 补齐 key 前，`list-llm` 不会显示该 provider。"
         )
     else:
-        typer.echo(f"✔ Saved LLM provider {name!r}")
+        typer.echo(f"✔ 已保存 LLM provider {name!r}")
 
 
 def _set_llm_delete(svc: ConfigService, existing: list[str]) -> None:
-    name = questionary.select("Pick provider to delete:", choices=existing).ask()
+    name = questionary.select("选择要删除的 provider：", choices=existing).ask()
     if name is None:
         raise typer.Exit(1)
     confirm = questionary.confirm(
-        f"Delete provider {name!r} (and its api_key)?", default=False
+        f"确认删除 provider {name!r}（连同其 api_key）？", default=False
     ).ask()
     if not confirm:
         raise typer.Exit(1)
     prior_default = svc.get_default_llm_provider()
     svc.delete_llm_provider(name)
-    typer.echo(f"✔ Deleted LLM provider {name!r}")
+    typer.echo(f"✔ 已删除 LLM provider {name!r}")
     new_default = svc.get_default_llm_provider()
     if prior_default == name and new_default is not None:
-        typer.echo(f"✔ Default LLM provider auto-switched to {new_default!r}")
+        typer.echo(f"✔ 默认 LLM provider 已自动切换为 {new_default!r}")
 
 
 @app.command("set-default-llm")
 def cmd_set_default_llm(
-    name: str = typer.Argument(..., help="Provider name to mark as default."),
+    name: str = typer.Argument(..., help="要设为默认的 provider 名称"),
 ) -> None:
-    """Mark ``name`` as the default LLM provider.
+    """将 ``name`` 标记为默认 LLM provider。
 
     The default is consumed by ``LLMManager.get_client()`` when callers
     don't name a provider (non-debate plugin path). Switching default
@@ -321,12 +326,12 @@ def cmd_set_default_llm(
         provider = cfg.llm_providers.get(name)
         if provider is None:
             typer.echo(
-                f"Unknown LLM provider: {name!r}; configured providers: "
-                + (", ".join(sorted(cfg.llm_providers.keys())) or "(none)")
+                f"未知 LLM provider：{name!r}；已配置的 providers："
+                + (", ".join(sorted(cfg.llm_providers.keys())) or "（无）")
             )
             raise typer.Exit(2)
         if provider.is_default:
-            typer.echo(f"{name!r} is already the default LLM provider")
+            typer.echo(f"{name!r} 已是默认 LLM provider")
             return
         svc.set_llm_provider(
             name,
@@ -335,14 +340,14 @@ def cmd_set_default_llm(
             timeout=provider.timeout,
             is_default=True,
         )
-        typer.echo(f"✔ Default LLM provider set to {name!r}")
+        typer.echo(f"✔ 默认 LLM provider 已设为 {name!r}")
     finally:
         db.close()
 
 
 @app.command("list-llm")
 def cmd_list_llm() -> None:
-    """List all configured LLM providers (those with ``api_key`` set).
+    """列出所有已配置的 LLM provider（仅含 ``api_key`` 已设置的项）。
 
     Mirrors ``LLMManager.list_providers()`` — what plugins will see.
     """
@@ -355,13 +360,13 @@ def cmd_list_llm() -> None:
         mgr = LLMManager(db, cfg)
         names = mgr.list_providers()
         if not names:
-            typer.echo("(no LLM providers configured; run `deeptrade config set-llm`)")
+            typer.echo("（未配置任何 LLM provider；可执行 `deeptrade config set-llm`）")
             return
 
         console = Console()
         table = Table(title="LLM Providers")
-        table.add_column("Name", style="cyan")
-        table.add_column("Model", overflow="fold")
+        table.add_column("名称", style="cyan")
+        table.add_column("模型", overflow="fold")
         table.add_column("Base URL", overflow="fold")
         for name in names:
             info = mgr.get_provider_info(name)
@@ -380,10 +385,10 @@ def cmd_list_llm() -> None:
 def cmd_test_llm(
     name: str | None = typer.Argument(
         None,
-        help="Provider name to test; omit to test every configured provider.",
+        help="要测试的 provider 名称；留空则测试每个已配置的 provider。",
     ),
 ) -> None:
-    """Connectivity check via the production ``LLMClient`` for one or all providers.
+    """对单个或全部已配置 provider 做基于生产 ``LLMClient`` 的连通性探测。
 
     Each test sends a tiny JSON-mode echo through the cheapest stage profile
     (``final_ranking``) so the no-tools / JSON-mode constraints are exercised.
@@ -401,7 +406,7 @@ def cmd_test_llm(
         else:
             targets = mgr.list_providers()
             if not targets:
-                typer.echo("(no LLM providers configured; run `deeptrade config set-llm`)")
+                typer.echo("（未配置任何 LLM provider；可执行 `deeptrade config set-llm`）")
                 raise typer.Exit(1)
 
         any_failed = False

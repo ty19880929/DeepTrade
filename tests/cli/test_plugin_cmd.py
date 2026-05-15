@@ -56,7 +56,11 @@ def _make_plugin_dir(base: Path, plugin_id: str, version: str) -> Path:
     mig_dir = src / "migrations"
     mig_dir.mkdir(exist_ok=True)
     table_name = f"{pkg_name}_t"
-    sql = f"-- v{version}\nCREATE TABLE IF NOT EXISTS {table_name} (id INTEGER);\n"
+    # Version-independent body so the same migration version keeps a stable
+    # checksum across plugin-version bumps (T09 refuses checksum mutation
+    # on historical migrations; the right pattern is to add a new migration
+    # file, not edit an existing one).
+    sql = f"CREATE TABLE IF NOT EXISTS {table_name} (id INTEGER);\n"
     (mig_dir / "20260501_001_init.sql").write_text(sql)
     checksum = "sha256:" + hashlib.sha256(sql.encode()).hexdigest()
     (src / "deeptrade_plugin.yaml").write_text(
@@ -178,7 +182,7 @@ def test_upgrade_higher_version_exit_0(home: Path) -> None:
     new_src = _make_plugin_dir(home, "vplug", "0.2.0")
     result = runner.invoke(app, ["plugin", "upgrade", str(new_src)])
     assert result.exit_code == 0, result.output
-    assert "✔ upgraded: vplug → v0.2.0" in result.output
+    assert "✔ 已升级: vplug → v0.2.0" in result.output
 
 
 def test_upgrade_same_version_exits_0_with_already_latest_message(home: Path) -> None:
@@ -271,7 +275,7 @@ def test_search_no_match_message(home: Path) -> None:
     with patch("deeptrade.cli_plugin.RegistryClient", return_value=fake_client):
         result = runner.invoke(app, ["plugin", "search", "zzz"])
     assert result.exit_code == 0
-    assert "no plugins matched" in result.output
+    assert "未匹配到任何插件" in result.output
 
 
 def test_search_no_cache_forces_fetch(home: Path) -> None:
@@ -323,3 +327,40 @@ def test_info_unknown_exits_2(home: Path) -> None:
         result = runner.invoke(app, ["plugin", "info", "ghost"])
     assert result.exit_code == 2
     assert "既未安装" in result.output
+
+
+# ---------------------------------------------------------------------------
+# enable
+# ---------------------------------------------------------------------------
+
+
+def test_enable_missing_install_path_message(home: Path) -> None:
+    """T24 — `deeptrade plugin enable <pid>` must surface the manager's
+    install_path-missing guidance rather than crashing with a raw
+    PluginInstallError traceback.
+
+    Repro: install a plugin, disable it, manually remove the install copy
+    (simulating the state left by an older uninstall flow that wiped files
+    but not the plugins row), then try to re-enable. The CLI should exit 2
+    with a hint to reinstall — never enable the half-broken plugin only to
+    have it crash on first invocation."""
+    import shutil
+
+    src = _make_plugin_dir(home, "broken-plug", "0.1.0")
+    install_result = runner.invoke(app, ["plugin", "install", str(src), "-y"])
+    assert install_result.exit_code == 0, install_result.output
+
+    disable_result = runner.invoke(app, ["plugin", "disable", "broken-plug"])
+    assert disable_result.exit_code == 0, disable_result.output
+
+    # Wipe the install copy to simulate a missing install_path. DEEPTRADE_HOME
+    # is set to tmp_path by the `home` fixture, so plugins live directly
+    # under <home>/plugins/installed/<plugin_id>/<version>/.
+    install_root = home / "plugins" / "installed" / "broken-plug"
+    assert install_root.exists()
+    shutil.rmtree(install_root)
+
+    result = runner.invoke(app, ["plugin", "enable", "broken-plug"])
+    assert result.exit_code == 2, result.output
+    assert "install_path missing" in result.output
+    assert "reinstall" in result.output

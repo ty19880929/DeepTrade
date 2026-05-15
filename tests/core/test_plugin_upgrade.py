@@ -22,8 +22,10 @@ from deeptrade.core.plugin_manager import (
 
 
 def _make_plugin_dir(base: Path, plugin_id: str, version: str) -> Path:
-    """Tiny but valid plugin source. The migration DDL embeds the version
-    so that bumping the version produces a different .sql checksum."""
+    """Tiny but valid plugin source. The migration body is version-independent
+    so the same migration version carries the same checksum across plugin
+    versions — the realistic upgrade pattern is "add a new migration file",
+    not "mutate the existing one" (the latter is what T09 refuses)."""
     pkg_name = plugin_id.replace("-", "_")
     # _make_plugin_dir may be called multiple times with the same (id, version)
     # in a single test (e.g. install 0.1.0, upgrade 0.2.0, then "downgrade" to
@@ -42,7 +44,7 @@ def _make_plugin_dir(base: Path, plugin_id: str, version: str) -> Path:
     mig_dir = src / "migrations"
     mig_dir.mkdir(exist_ok=True)
     table_name = f"{pkg_name}_t"
-    sql = f"-- v{version}\nCREATE TABLE IF NOT EXISTS {table_name} (id INTEGER);\n"
+    sql = f"CREATE TABLE IF NOT EXISTS {table_name} (id INTEGER);\n"
     (mig_dir / "20260501_001_init.sql").write_text(sql)
     checksum = "sha256:" + hashlib.sha256(sql.encode()).hexdigest()
     (src / "deeptrade_plugin.yaml").write_text(

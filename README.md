@@ -109,7 +109,7 @@ deeptrade volume-anomaly stats            # 收益统计聚合
 | `deeptrade plugin upgrade <SOURCE> [--ref <REF>] [--no-deps] [--reinstall-deps]` | 升级（SemVer 比较，禁止降级；只跑增量 migrations + 依赖） |
 | `deeptrade data sync ...` | （暂停用，下版本恢复；改用插件自带的 sync 子命令） |
 
-保留字（不可作为 plugin_id）：`init / config / plugin / data / db`。
+保留字（不可作为 plugin_id）：`init / config / plugin / data / db`。其中 `db` 长度未达 plugin_id 正则下限（`^[a-z][a-z0-9-]{2,31}$`，至少 3 字符），已被隐式拒绝；其余四个由 `RESERVED_PLUGIN_IDS` 在安装时显式拦截。
 
 ### 插件命令（按 plugin_id 透传，插件自管）
 

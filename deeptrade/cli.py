@@ -66,9 +66,9 @@ class _DeepTradeGroup(TyperGroup):
             # Synthesize a helpful error including framework cmd list.
             framework = sorted(super().list_commands(ctx))
             ctx.fail(
-                f"unknown command or plugin: {cmd_name!r}\n"
-                f"  framework commands: {framework}\n"
-                f"  use `deeptrade plugin list` to see installed plugins"
+                f"未知命令或插件: {cmd_name!r}\n"
+                f"  框架命令: {framework}\n"
+                f"  执行 `deeptrade plugin list` 查看已安装插件"
             )
         return super().resolve_command(ctx, args)
 
@@ -98,12 +98,12 @@ def _build_plugin_command(plugin_id: str) -> click.Command | None:
 
         @click.command(
             name=plugin_id,
-            help=f"(disabled) {rec.name}",
+            help=f"(disabled / 已禁用) {rec.name}",
             context_settings={"ignore_unknown_options": True, "allow_extra_args": True},
         )
         def _disabled() -> None:
             typer.echo(
-                f"✘ plugin {plugin_id!r} is disabled; run `deeptrade plugin enable {plugin_id}`"
+                f"✘ 插件 {plugin_id!r} 已 disabled；请先执行 `deeptrade plugin enable {plugin_id}`"
             )
             raise typer.Exit(2)
 
@@ -113,7 +113,7 @@ def _build_plugin_command(plugin_id: str) -> click.Command | None:
     @click.command(
         name=plugin_id,
         # Plugin owns its own --help; let everything through unparsed.
-        help=f"{rec.name} (v{rec.version}) — plugin-managed CLI; try `--help`",
+        help=f"{rec.name} (v{rec.version}) — 插件自管 CLI，可执行 `--help` 查看子命令",
         context_settings={
             "ignore_unknown_options": True,
             "allow_extra_args": True,
@@ -124,7 +124,7 @@ def _build_plugin_command(plugin_id: str) -> click.Command | None:
     def _dispatch(ctx: click.Context) -> None:
         plugin = _load_entrypoint(Path(rec.install_path), rec.entrypoint, rec.metadata)
         if not hasattr(plugin, "dispatch"):
-            typer.echo(f"✘ plugin {plugin_id!r} does not implement dispatch()")
+            typer.echo(f"✘ 插件 {plugin_id!r} 未实现 dispatch()")
             raise typer.Exit(2)
         try:
             rc = plugin.dispatch(list(ctx.args))
@@ -152,7 +152,7 @@ def _build_plugin_command(plugin_id: str) -> click.Command | None:
 
 app = typer.Typer(
     name="deeptrade",
-    help="DeepTrade — LLM-driven A-share stock screening CLI",
+    help="DeepTrade — LLM 驱动的 A 股选股 CLI；管理配置 / 插件 / 数据库。",
     no_args_is_help=True,
     add_completion=True,
     cls=_DeepTradeGroup,
@@ -176,10 +176,10 @@ def main(
         "-V",
         callback=_version_callback,
         is_eager=True,
-        help="Show version and exit.",
+        help="显示版本号并退出。",
     ),
 ) -> None:
-    """DeepTrade — LLM-driven A-share stock screening CLI."""
+    """DeepTrade — LLM 驱动的 A 股选股 CLI；管理配置 / 插件 / 数据库。"""
 
 
 @app.command()
@@ -187,10 +187,10 @@ def init(
     no_prompts: bool = typer.Option(
         False,
         "--no-prompts",
-        help="Skip post-init tushare/deepseek configuration prompts.",
+        help="跳过初始化后的 Tushare / LLM 配置交互提示。",
     ),
 ) -> None:
-    """Initialize ~/.deeptrade layout and apply core schema migrations (idempotent)."""
+    """初始化 ~/.deeptrade 目录并应用核心 schema 迁移（幂等）。"""
     paths.ensure_layout()
     db_file = paths.db_path()
     fresh = not db_file.exists()
@@ -201,9 +201,9 @@ def init(
     try:
         applied = apply_core_migrations(db)
         if fresh:
-            typer.echo(f"✔ Database created: {db_file}")
+            typer.echo(f"✔ 已创建数据库：{db_file}")
         for v in applied:
-            typer.echo(f"✔ Schema applied: {v}")
+            typer.echo(f"✔ 已应用 schema 迁移：{v}")
     finally:
         db.close()
 
@@ -212,11 +212,11 @@ def init(
 
     import questionary
 
-    if questionary.confirm("Configure tushare now?", default=True).ask():
+    if questionary.confirm("现在配置 Tushare 吗？", default=True).ask():
         from deeptrade.cli_config import cmd_set_tushare
 
         cmd_set_tushare()
-    if questionary.confirm("Configure an LLM provider now?", default=True).ask():
+    if questionary.confirm("现在配置一个 LLM provider 吗？", default=True).ask():
         from deeptrade.cli_config import cmd_set_llm
 
         cmd_set_llm()
@@ -224,17 +224,17 @@ def init(
 
 @app.command(name="db", context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
 def db_cmd(ctx: click.Context) -> None:
-    """Database migration and management commands (legacy stub; use `deeptrade db init` via group if added)."""
+    """数据库迁移与管理命令（占位；实际入口在 `db_app` typer group）。"""
     pass
 
 
-db_app = typer.Typer(name="db", help="Database migration and management commands.")
+db_app = typer.Typer(name="db", help="数据库迁移与管理命令。")
 app.add_typer(db_app, name="db")
 
 
 @db_app.command("init")
 def db_init() -> None:
-    """Initialize the core database tables and apply migrations."""
+    """初始化核心数据库表并应用迁移。"""
     paths.ensure_layout()
     db_file = paths.db_path()
     fresh = not db_file.exists()
@@ -244,19 +244,19 @@ def db_init() -> None:
     try:
         applied = apply_core_migrations(db)
         if fresh:
-            typer.echo(f"✔ Database created: {db_file}")
+            typer.echo(f"✔ 已创建数据库：{db_file}")
         if applied:
             for v in applied:
-                typer.echo(f"✔ Schema applied: {v}")
+                typer.echo(f"✔ 已应用 schema 迁移：{v}")
         else:
-            typer.echo("✔ Database already initialized; schema up-to-date")
+            typer.echo("✔ 数据库已初始化；schema 已是最新")
     finally:
         db.close()
 
 
 @db_app.command("upgrade")
 def db_upgrade() -> None:
-    """Apply any pending core migrations."""
+    """应用所有未应用的核心迁移。"""
     db_init()
 
 

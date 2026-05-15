@@ -2,6 +2,50 @@
 
 All notable changes to DeepTrade. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and SemVer.
 
+## [v0.5.0] — 2026-05-15 — 插件信任边界 + CLI 中文化
+
+本版主线落地 2026-05-15 评审研判文档 `DeepTrade-review-assessment-and-fix-plan-2026-05-15.md` 中的 v0.5 路线：把"插件可以声明并清掉框架核心表"这条被忽视的信任边界明确收口，让框架的 SQL 迁移有边界、插件加载有 sys.modules 守卫、升级路径不会被静默改动的历史 migration 蒙混过关；同时把命令行用户向文案统一为中文，建立首道防回退的回归测试。整体不引入新框架概念（拒绝了报告里的 RuntimeContext 大对象、独立 venv、SQL DSL 等重型方案），保持"框架轻、插件重"的原则。
+
+实现按 5 个 PR 切片推进；既有插件不需要任何源码改动，但 v0.6 会把 v0.5 用 DeprecationWarning 提示的 `table_prefix` 缺省派生策略升级为硬失败——本版起插件作者应开始把声明的表名收敛到 `<plugin_id 派生前缀>_*` 命名空间。
+
+### Added
+
+- `deeptrade/plugins_api/metadata.py`：新增公开常量 `RESERVED_TABLE_NAMES`（10 个框架自有表）与 `RESERVED_TOP_PACKAGES`（15 个框架 / 公共依赖的顶层包名）。`PluginMetadata` 追加 4 个 `model_validator`：
+  - `_tables_not_reserved`：拒绝声明任何 `RESERVED_TABLE_NAMES` 中的表（H1）。
+  - `_tables_match_prefix`：`table_prefix` 显式声明则全表强制匹配；省略时按 `plugin_id.replace('-','_') + '_'` 派生并对不匹配的表发 `DeprecationWarning`。v0.6 转硬失败。
+  - `_entrypoint_top_pkg_matches_plugin_id`：entrypoint 顶层包名必须等于 `plugin_id.replace('-','_')`，且不在 `RESERVED_TOP_PACKAGES` 中（H3 / T04）。
+  - 新增 `table_prefix: str | None`（pattern `^[a-z][a-z0-9_]{0,15}_$`）字段。
+- `deeptrade/core/migrations/core/20260515_002_affected_tables.sql`：给 `plugin_schema_migrations` 加 `affected_tables TEXT DEFAULT NULL` 列，由框架在每条 migration 应用后写入实际新增的表名（JSON 数组）。purge 路径优先按此列反查归属，`plugin_tables` 仅作为兼容老库的兜底（H2 / T03）。
+- `deeptrade/core/plugin_manager.py::_apply_migrations`：重写为按每条 migration 做 schema-diff（`information_schema.tables` 前后快照）+ 3 道边界检查：
+  - 新增表必须在 `meta.tables` 声明集合内（创建未声明表 → `PluginInstallError`）；
+  - 删除表不可命中 `RESERVED_TABLE_NAMES`（DROP 核心表 → `PluginInstallError`）；
+  - 删除表必须当前归属本插件（`plugin_tables` 反查）。
+- `deeptrade/core/plugin_manager.py::_load_entrypoint`：新增 `sys.modules["deeptrade"]` 守卫（T07）—— import 前后比较框架模块的对象身份与 `__file__`，被替换则立即还原并 `PluginInstallError`；新增 `isinstance(instance, Plugin)` 校验（T08），缺 `dispatch` / `validate_static` / `metadata` 任一属性即拒绝。
+- `deeptrade/core/plugin_manager.py::upgrade`：在跑任何迁移前先比对 `(version, checksum)`——若 metadata 中某条 migration 的 version 已在 DB 中但 checksum 不一致，直接 `PluginInstallError("checksum changed ... historical migrations are immutable")`（T09 / M4）。
+- `deeptrade/core/plugin_manager.py::_purge_plugin_tables`：从 `uninstall(purge=True)` 中拆出独立方法。`affected_tables` 全部非空则按其与 `plugin_tables(purge=True)` 取交集；任一行为 NULL（v0.4 老库）则退化到全 `plugin_tables`；无论走哪条路径都在 DROP 前再次拦截 `RESERVED_TABLE_NAMES` 并 `logger.error` 留痕（H1 / T06）。
+- `deeptrade/cli_plugin.py::cmd_enable`：补 `PluginInstallError` 捕获分支（T11），把 manager 给出的 "install_path missing, reinstall before enabling" 提示透传，`Exit(2)`。
+- `deeptrade/cli_config.py::cmd_show`：表格之后追加黄色 `⚠ N 个 secret 以明文存储` 提示（T13）。
+- `deeptrade/core/config.py::ConfigService.count_plaintext_secrets()`：上述 CLI 警告的支撑方法，封装 `SecretStore.list_records()` 过滤，避免 CLI 触私有属性。
+- `tests/core/test_plugin_security.py`：v0.5 trust-boundary 全套负向回归，38 个用例覆盖 RESERVED 集合、`table_prefix` warn/hard、entrypoint 顶层包约束（参数化跑 14 个保留包名）、schema-diff 拒创建未声明表、拒 DROP 核心表、purge 即便 plugin_tables 被污染仍跳过核心表、Plugin Protocol 缺 dispatch 拒装、upgrade 拒收已篡改的历史 migration。
+- `tests/cli/test_user_facing_strings_are_chinese.py`：T16 中文化回归锁，11 个用例覆盖 `--help / config show / config show --help / plugin list / plugin install --help` 的中文关键字断言 + 6 条参数化反向断言（钉死被替换掉的英文短语）。
+- 新增覆盖：`tests/cli/test_plugin_cmd.py::test_enable_missing_install_path_message`（T24）、`tests/cli/test_config_cmd.py::test_config_show_warns_plaintext_secrets` 与 `_no_warning_when_no_secrets_set`（T26）。
+
+### Changed
+
+- `deeptrade/core/plugin_manager.py`：删除自实现的 `_iter_statements` SQL 多语句分割器，改为 `self._db.execute(sql)` 直接喂入整段——DuckDB 原生支持 `;` 分隔多语句执行（T10）。
+- `deeptrade/cli.py` / `cli_config.py` / `cli_plugin.py` / `cli_data.py` + `plugin_manager.summarize_for_install`：用户向文案全面中文化（T15）。范围限定为 `typer.echo` / Rich Table 标题与列名 / `questionary.*` prompt / `typer.Option/Argument` 的 `help` / `@app.command` docstring 首行 / `✘ / ✔ / ⚠` 句子；明确**保留英文**：`raise XxxError(...)` 消息、`logger.*`、源码注释 + docstring 第二行及之后、命令名本身——保证异常 / 日志 / stack trace 在英文社区仍可搜可贴。
+- `deeptrade/cli_plugin.py::cmd_uninstall`：docstring + `--purge` option help 重写为中文，准确描述实际两段语义（默认 = 删文件 + disable，可重装恢复；`--purge` = 同时 DROP 表与所有 metadata 行，不可恢复）。实际行为不动。
+- `pyproject.toml::[tool.hatch.build.targets.sdist].include`：删除不存在的 `/DESIGN.md`、`/PLAN.md`（v0.2.0 删除的 docs 残留），改为收录 `/CHANGELOG.md`（T14）。
+- `deeptrade/{cli_data, core/github_fetch, core/dep_installer, core/plugin_source, core/registry}.py` 五处模块 docstring 中的 `docs/*_design.md` 失效引用全部改指 `CHANGELOG.md` 对应版本段（项目 docs 目录已在 v0.2.0 删除，不予恢复）。
+- `README.md` 保留 IDs 段落补一句：`db` 长度未达 plugin_id 正则下限（`^[a-z][a-z0-9-]{2,31}$`，至少 3 字符），由正则隐式拒绝；其余四个由 `RESERVED_PLUGIN_IDS` 在安装时显式拦截。
+
+### Migration notes
+
+- **插件作者侧零强制动作**：本版只对边界违例发 `DeprecationWarning`（仅 `table_prefix` 派生不匹配这一项）。v0.6 会把它转硬失败，因此官方插件 + 第三方插件**建议**在下个版本前把表名收敛到 `<plugin_id 派生前缀>_*` 命名空间（如 `limit-up-board` → 派生 `limit_up_board_`，所有表以此开头），或在 `deeptrade_plugin.yaml` 顶层显式声明 `table_prefix: <prefix>_`。
+- **v0.4 已装插件平滑升级**：`plugin_schema_migrations.affected_tables` 是新列，老插件历史行将以 NULL 存在；`uninstall --purge` 检测到 NULL 自动退化到 v0.4 的 `plugin_tables` 路径，行为不变。重新跑一次 install/upgrade 会让新写入的 migration 行带上 `affected_tables`，自动进入更严格的路径。
+- **DB 自动迁移**：v0.4.2 起 `Database()` 已默认 `auto_migrate=True`，本版新增的 `20260515_002_affected_tables.sql` 在用户下次执行任意 `deeptrade <...>` 命令时静默应用，无需手动 `db upgrade`。设置 `DEEPTRADE_SKIP_AUTO_MIGRATE=1` 仍是逃生通道。
+- **CLI 输出语言切换**：异常 / 日志 / `--help` 中 Typer 自动生成的 `Usage:` / `Options:` 头仍是英文（Typer 行为，不打算改），其余命令输出全部中文化。监控 / 自动化脚本如有按英文短语 grep 输出的，需要按 `tests/cli/test_user_facing_strings_are_chinese.py` 中的中文关键字相应更新。
+
 ## [v0.4.2] — 2026-05-12 — Database 构造自动迁移 + DEEPTRADE_DEBUG=1 显示堆栈
 
 定位到一个用户报错：升级到 0.4.1 后第一次跑 `deeptrade limit-up-board lgb train ...` 直接报 `✘ TypeError: list indices must be integers or slices, not str`。链路追到 `TushareClient._restore_cached_frame` —— 0.4.1 改用 `{"version","schema","data"}` 包裹格式读取，但旧裸数组的缓存行没被清掉。根因不是缓存代码本身，而是迁移触发链路：`apply_core_migrations` 只在 `deeptrade db init` / `db upgrade` 显式调用，包升级后用户不手动跑就一直拿不到 `20260512_001_drop_legacy_tushare_cache.sql` 的清空动作。同时报错只有一行无堆栈，定位也很慢——这是双层 swallow（插件 + 框架都没渲染 traceback）。

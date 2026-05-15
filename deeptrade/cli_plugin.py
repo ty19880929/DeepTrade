@@ -35,7 +35,7 @@ from deeptrade.core.registry import (
     RegistrySchemaError,
 )
 
-app = typer.Typer(help="Install / manage plugins", no_args_is_help=True)
+app = typer.Typer(help="安装 / 管理插件", no_args_is_help=True)
 
 _RESOLVE_ERRORS: tuple[type[Exception], ...] = (
     RegistryNotFoundError,
@@ -70,15 +70,13 @@ def cmd_install(
     ref: str | None = typer.Option(
         None, "--ref", help="Tag / branch / sha (默认 = 该插件最新 release)"
     ),
-    yes: bool = typer.Option(False, "-y", "--yes", help="Skip the confirmation prompt"),
-    no_deps: bool = typer.Option(
-        False, "--no-deps", help="Skip plugin Python dependency installation"
-    ),
+    yes: bool = typer.Option(False, "-y", "--yes", help="跳过安装前的确认提示"),
+    no_deps: bool = typer.Option(False, "--no-deps", help="跳过插件 Python 依赖安装"),
     reinstall_deps: bool = typer.Option(
-        False, "--reinstall-deps", help="Re-run installer for all deps (uv/pip --upgrade)"
+        False, "--reinstall-deps", help="对全部依赖重新运行安装器（uv/pip --upgrade）"
     ),
 ) -> None:
-    """Install a plugin from the registry, a GitHub URL, or a local directory."""
+    """从注册表 / GitHub URL / 本地目录安装一个插件。"""
     resolver = SourceResolver()
     try:
         resolved = resolver.resolve(source, ref)
@@ -97,12 +95,12 @@ def cmd_install(
         typer.echo(f"来源: {_format_origin(resolved)}")
         typer.echo(summarize_for_install(meta, resolved.path))
         if no_deps and meta.dependencies:
-            typer.echo("(deps install will be SKIPPED — --no-deps)")
+            typer.echo("（依赖安装将被跳过 —— --no-deps）")
         typer.echo("──────────────────────────────────────────")
         if not yes:
-            ok = questionary.confirm("确认安装?", default=False).ask()
+            ok = questionary.confirm("确认安装？", default=False).ask()
             if not ok:
-                typer.echo("Aborted.")
+                typer.echo("已取消。")
                 raise typer.Exit(1)
 
         db, mgr = _open()
@@ -113,7 +111,7 @@ def cmd_install(
                 reinstall_deps=reinstall_deps,
             )
         except PluginInstallError as e:
-            typer.echo(f"✘ Install failed: {e}")
+            typer.echo(f"✘ 安装失败：{e}")
             raise typer.Exit(2) from e
         finally:
             db.close()
@@ -126,7 +124,7 @@ def cmd_install(
 
 @app.command("list")
 def cmd_list() -> None:
-    """List installed plugins."""
+    """列出已安装的插件。"""
     db, mgr = _open()
     try:
         records = mgr.list_all()
@@ -134,22 +132,22 @@ def cmd_list() -> None:
         db.close()
 
     console = Console()
-    table = Table(title="Installed Plugins")
+    table = Table(title="已安装插件")
     table.add_column("plugin_id", style="cyan")
-    table.add_column("name")
-    table.add_column("version")
-    table.add_column("enabled", style="green")
+    table.add_column("名称")
+    table.add_column("版本")
+    table.add_column("已启用", style="green")
     if not records:
-        typer.echo("(no plugins installed)")
+        typer.echo("（未安装任何插件）")
         return
     for r in records:
-        table.add_row(r.plugin_id, r.name, r.version, "yes" if r.enabled else "no")
+        table.add_row(r.plugin_id, r.name, r.version, "是" if r.enabled else "否")
     console.print(table)
 
 
 @app.command("info")
 def cmd_info(plugin_id: str = typer.Argument(...)) -> None:
-    """Show metadata for a plugin.
+    """查看插件的 metadata。
 
     If installed locally: shows the full installed metadata.yaml.
     If not installed: falls back to the registry entry (with an install hint).
@@ -185,28 +183,37 @@ def cmd_info(plugin_id: str = typer.Argument(...)) -> None:
 
 @app.command("disable")
 def cmd_disable(plugin_id: str = typer.Argument(...)) -> None:
+    """禁用一个已安装插件（保留安装文件与表）。"""
     db, mgr = _open()
     try:
         try:
             mgr.disable(plugin_id)
         except PluginNotFoundError as e:
-            typer.echo(f"✘ {plugin_id} not installed")
+            typer.echo(f"✘ {plugin_id} 未安装")
             raise typer.Exit(2) from e
-        typer.echo(f"✔ disabled: {plugin_id}")
+        typer.echo(f"✔ 已禁用: {plugin_id}")
     finally:
         db.close()
 
 
 @app.command("enable")
 def cmd_enable(plugin_id: str = typer.Argument(...)) -> None:
+    """启用一个已禁用的插件。"""
     db, mgr = _open()
     try:
         try:
             mgr.enable(plugin_id)
         except PluginNotFoundError as e:
-            typer.echo(f"✘ {plugin_id} not installed")
+            typer.echo(f"✘ {plugin_id} 未安装")
             raise typer.Exit(2) from e
-        typer.echo(f"✔ enabled: {plugin_id}")
+        except PluginInstallError as e:
+            # T11 — enable() refuses re-enable when install_path is missing
+            # (typical after a prior uninstall without --purge that wiped the
+            # files but left the plugins row). Surface the manager's hint
+            # verbatim so users know to reinstall rather than re-run enable.
+            typer.echo(f"✘ {e}")
+            raise typer.Exit(2) from e
+        typer.echo(f"✔ 已启用: {plugin_id}")
     finally:
         db.close()
 
@@ -214,29 +221,40 @@ def cmd_enable(plugin_id: str = typer.Argument(...)) -> None:
 @app.command("uninstall")
 def cmd_uninstall(
     plugin_id: str = typer.Argument(...),
-    purge: bool = typer.Option(False, "--purge", help="DROP plugin tables and forget all data"),
-    yes: bool = typer.Option(False, "-y", "--yes", help="Skip confirmation"),
+    purge: bool = typer.Option(
+        False,
+        "--purge",
+        help="同时 DROP 插件表 + 删除迁移记录（不可恢复）",
+    ),
+    yes: bool = typer.Option(False, "-y", "--yes", help="跳过确认提示"),
 ) -> None:
-    """Uninstall a plugin. Default: keep tables (just disable). --purge: drop tables."""
+    """卸载插件。
+
+    默认：删除磁盘安装副本 + 把 plugins 行标 disabled，插件表保留；
+    之后可用 `deeptrade plugin install/upgrade <source>` 重新安装恢复。
+
+    `--purge`：在默认动作的基础上，再 DROP 该插件声明的表、清空
+    plugin_tables / plugin_schema_migrations / plugins 行——不可恢复。
+    """
     db, mgr = _open()
     try:
         try:
             rec = mgr.info(plugin_id)
         except PluginNotFoundError as e:
-            typer.echo(f"✘ {plugin_id} not installed")
+            typer.echo(f"✘ {plugin_id} 未安装")
             raise typer.Exit(2) from e
 
         if purge and not yes:
             tables = [t.name for t in rec.metadata.tables if t.purge_on_uninstall]
             typer.echo(f"将删除以下表（不可恢复）: {tables}")
-            ok = questionary.confirm("确认 --purge?", default=False).ask()
+            ok = questionary.confirm("确认 --purge？", default=False).ask()
             if not ok:
-                typer.echo("Aborted.")
+                typer.echo("已取消。")
                 raise typer.Exit(1)
 
         result = mgr.uninstall(plugin_id, purge=purge)
-        action = "purged" if purge else "disabled"
-        typer.echo(f"✔ {action}: {plugin_id} (dropped tables: {result['purged_tables']})")
+        action = "已 purge" if purge else "已 disable"
+        typer.echo(f"✔ {action}: {plugin_id}（dropped tables: {result['purged_tables']}）")
     finally:
         db.close()
 
@@ -247,14 +265,12 @@ def cmd_upgrade(
     ref: str | None = typer.Option(
         None, "--ref", help="Tag / branch / sha (默认 = 该插件最新 release)"
     ),
-    no_deps: bool = typer.Option(
-        False, "--no-deps", help="Skip plugin Python dependency installation"
-    ),
+    no_deps: bool = typer.Option(False, "--no-deps", help="跳过插件 Python 依赖安装"),
     reinstall_deps: bool = typer.Option(
-        False, "--reinstall-deps", help="Re-run installer for all deps (uv/pip --upgrade)"
+        False, "--reinstall-deps", help="对全部依赖重新运行安装器（uv/pip --upgrade）"
     ),
 ) -> None:
-    """Upgrade an installed plugin.
+    """升级一个已安装的插件。
 
     Exit codes:
       0 — upgraded, or already at the candidate version
@@ -286,13 +302,13 @@ def cmd_upgrade(
                 typer.echo(f'✘ 插件 "{pid}" 未安装，请先执行 deeptrade plugin install')
                 raise typer.Exit(2) from e
             except PluginInstallError as e:
-                typer.echo(f"✘ Upgrade failed: {e}")
+                typer.echo(f"✘ 升级失败：{e}")
                 raise typer.Exit(2) from e
 
             if isinstance(result, UpgradeNoop):
                 typer.echo(f"已是最新版本 v{result.version}")
                 return
-            typer.echo(f"✔ upgraded: {result.plugin_id} → v{result.version}")
+            typer.echo(f"✔ 已升级: {result.plugin_id} → v{result.version}")
         finally:
             db.close()
     finally:
@@ -307,7 +323,7 @@ def cmd_search(
     ),
     no_cache: bool = typer.Option(False, "--no-cache", help="强制刷新注册表（旁路 ETag 缓存）"),
 ) -> None:
-    """List plugins available in the official registry."""
+    """列出官方注册表中所有可用的插件。"""
     try:
         registry = RegistryClient().fetch(force=no_cache)
     except (RegistryFetchError, RegistrySchemaError) as e:
@@ -326,15 +342,15 @@ def cmd_search(
         ]
 
     if not rows:
-        typer.echo("(no plugins matched)" if keyword else "(registry is empty)")
+        typer.echo("（未匹配到任何插件）" if keyword else "（注册表为空）")
         return
 
     console = Console()
-    table = Table(title="Available Plugins")
+    table = Table(title="可用插件")
     table.add_column("plugin_id", style="cyan")
-    table.add_column("name")
-    table.add_column("type", style="green")
-    table.add_column("description")
+    table.add_column("名称")
+    table.add_column("类型", style="green")
+    table.add_column("描述")
     for entry in sorted(rows, key=lambda x: x.plugin_id):
         table.add_row(entry.plugin_id, entry.name, entry.type, entry.description)
     console.print(table)

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "deeptrade-quant"
-version = "0.4.2"
+version = "0.5.0"
 description = "LLM-driven A-share (Shanghai/Shenzhen main board) stock screening CLI"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -60,4 +60,7 @@ Issues       = "https://github.com/ty19880929/deeptrade/issues"
 packages = ["deeptrade"]
 
 [tool.hatch.build.targets.sdist]
-include = ["/deeptrade", "/tests", "/README.md", "/DESIGN.md", "/PLAN.md"]
+# `/DESIGN.md` and `/PLAN.md` were dropped in v0.2.0 alongside the docs tree
+# rewrite; CHANGELOG.md is the surviving history-of-record. Don't list them
+# here — hatchling will fail the sdist build on missing include patterns.
+include = ["/deeptrade", "/tests", "/README.md", "/CHANGELOG.md"]

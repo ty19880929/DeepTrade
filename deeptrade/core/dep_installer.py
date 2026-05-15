@@ -4,7 +4,8 @@ Called by :class:`PluginManager` during install / upgrade to satisfy a
 plugin's declared third-party Python dependencies (PEP 508 specifiers
 in ``deeptrade_plugin.yaml::dependencies``).
 
-Design: ``docs/plugin_dependency_management_design.md``.
+Design context: ``CHANGELOG.md`` v0.4.0 (per-plugin Python dependency
+management; framework-interpreter install model rather than per-plugin venv).
 
 Key invariants:
   * Plugins share the framework's Python interpreter — deps must be

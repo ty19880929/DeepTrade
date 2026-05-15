@@ -4,7 +4,7 @@ Fetches the official plugin index from
 ``raw.githubusercontent.com/ty19880929/DeepTradePluginOfficial/main/registry/index.json``
 with ETag-based caching to ``~/.deeptrade/plugins/registry-cache.json``.
 
-See ``docs/distribution-and-plugin-install-design.md`` §5 + §6.1.
+See ``CHANGELOG.md`` v0.3 entries for the distribution / install design context.
 """
 
 from __future__ import annotations

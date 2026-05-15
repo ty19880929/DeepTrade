@@ -49,7 +49,7 @@ def test_config_set_unknown_key_returns_2(home: Path) -> None:
     runner = CliRunner()
     result = runner.invoke(app, ["config", "set", "bogus.key", "x"])
     assert result.exit_code == 2
-    assert "Unknown key" in result.stdout
+    assert "未知 key" in result.stdout
 
 
 def test_config_set_invalid_profile_returns_2(home: Path) -> None:
@@ -63,3 +63,26 @@ def test_init_no_prompts_skips_questionary(home: Path) -> None:
     runner = CliRunner()
     result = runner.invoke(app, ["init", "--no-prompts"])
     assert result.exit_code == 0
+
+
+def test_config_show_warns_plaintext_secrets(home: Path) -> None:
+    """T26 — `config show` must surface a warning whenever any secret in
+    ``secret_store`` was persisted as plaintext. The autouse keyring
+    isolation fixture in ``tests/conftest.py`` forces every secret write
+    to fall back to plaintext, so storing one token is enough to trip the
+    branch."""
+    runner = CliRunner()
+    runner.invoke(app, ["config", "set", "tushare.token", "abcdef1234567890"])
+    result = runner.invoke(app, ["config", "show"])
+    assert result.exit_code == 0
+    assert "明文存储" in result.stdout
+    assert "1 个 secret" in result.stdout
+
+
+def test_config_show_no_warning_when_no_secrets_set(home: Path) -> None:
+    """Inverse: a clean install with zero secrets must NOT print the
+    warning — otherwise it becomes noise that users learn to ignore."""
+    runner = CliRunner()
+    result = runner.invoke(app, ["config", "show"])
+    assert result.exit_code == 0
+    assert "明文存储" not in result.stdout

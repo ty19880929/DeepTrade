@@ -6,7 +6,7 @@ matching a prefix and (b) download + extract a repo tarball into a directory.
 Implementation uses stdlib ``urllib.request`` + ``tarfile``; no third-party
 HTTP dependency. ``GITHUB_TOKEN`` env var is honored for rate-limit relief.
 
-See ``docs/distribution-and-plugin-install-design.md`` §6.2.
+See ``CHANGELOG.md`` v0.3 entries for the distribution / install design context.
 """
 
 from __future__ import annotations

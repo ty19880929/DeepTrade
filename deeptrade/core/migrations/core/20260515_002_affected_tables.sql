@@ -1,0 +1,13 @@
+-- v0.5 — record which tables a plugin migration actually touched.
+--
+-- Pre-v0.5 the framework relied on ``plugin_tables`` rows to decide which
+-- tables to DROP during ``uninstall --purge``. That list is plugin-supplied
+-- metadata; nothing prevents a malicious or buggy plugin from claiming a
+-- framework table (e.g. ``app_config``) and getting it dropped on purge.
+--
+-- ``affected_tables`` is the framework's own record of what each migration
+-- created, captured by ``PluginManager._apply_migrations`` via a schema
+-- diff. Stored as a JSON-array TEXT (e.g. ``["foo","bar"]``); v0.5 purge
+-- prefers this list and falls back to ``plugin_tables`` only when the
+-- column is NULL (rows written by pre-v0.5 installs).
+ALTER TABLE plugin_schema_migrations ADD COLUMN affected_tables TEXT DEFAULT NULL;

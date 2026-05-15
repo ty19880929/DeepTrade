@@ -102,7 +102,9 @@ def _make_plugin_dir(
     mig_dir = src / "migrations"
     mig_dir.mkdir(exist_ok=True)
     table_name = f"{pkg}_t"
-    sql = f"-- v{version}\nCREATE TABLE IF NOT EXISTS {table_name} (id INTEGER);\n"
+    # Version-independent body so historical migrations keep a stable
+    # checksum across plugin-version bumps (T09 refuses mutation).
+    sql = f"CREATE TABLE IF NOT EXISTS {table_name} (id INTEGER);\n"
     (mig_dir / "20260501_001_init.sql").write_text(sql)
     checksum = "sha256:" + hashlib.sha256(sql.encode()).hexdigest()
     yaml_text = (
@@ -465,7 +467,8 @@ def test_summarize_includes_dependencies_line(home: Path):
     src = _make_plugin_dir(home, "sumplug", dependencies=["pandas>=2.2", "ta-lib>=0.4"])
     meta = _load_metadata_yaml(src / "deeptrade_plugin.yaml")
     out = summarize_for_install(meta, src)
-    assert "dependencies" in out
+    # v0.5 — summary labels are Chinese; assert the label and each spec line.
+    assert "依赖" in out
     assert "pandas>=2.2" in out
     assert "ta-lib>=0.4" in out
 
@@ -474,7 +477,7 @@ def test_summarize_dependencies_none_when_empty(home: Path):
     src = _make_plugin_dir(home, "noplug")
     meta = _load_metadata_yaml(src / "deeptrade_plugin.yaml")
     out = summarize_for_install(meta, src)
-    assert "(none)" in out
+    assert "（无）" in out
 
 
 def test_cli_install_no_deps_flag_passes_through(home: Path, monkeypatch: pytest.MonkeyPatch):

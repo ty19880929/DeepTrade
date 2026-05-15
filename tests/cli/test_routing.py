@@ -30,9 +30,11 @@ def home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
 
 def _install_fake_plugin(home: Path, plugin_id: str = "echo-plug") -> None:
     """Install a tiny plugin whose dispatch echoes argv to stdout."""
-    src = home / "_fake_src"
+    pkg_name = plugin_id.replace("-", "_")
+    table_name = f"{pkg_name}_log"
+    src = home / f"_fake_src_{pkg_name}"
     src.mkdir()
-    pkg = src / "echo_plug"
+    pkg = src / pkg_name
     pkg.mkdir()
     (pkg / "__init__.py").write_text("")
     (pkg / "plugin.py").write_text(
@@ -44,7 +46,7 @@ def _install_fake_plugin(home: Path, plugin_id: str = "echo-plug") -> None:
     )
     mig_dir = src / "migrations"
     mig_dir.mkdir()
-    sql = "CREATE TABLE IF NOT EXISTS echo_plug_log (id INTEGER);\n"
+    sql = f"CREATE TABLE IF NOT EXISTS {table_name} (id INTEGER);\n"
     sql_path = mig_dir / "20260501_001_init.sql"
     sql_path.write_text(sql)
     import hashlib
@@ -57,7 +59,7 @@ def _install_fake_plugin(home: Path, plugin_id: str = "echo-plug") -> None:
         "version: 0.1.0\n"
         "type: strategy\n"
         'api_version: "1"\n'
-        "entrypoint: echo_plug.plugin:EchoPlugin\n"
+        f"entrypoint: {pkg_name}.plugin:EchoPlugin\n"
         "description: argv echo plugin used by tests\n"
         "permissions:\n  llm: false\n  llm_tools: false\n"
         "migrations:\n"
@@ -65,7 +67,7 @@ def _install_fake_plugin(home: Path, plugin_id: str = "echo-plug") -> None:
         "    file: migrations/20260501_001_init.sql\n"
         f'    checksum: "{checksum}"\n'
         "tables:\n"
-        "  - name: echo_plug_log\n"
+        f"  - name: {table_name}\n"
         "    description: tiny test table\n"
         "    purge_on_uninstall: true\n"
     )
@@ -85,7 +87,7 @@ def test_unknown_command_lists_framework_commands(home: Path) -> None:
     result = runner.invoke(app, ["nonesuch"])
     assert result.exit_code != 0
     out = result.output
-    assert "unknown command or plugin: 'nonesuch'" in out
+    assert "未知命令或插件: 'nonesuch'" in out
     # Must mention all 4 framework commands so users know where to look.
     for cmd in ("config", "data", "init", "plugin"):
         assert cmd in out
@@ -96,7 +98,9 @@ def test_data_sync_stub_exits_with_message(home: Path) -> None:
     runner = CliRunner()
     result = runner.invoke(app, ["data", "sync"])
     assert result.exit_code == 2
-    assert "temporarily disabled" in result.output
+    # The user-visible Chinese phrase is the primary token; the parenthetical
+    # English label is kept for searchability in bug reports.
+    assert "暂停使用" in result.output
 
 
 def test_plugin_dispatch_forwards_argv_verbatim(home: Path) -> None:

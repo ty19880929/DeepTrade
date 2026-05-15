@@ -200,6 +200,15 @@ class ConfigService:
         self._db = db
         self._secrets = secret_store if secret_store is not None else SecretStore(db)
 
+    # --- introspection -------------------------------------------------
+
+    def count_plaintext_secrets(self) -> int:
+        """Return the number of secrets currently stored as plaintext in
+        ``secret_store``. Used by ``deeptrade config show`` (T13) to flag
+        the unencrypted-keys situation that arises on hosts without an
+        accessible OS keyring."""
+        return sum(1 for r in self._secrets.list_records() if r.method == "plaintext")
+
     # --- read ----------------------------------------------------------
 
     def get(self, key: str) -> Any:
