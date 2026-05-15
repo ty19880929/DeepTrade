@@ -53,7 +53,7 @@ def _minimal_meta_dict() -> dict:
         "entrypoint": "minimal_x.plugin:X",
         "description": "x",
         "permissions": {"llm": False, "llm_tools": False},
-        "tables": [{"name": "x_t", "description": "x", "purge_on_uninstall": True}],
+        "tables": [{"name": "minimal_x_t", "description": "x", "purge_on_uninstall": True}],
         "migrations": [
             {
                 "version": "20260501_001",

@@ -2,6 +2,59 @@
 
 All notable changes to DeepTrade. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and SemVer.
 
+## [v0.6.0] — 2026-05-15 — 插件运行时 API + LLM 方言 + 杂项收尾
+
+本版按 2026-05-15 评审研判文档 `DeepTrade-review-assessment-and-fix-plan-2026-05-15.md` §5 中 v0.6 路线落地 6 项主线：
+
+1. **H4 插件运行时 API**：``api_version="2"`` 的插件改用 ``dispatch(ctx, argv)`` 接收 ``PluginContext``，无需再 ``import deeptrade.core.*`` 私有路径取 db / config。``api_version="1"`` 永久向后兼容，运行时按 metadata 决定调用形态。``plugins_api/__init__.py`` 把 ``LLMManager`` / ``TushareClient`` 提升为公共 API。
+2. **H5 LLM 方言收口**：``OpenAICompatTransport`` 加 class 属性 ``supports_reasoning_effort`` 默认 False；新增 ``OpenAIOfficialTransport``（base_url 含 ``api.openai.com``）改 True。其余 OpenAI-compat provider 不再裸送 ``reasoning_effort``，消除国内非推理模型常见的 400 与忽略两种失败模式。
+3. **H1 hard error**：``table_prefix`` 派生不匹配从 v0.5 的 ``DeprecationWarning`` 转 ``ValueError``，与显式声明路径合流，让"插件表必须落在派生命名空间"成为可执行约束。
+4. **M6**：``env_var_for(key)`` 把 provider 名中的 ``-`` 归一化为 ``_``，避免 ``DEEPTRADE_LLM_QWEN-PLUS_API_KEY`` 这种 bash/sh 非法标识符；``set_llm_provider`` 在归一化后冲突时硬拒绝，避免 ``qwen-plus`` / ``qwen_plus`` 共用同一个 env var 时的静默 shadowing。
+5. **M8**：``_try_load_keyring`` 改用 ``keyring.get_keyring()`` 的非写入式 backend 探测，只在 ``backends.fail.*`` / ``backends.null.*`` 类时返回 None；结果缓存到模块级变量，配 ``_invalidate_keyring_cache`` 给测试用。彻底消除 ``SecretStore.__init__`` 每次都向 OS 凭据存储写一个 ``__probe__`` 的副作用。
+6. **M9**：``TushareClient`` 首次遇未知 API 改打 INFO 日志（进程级 + 实例级双 dedup，不再每次默认就刷屏）；``PluginMetadata.permissions.tushare_apis.cache_overrides: dict[str, str]`` 让插件作者声明非默认缓存策略，``TushareClient(cache_overrides=...)`` 在分类决策中优先采纳。
+
+### Added
+
+- ``deeptrade/plugins_api/base.py``：docstring 标注 ``api_version`` 与 ``dispatch`` 签名的对应关系；``Plugin.dispatch`` 改写为变参 Protocol 占位（``runtime_checkable`` 只校验属性存在，签名由框架按 metadata 决定）。
+- ``deeptrade/core/plugin_manager.py::SUPPORTED_API_VERSIONS``（``frozenset({"1", "2"})``）；install / upgrade 路径用集合包含判断替换原先的 ``!= CURRENT_API_VERSION``，对未来扩 ``"3"`` 留接口。
+- ``deeptrade/cli.py::_dispatch``：按 ``rec.api_version`` 选择 ``plugin.dispatch(argv)`` 或 ``plugin.dispatch(ctx, argv)``；v2 路径由框架开 ``Database`` + 构 ``PluginContext`` + 收尾关库，插件不再操心生命周期。
+- ``deeptrade/plugins_api/__init__.py``：重导出 ``LLMManager`` 与 ``TushareClient``，正式纳入公共 surface 的 ``__all__``。
+- ``deeptrade/plugins_api/metadata.py::TushareApiPermissions.cache_overrides: dict[str, str]``，配 ``_cache_overrides_values_valid`` model_validator 强制值落在 ``{static, trade_day_immutable, trade_day_mutable, hot_or_anns}``；非法值在 yaml 解析阶段拒绝，避免运行时缓存行为静默退化。
+- ``deeptrade/core/tushare_client.py``：``TushareClient.__init__`` 新增 ``cache_overrides`` kwarg；新增 ``_resolve_cache_class`` 把"插件 overrides → 框架表 → 默认 + 一次性 INFO 日志"三级优先级集中表达；模块级 ``_UNKNOWN_API_LOGGED`` 做进程级 dedup。
+- ``deeptrade/core/llm_client.py``：``OpenAICompatTransport.supports_reasoning_effort: bool = False`` 类标志位；``OpenAIOfficialTransport`` 子类（``api.openai.com`` base_url 触发）将其覆盖为 True；``chat()`` 仅在 ``supports_reasoning_effort and reasoning_effort`` 时把字段写入 ``kwargs``。``_TRANSPORT_BY_BASE_URL`` 新增 ``("api.openai.com", OpenAIOfficialTransport)`` 路由。
+- ``deeptrade/core/secrets.py``：模块级 ``_keyring_cache`` / ``_keyring_probed`` 缓存；``_invalidate_keyring_cache`` 测试钩子；``_try_load_keyring`` 重写为按 backend FQCN 子串识别 fail/null 类。
+- ``deeptrade/core/config.py::ConfigService.set_llm_provider``：归一化后冲突检测；``env_var_for`` 文档说明 ``-``→``_`` 规则的动机。
+- 测试新增：``tests/plugins_api/test_api_version_2.py``（6 用例，覆盖双 api_version 安装、unknown api_version 拒绝、v1/v2 dispatch arity、公开类导出）、``tests/core/test_secrets.py`` v0.6 M8 节 3 用例（fail backend 拒绝、real backend 不写探针、cache 可重置）、``tests/core/test_config.py`` 3 用例（env 归一化、归一化冲突拒绝、同名更新放行）、``tests/core/test_plugin_security.py`` 3 用例（cache_overrides 默认空 / 合法值 / 非法值）、``tests/core/test_tushare_client.py`` 3 用例（overrides 优先、未知 API override 路径、INFO 日志一次性）、``tests/core/test_llm_client.py`` 4 用例（supports_reasoning_effort 默认 False、OpenAI-official 路由、Generic transport 不发送、empty 字符串不发送）。
+
+### Changed
+
+- ``deeptrade/plugins_api/metadata.py::_tables_match_prefix``：``table_prefix`` 省略且不匹配派生时从 ``warnings.warn(DeprecationWarning)`` 转 ``raise ValueError``；删除现已无用的 ``import warnings``。模块顶部 docstring 把 v0.5 advisory / v0.6 enforcement 的边界明确标注。
+- ``deeptrade/plugins_api/metadata.py``：``TushareApiPermissions`` 加 ``cache_overrides`` 字段；定义 ``_CACHE_CLASS_VALUES`` 内部常量便于校验。
+- ``deeptrade/core/tushare_client.py``：``cache_class = API_CACHE_CLASS.get(api_name, "trade_day_immutable")`` 改为 ``cache_class = self._resolve_cache_class(api_name)``，集中所有分类决策。
+- ``deeptrade/cli.py``：v2 路径在 dispatch 周边内联 ``ConfigService`` / ``PluginContext`` 导入，避免顶层冷启动负担；其余跨 dispatch 路径行为不变。
+- ``tests/core/test_plugin_security.py``：``test_plugin_table_prefix_warns_when_omitted_and_mismatched`` 改名 ``test_plugin_table_prefix_hard_fails_when_omitted_and_mismatched``，正向断言 ``ValidationError``；``test_plugin_table_prefix_no_warning_when_tables_match_derived`` 改名 ``test_plugin_table_prefix_passes_when_tables_match_derived``，保留 ``simplefilter("error", DeprecationWarning)`` 作为反向断言。
+- ``tests/core/test_plugin_install.py::_make_minimal_plugin_dir``：``table_name`` 默认值从硬编码 ``test_table`` 改为按 ``plugin_id`` 派生（``<pkg>_t``），满足 v0.6 派生前缀约束；``table_ddl`` 默认也从默认值同步派生。
+- ``tests/core/test_plugin_dependencies.py::_minimal_meta_dict``：表名 ``x_t`` 改为 ``minimal_x_t`` 以匹配 ``plugin_id="minimal-x"`` 的派生前缀。
+- ``tests/core/test_llm_client.py::test_select_transport_class_defaults_to_generic``：``api.openai.com`` 从"回退到 Generic"断言改为"回退用 Generic / OpenAI-official 走专属路由"的双行声明；docstring 标注 v0.6 行为变化。
+
+### Migration notes
+
+- **插件作者侧（推荐路径）**：迁移到 ``api_version="2"``——
+    1. ``deeptrade_plugin.yaml::api_version`` 改为 ``"2"``。
+    2. ``def dispatch(self, argv):`` 改写为 ``def dispatch(self, ctx, argv):``。
+    3. 把 ``Database(paths.db_path())`` / ``ConfigService(...)`` 等手动构造替换为 ``ctx.db`` / ``ctx.config``；之前从 ``deeptrade.core.*`` import 的 ``LLMManager`` / ``TushareClient`` 改为 ``from deeptrade.plugins_api import LLMManager, TushareClient``。
+- **插件作者侧（最低改动路径）**：不动 ``api_version="1"``，所有既有插件**零代码改动**继续工作；唯一硬约束是 ``metadata.tables`` 必须落在 ``<plugin_id 派生前缀>_*`` 命名空间内（或显式声明 ``table_prefix``）。
+- **多 LLM provider 命名**：使用 ``qwen-plus`` / ``qwen-max-2024`` 这类带连字符的 provider 名时，``DEEPTRADE_LLM_QWEN_PLUS_API_KEY`` 形式的 env var 现在可以正常生效；不要再同时注册归一化后冲突的名字（``qwen-plus`` 与 ``qwen_plus``）。
+- **官方 OpenAI 推理模型**：``reasoning_effort`` 现在只在 ``base_url`` 含 ``api.openai.com`` 时上行。其他 OpenAI-compat 网关如需该字段（少见），临时方案是 fork 当前 transport 类并覆写 ``supports_reasoning_effort = True``；后续版本会按需要在路由表里追加。
+- **Tushare 缓存策略覆盖**：插件作者可在 ``deeptrade_plugin.yaml`` 写
+  ```yaml
+  permissions:
+    tushare_apis:
+      cache_overrides:
+        moneyflow_industry_ths: trade_day_mutable
+  ```
+  把框架表里没列出的 API 显式钉到正确的缓存类，避免依赖默认 ``trade_day_immutable``。运行时由插件自己把这份 dict 作为 ``cache_overrides=...`` 传给 ``TushareClient``。
+
 ## [v0.5.0] — 2026-05-15 — 插件信任边界 + CLI 中文化
 
 本版主线落地 2026-05-15 评审研判文档 `DeepTrade-review-assessment-and-fix-plan-2026-05-15.md` 中的 v0.5 路线：把"插件可以声明并清掉框架核心表"这条被忽视的信任边界明确收口，让框架的 SQL 迁移有边界、插件加载有 sys.modules 守卫、升级路径不会被静默改动的历史 migration 蒙混过关；同时把命令行用户向文案统一为中文，建立首道防回退的回归测试。整体不引入新框架概念（拒绝了报告里的 RuntimeContext 大对象、独立 venv、SQL DSL 等重型方案），保持"框架轻、插件重"的原则。

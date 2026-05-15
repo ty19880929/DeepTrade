@@ -110,6 +110,11 @@ DEFAULT_HOT_TTL_SECONDS = 6 * 3600
 # Default TTL for static class
 STATIC_TTL_SECONDS = 7 * 24 * 3600
 
+# v0.6 M9 — process-level dedup of "unknown api defaulted to trade_day_immutable"
+# log lines. Without this each call site for an unclassified API would emit a
+# fresh INFO row.
+_UNKNOWN_API_LOGGED: set[str] = set()
+
 
 # ---------------------------------------------------------------------------
 # Errors
@@ -454,6 +459,7 @@ class TushareClient:
         intraday: bool = False,
         max_retries: int = 7,
         event_cb: Callable[[str, str, dict[str, Any]], None] | None = None,
+        cache_overrides: dict[str, CacheClass] | None = None,
     ) -> None:
         self._db = db
         self._transport = transport
@@ -461,6 +467,15 @@ class TushareClient:
         self._bucket = _TokenBucket(rps)
         self._intraday = intraday
         self._event_cb = event_cb
+        # v0.6 M9 — per-instance cache classification overrides. Plugin authors
+        # supply this from their ``deeptrade_plugin.yaml::permissions.tushare_apis
+        # .cache_overrides`` so an API the framework doesn't know about can be
+        # classified correctly without monkey-patching the framework's table.
+        self._cache_overrides: dict[str, CacheClass] = dict(cache_overrides or {})
+        # One-shot INFO log dedup: each unknown api_name logs at most once
+        # per client instance (and via _UNKNOWN_API_LOGGED below, once per
+        # process across all clients).
+        self._unknown_api_logged: set[str] = set()
         # R1 (HARD CONSTRAINT): the Retrying object wraps `_do_fetch`, whose
         # FIRST line is `self._bucket.acquire()`. Every retry attempt re-enters
         # `_do_fetch`, so the token bucket is honored on every attempt — the
@@ -582,7 +597,7 @@ class TushareClient:
         # so that daily(start=A,end=B) and daily(start=C,end=D) live in
         # different cache rows even when neither passes a single trade_date.
         cache_key_date = self._compute_cache_key_date(trade_date, params)
-        cache_class = API_CACHE_CLASS.get(api_name, "trade_day_immutable")
+        cache_class = self._resolve_cache_class(api_name)
 
         state = self._read_state(api_name, cache_key_date)
         if not force_sync and self._cache_hit(
@@ -598,6 +613,39 @@ class TushareClient:
 
         # Apply field projection at the read site (cache stays full).
         return self._project_fields(df, fields)
+
+    def _resolve_cache_class(self, api_name: str) -> CacheClass:
+        """Pick the cache classification for ``api_name``, in priority order:
+
+        1. Plugin-supplied ``cache_overrides`` (highest priority — lets a
+           plugin author correct the framework's table without a release).
+        2. Framework-curated ``API_CACHE_CLASS`` table.
+        3. Default ``trade_day_immutable``. The default fits the quant
+           workload (historical data dominates) but is wrong for
+           intraday-mutable APIs; emit a one-shot INFO log when we fall
+           into this branch so plugin authors notice and can declare the
+           correct class in their metadata.
+        """
+        override = self._cache_overrides.get(api_name)
+        if override is not None:
+            return override
+        explicit = API_CACHE_CLASS.get(api_name)
+        if explicit is not None:
+            return explicit
+        # Default + one-shot INFO log dedup'd both per-instance and
+        # per-process so high-frequency call paths don't drown logs.
+        if api_name not in self._unknown_api_logged:
+            self._unknown_api_logged.add(api_name)
+            if api_name not in _UNKNOWN_API_LOGGED:
+                _UNKNOWN_API_LOGGED.add(api_name)
+                logger.info(
+                    "Tushare API %r has no explicit cache class; defaulting to "
+                    "trade_day_immutable. Plugin authors: declare it under "
+                    "metadata.permissions.tushare_apis.cache_overrides if this "
+                    "API returns mutable data.",
+                    api_name,
+                )
+        return "trade_day_immutable"
 
     @staticmethod
     def _compute_cache_key_date(trade_date: str | None, params: dict[str, Any]) -> str:

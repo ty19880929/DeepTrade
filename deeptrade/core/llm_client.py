@@ -139,7 +139,18 @@ class OpenAICompatTransport(LLMTransport):
     implementation returns ``{}``: appropriate for OpenAI-compatible providers
     that don't recognize a thinking concept, where ``StageProfile.thinking``
     is silently dropped per the plugins_api/llm.py contract.
+
+    v0.6 — ``supports_reasoning_effort`` (class attribute) gates whether
+    ``reasoning_effort`` from :class:`StageProfile` is forwarded to the
+    provider. Default ``False``: most OpenAI-compatible Chinese providers
+    (DeepSeek / Kimi / Qwen non-reasoning models / Doubao) either ignore
+    the field or reject it as a 400, so we drop it by default. Subclasses
+    override to ``True`` only when the provider has documented support.
     """
+
+    # v0.6 H5 — see class docstring. The default is False; OpenAI-official
+    # is the only known transport that flips it to True.
+    supports_reasoning_effort: bool = False
 
     def __init__(self, api_key: str, base_url: str, timeout: int) -> None:
         from openai import OpenAI  # noqa: PLC0415
@@ -171,11 +182,16 @@ class OpenAICompatTransport(LLMTransport):
                 {"role": "user", "content": user},
             ],
             "response_format": {"type": "json_object"},
-            "reasoning_effort": reasoning_effort,
             "temperature": temperature,
             "max_tokens": max_tokens,
             "stream": False,
         }
+        # v0.6 H5 — only send ``reasoning_effort`` when the transport
+        # declares support AND the caller actually supplied a non-empty
+        # value. Sending it unconditionally was the v0.5 default and is
+        # the dominant failure mode on Chinese OpenAI-compat providers.
+        if self.supports_reasoning_effort and reasoning_effort:
+            kwargs["reasoning_effort"] = reasoning_effort
         extra_body = self._provider_extra_body(thinking=thinking)
         if extra_body:
             kwargs["extra_body"] = extra_body
@@ -220,6 +236,19 @@ class DashScopeTransport(OpenAICompatTransport):
         return {"enable_thinking": thinking}
 
 
+class OpenAIOfficialTransport(OpenAICompatTransport):
+    """OpenAI's own ``api.openai.com`` endpoint.
+
+    Only this transport documents support for the ``reasoning_effort``
+    parameter (on the o1 / o3 reasoning family); flipping the base-class
+    flag here makes ``OpenAICompatTransport.chat`` forward the value from
+    :class:`StageProfile`. Other OpenAI-compatible providers either ignore
+    the field or 400 on it, so they keep the base-class default (False).
+    """
+
+    supports_reasoning_effort = True
+
+
 # ---------------------------------------------------------------------------
 # Transport routing (framework-internal)
 # ---------------------------------------------------------------------------
@@ -230,6 +259,7 @@ class DashScopeTransport(OpenAICompatTransport):
 # nowhere else; user-facing config has no "dialect" knob on purpose.
 _TRANSPORT_BY_BASE_URL: tuple[tuple[str, type[OpenAICompatTransport]], ...] = (
     ("dashscope.aliyuncs.com", DashScopeTransport),
+    ("api.openai.com", OpenAIOfficialTransport),
 )
 
 

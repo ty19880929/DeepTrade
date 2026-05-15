@@ -173,8 +173,20 @@ def llm_api_key_name(key: str) -> str | None:
 
 
 def env_var_for(key: str) -> str:
-    """Map dotted key → DEEPTRADE_<UPPER_SNAKE> env var name."""
-    return "DEEPTRADE_" + key.upper().replace(".", "_")
+    """Map dotted key → ``DEEPTRADE_<UPPER_SNAKE>`` env var name.
+
+    Hyphens are normalized to underscores so that hyphen-containing provider
+    names (e.g. ``llm.qwen-plus.api_key``) yield a POSIX-valid identifier
+    (``DEEPTRADE_LLM_QWEN_PLUS_API_KEY``). Without this, the env var
+    ``DEEPTRADE_LLM_QWEN-PLUS_API_KEY`` cannot be set via ``export`` on
+    bash / sh — variable names there must match ``[A-Za-z_][A-Za-z0-9_]*``.
+
+    Collision risk: provider names ``qwen-plus`` and ``qwen_plus`` would map
+    to the same env var. :meth:`ConfigService.set_llm_provider` refuses such
+    a registration so users discover the conflict at write time rather than
+    at first env-var read.
+    """
+    return "DEEPTRADE_" + key.upper().replace(".", "_").replace("-", "_")
 
 
 def known_keys() -> list[str]:
@@ -364,6 +376,24 @@ class ConfigService:
             )
         current_raw = self.get("llm.providers")
         current: dict[str, Any] = dict(current_raw) if isinstance(current_raw, dict) else {}
+
+        # M6 — refuse a name that collides with an existing provider after
+        # ``env_var_for`` normalization (``-`` → ``_``). Without this, two
+        # providers ``qwen-plus`` and ``qwen_plus`` would share the env var
+        # ``DEEPTRADE_LLM_QWEN_PLUS_API_KEY`` and silently shadow each other
+        # on read. Surface the conflict at registration time.
+        normalized = name.replace("-", "_")
+        for existing_name in current:
+            if existing_name == name:
+                continue
+            if existing_name.replace("-", "_") == normalized:
+                raise ValueError(
+                    f"provider name {name!r} collides with {existing_name!r} after "
+                    f"env-var normalization (both map to "
+                    f"{env_var_for(f'llm.{name}.api_key')!r}); rename one to avoid "
+                    f"silent env-var shadowing"
+                )
+
         is_first = len(current) == 0
         existing = dict(current.get(name) or {})
         prior_default = bool(existing.get("is_default", False))

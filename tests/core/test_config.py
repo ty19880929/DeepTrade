@@ -80,6 +80,56 @@ def test_env_var_naming_convention() -> None:
     assert env_var_for("app.close_after") == "DEEPTRADE_APP_CLOSE_AFTER"
 
 
+def test_env_var_for_normalizes_hyphenated_provider_names() -> None:
+    """v0.6 M6 — hyphens in provider names must collapse to underscores so
+    the env var is a POSIX-valid identifier (``[A-Za-z_][A-Za-z0-9_]*``).
+    Without this, ``DEEPTRADE_LLM_QWEN-PLUS_API_KEY`` cannot be set via
+    bash/sh ``export``."""
+    assert env_var_for("llm.qwen-plus.api_key") == "DEEPTRADE_LLM_QWEN_PLUS_API_KEY"
+    assert env_var_for("llm.qwen-max-2024.api_key") == "DEEPTRADE_LLM_QWEN_MAX_2024_API_KEY"
+
+
+def test_set_llm_provider_refuses_hyphen_normalization_collision(
+    svc: ConfigService,
+) -> None:
+    """v0.6 M6 — registering two providers whose names normalize to the
+    same env var (``qwen-plus`` vs ``qwen_plus``) must fail at write time
+    rather than silently shadowing each other on read."""
+    svc.set_llm_provider(
+        "qwen-plus",
+        base_url="https://example.com",
+        model="qwen-plus",
+        api_key="sk-1",
+    )
+    with pytest.raises(ValueError, match="collides with"):
+        svc.set_llm_provider(
+            "qwen_plus",
+            base_url="https://example.com",
+            model="qwen-plus",
+            api_key="sk-2",
+        )
+
+
+def test_set_llm_provider_allows_updating_same_name(svc: ConfigService) -> None:
+    """Re-saving an existing provider must NOT trip the collision check —
+    a name only collides with *other* entries."""
+    svc.set_llm_provider(
+        "qwen-plus",
+        base_url="https://a",
+        model="qwen-plus",
+        api_key="sk-1",
+    )
+    # Same name, new model — should succeed.
+    svc.set_llm_provider(
+        "qwen-plus",
+        base_url="https://a",
+        model="qwen-turbo",
+        api_key="sk-1",
+    )
+    cfg = svc.get_app_config()
+    assert cfg.llm_providers["qwen-plus"].model == "qwen-turbo"
+
+
 # --- DoD 3 & 4: secret vs non-secret routing -------------------------------
 
 

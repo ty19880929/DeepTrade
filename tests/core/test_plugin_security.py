@@ -186,28 +186,81 @@ def test_install_rejects_core_table_via_install_pipeline(home: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# T18 — table_prefix: warn (v0.5) on derive mismatch; hard-fail when declared
+# T18 — table_prefix: hard-fail when omitted+mismatched (v0.6) or declared
 # ---------------------------------------------------------------------------
 
 
-def test_plugin_table_prefix_warns_when_omitted_and_mismatched() -> None:
-    """v0.5 behaviour: no explicit ``table_prefix`` + a table outside the
-    plugin_id-derived namespace → ``DeprecationWarning`` (not hard fail)."""
+def test_plugin_table_prefix_hard_fails_when_omitted_and_mismatched() -> None:
+    """v0.6 behaviour: no explicit ``table_prefix`` + a table outside the
+    plugin_id-derived namespace → ``ValidationError``.
+
+    v0.5 emitted a ``DeprecationWarning`` here; v0.6 promotes it to a hard
+    error per the v0.5 plan §5. See CHANGELOG.md v0.6.0."""
     spec = _minimal_metadata_dict(
         plugin_id="prefix-plug",
         tables=[
             {"name": "wrong_name", "description": "t", "purge_on_uninstall": True},
         ],
     )
-    with pytest.warns(DeprecationWarning, match="derived table prefix 'prefix_plug_'"):
-        meta = PluginMetadata.model_validate(spec)
-    # Parse still succeeds — the warning does not abort install in v0.5.
-    assert meta.tables[0].name == "wrong_name"
+    with pytest.raises(ValidationError, match="derived table prefix 'prefix_plug_'"):
+        PluginMetadata.model_validate(spec)
 
 
-def test_plugin_table_prefix_no_warning_when_tables_match_derived() -> None:
-    """Tables aligned with the derived prefix must NOT trigger the warning,
-    otherwise correctly-namespaced plugins would emit noise on every install."""
+# ---------------------------------------------------------------------------
+# v0.6 M9 — permissions.tushare_apis.cache_overrides
+# ---------------------------------------------------------------------------
+
+
+def test_tushare_apis_cache_overrides_default_empty() -> None:
+    """Omitting ``cache_overrides`` parses cleanly with an empty dict
+    default — old plugin yamls remain valid."""
+    spec = _minimal_metadata_dict()
+    meta = PluginMetadata.model_validate(spec)
+    assert meta.permissions.tushare_apis.cache_overrides == {}
+
+
+def test_tushare_apis_cache_overrides_accepts_valid_classes() -> None:
+    """Each of the four supported cache classes must be accepted."""
+    spec = _minimal_metadata_dict()
+    spec["permissions"] = {
+        "llm": False,
+        "llm_tools": False,
+        "tushare_apis": {
+            "required": [],
+            "optional": [],
+            "cache_overrides": {
+                "foo": "static",
+                "bar": "trade_day_immutable",
+                "baz": "trade_day_mutable",
+                "qux": "hot_or_anns",
+            },
+        },
+    }
+    meta = PluginMetadata.model_validate(spec)
+    assert meta.permissions.tushare_apis.cache_overrides["foo"] == "static"
+    assert meta.permissions.tushare_apis.cache_overrides["qux"] == "hot_or_anns"
+
+
+def test_tushare_apis_cache_overrides_rejects_typo() -> None:
+    """A typo in the class string must fail validation — silently accepting
+    ``inmutable`` would degrade caching at runtime with no diagnostic."""
+    spec = _minimal_metadata_dict()
+    spec["permissions"] = {
+        "llm": False,
+        "llm_tools": False,
+        "tushare_apis": {
+            "required": [],
+            "optional": [],
+            "cache_overrides": {"foo": "inmutable"},
+        },
+    }
+    with pytest.raises(ValidationError, match="invalid class"):
+        PluginMetadata.model_validate(spec)
+
+
+def test_plugin_table_prefix_passes_when_tables_match_derived() -> None:
+    """Tables aligned with the derived prefix must parse cleanly and emit
+    no ``DeprecationWarning`` (the v0.5 advisory channel is gone)."""
     import warnings
 
     spec = _minimal_metadata_dict(
@@ -218,7 +271,8 @@ def test_plugin_table_prefix_no_warning_when_tables_match_derived() -> None:
     )
     with warnings.catch_warnings():
         warnings.simplefilter("error", DeprecationWarning)
-        PluginMetadata.model_validate(spec)  # would raise if warning fired
+        meta = PluginMetadata.model_validate(spec)
+    assert meta.tables[0].name == "quiet_plug_t"
 
 
 def test_plugin_table_prefix_explicit_hard_fails_on_mismatch() -> None:

@@ -19,13 +19,23 @@ def _make_minimal_plugin_dir(
     base: Path,
     plugin_id: str,
     *,
-    table_ddl: str = "CREATE TABLE IF NOT EXISTS test_table (id INTEGER);\n",
-    table_name: str = "test_table",
+    table_ddl: str | None = None,
+    table_name: str | None = None,
 ) -> Path:
-    """Synthesize a minimal but valid plugin source dir under ``base``."""
+    """Synthesize a minimal but valid plugin source dir under ``base``.
+
+    v0.6 — defaults now derive ``table_name`` / ``table_ddl`` from the
+    plugin_id so the metadata satisfies the prefix-match invariant
+    (``<plugin_id-derived>_*``). Callers can still pass either argument
+    explicitly when a test targets a specific table name."""
+    pkg_name = plugin_id.replace("-", "_")
+    if table_name is None:
+        table_name = f"{pkg_name}_t"
+    if table_ddl is None:
+        table_ddl = f"CREATE TABLE IF NOT EXISTS {table_name} (id INTEGER);\n"
     src = base / f"_src_{plugin_id}"
     src.mkdir()
-    pkg = src / plugin_id.replace("-", "_")
+    pkg = src / pkg_name
     pkg.mkdir()
     (pkg / "__init__.py").write_text("")
     (pkg / "plugin.py").write_text(

@@ -14,14 +14,15 @@ DESIGN v0.5 (plugin trust boundary):
     * Entrypoint's top-level package must equal ``plugin_id.replace('-','_')``
       and must not collide with framework / common-dependency packages
       (:data:`RESERVED_TOP_PACKAGES`).
+DESIGN v0.6:
     * ``table_prefix`` declares the namespace the plugin's tables live in;
-      v0.5 only warns when tables fall outside the derived prefix, v0.6 will
-      promote that to a hard error.
+      v0.5 emitted a ``DeprecationWarning`` when tables fell outside the
+      derived prefix and the prefix was omitted — v0.6 promotes that to a
+      hard error so the lifecycle invariant is enforced uniformly.
 """
 
 from __future__ import annotations
 
-import warnings
 from typing import Literal
 
 from packaging.requirements import InvalidRequirement, Requirement
@@ -90,10 +91,42 @@ class MigrationSpec(BaseModel):
     checksum: str = Field(..., pattern=r"^sha256:[0-9a-f]{64}$")
 
 
+_CACHE_CLASS_VALUES: frozenset[str] = frozenset(
+    {"static", "trade_day_immutable", "trade_day_mutable", "hot_or_anns"}
+)
+
+
 class TushareApiPermissions(BaseModel):
+    """Per-plugin Tushare API permissions + cache hints.
+
+    v0.6 — ``cache_overrides`` lets plugin authors declare a non-default
+    cache class for any API. Without this, ``TushareClient`` defaults unknown
+    API names to ``trade_day_immutable`` (history-data sized for the typical
+    quant workload); a plugin pulling an intraday-mutable API can now override
+    the default safely via the metadata rather than monkey-patching the
+    framework's classifier table.
+    """
+
     model_config = ConfigDict(extra="forbid")
     required: list[str] = Field(default_factory=list)
     optional: list[str] = Field(default_factory=list)
+    cache_overrides: dict[str, str] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _cache_overrides_values_valid(self) -> TushareApiPermissions:
+        """Each override value must name one of the four supported cache
+        classes — typos here would silently break caching at runtime."""
+        bad = sorted(
+            f"{api}={cls!r}"
+            for api, cls in self.cache_overrides.items()
+            if cls not in _CACHE_CLASS_VALUES
+        )
+        if bad:
+            raise ValueError(
+                f"permissions.tushare_apis.cache_overrides has invalid class(es): "
+                f"{bad}; allowed: {sorted(_CACHE_CLASS_VALUES)}"
+            )
+        return self
 
 
 class PluginPermissions(BaseModel):
@@ -187,13 +220,17 @@ class PluginMetadata(BaseModel):
 
     @model_validator(mode="after")
     def _tables_match_prefix(self) -> PluginMetadata:
-        """v0.5 T02: enforce / advise a per-plugin table namespace.
+        """v0.6 T02 (hard-fail): enforce a per-plugin table namespace.
 
         * ``table_prefix`` declared explicitly → all declared tables MUST
-          start with it; mismatch is a hard error.
+          start with it.
         * ``table_prefix`` omitted → derive ``plugin_id.replace('-','_') + '_'``
-          and only emit a ``DeprecationWarning`` for tables outside that
-          namespace. v0.6 will promote this to a hard error.
+          and require all declared tables to match.
+
+        v0.5 emitted a ``DeprecationWarning`` for the omitted-prefix path;
+        v0.6 promotes it to a hard error per the v0.5 plan §5. Plugins that
+        hit this need to either rename their tables to share a common prefix
+        or declare an explicit ``table_prefix`` in ``deeptrade_plugin.yaml``.
         """
         if self.table_prefix is not None:
             offenders = sorted(
@@ -209,13 +246,10 @@ class PluginMetadata(BaseModel):
         derived = self.plugin_id.replace("-", "_") + "_"
         offenders = sorted(t.name for t in self.tables if not t.name.startswith(derived))
         if offenders:
-            warnings.warn(
+            raise ValueError(
                 f"plugin {self.plugin_id!r}: tables {offenders} do not match the "
-                f"derived table prefix {derived!r}. v0.6 will require either "
-                f"renaming the tables or declaring an explicit `table_prefix` "
-                f"in deeptrade_plugin.yaml. See CHANGELOG.md v0.5.0.",
-                DeprecationWarning,
-                stacklevel=2,
+                f"derived table prefix {derived!r}. Rename the tables or declare "
+                f"an explicit `table_prefix` in deeptrade_plugin.yaml."
             )
         return self
 

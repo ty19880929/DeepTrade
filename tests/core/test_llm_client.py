@@ -23,6 +23,7 @@ from deeptrade.core.llm_client import (
     LLMTransportError,
     LLMValidationError,
     OpenAICompatTransport,
+    OpenAIOfficialTransport,
     RecordedTransport,
     _select_transport_class,
 )
@@ -406,10 +407,129 @@ def test_select_transport_class_routes_dashscope_by_base_url() -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# v0.6 H5 — reasoning_effort gating
+# ---------------------------------------------------------------------------
+
+
+def test_supports_reasoning_effort_defaults_to_false() -> None:
+    """Base class + every non-OpenAI subclass declares False so the v0.5
+    default-on behavior (sending ``reasoning_effort`` to every provider) is
+    inverted to default-off."""
+    assert OpenAICompatTransport.supports_reasoning_effort is False
+    assert GenericOpenAITransport.supports_reasoning_effort is False
+    assert DashScopeTransport.supports_reasoning_effort is False
+    assert OpenAIOfficialTransport.supports_reasoning_effort is True
+
+
+def test_select_transport_class_routes_openai_official() -> None:
+    """``api.openai.com`` base_url routes to OpenAIOfficialTransport — the
+    only transport that surfaces ``reasoning_effort`` on the wire."""
+    assert _select_transport_class("https://api.openai.com/v1") is OpenAIOfficialTransport
+
+
+def test_generic_transport_drops_reasoning_effort(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Even when the caller's StageProfile sets ``reasoning_effort='high'``,
+    a Generic (non-OpenAI) transport must NOT send the field — most Chinese
+    OpenAI-compat providers either ignore or 400 on it."""
+    from types import SimpleNamespace
+
+    captured: dict[str, Any] = {}
+
+    def fake_create(**kwargs: Any) -> Any:
+        captured.update(kwargs)
+        choice = SimpleNamespace(message=SimpleNamespace(content='{"k": 1}'))
+        return SimpleNamespace(
+            choices=[choice],
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+        )
+
+    t = GenericOpenAITransport(api_key="dummy", base_url="https://api.deepseek.com", timeout=10)
+    monkeypatch.setattr(t._client.chat.completions, "create", fake_create)
+    t.chat(
+        model="deepseek-chat",
+        system="s",
+        user="u",
+        temperature=0.0,
+        max_tokens=8,
+        thinking=False,
+        reasoning_effort="high",
+    )
+    assert "reasoning_effort" not in captured, (
+        "GenericOpenAITransport must not forward reasoning_effort even when the caller sets it"
+    )
+
+
+def test_openai_official_transport_sends_reasoning_effort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The official OpenAI transport forwards ``reasoning_effort`` when the
+    caller's StageProfile supplies a non-empty value."""
+    from types import SimpleNamespace
+
+    captured: dict[str, Any] = {}
+
+    def fake_create(**kwargs: Any) -> Any:
+        captured.update(kwargs)
+        choice = SimpleNamespace(message=SimpleNamespace(content='{"k": 1}'))
+        return SimpleNamespace(
+            choices=[choice],
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+        )
+
+    t = OpenAIOfficialTransport(api_key="dummy", base_url="https://api.openai.com/v1", timeout=10)
+    monkeypatch.setattr(t._client.chat.completions, "create", fake_create)
+    t.chat(
+        model="o1-mini",
+        system="s",
+        user="u",
+        temperature=0.0,
+        max_tokens=8,
+        thinking=False,
+        reasoning_effort="medium",
+    )
+    assert captured.get("reasoning_effort") == "medium"
+
+
+def test_openai_official_transport_drops_empty_reasoning_effort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty ``reasoning_effort`` (caller declined to set one) is dropped
+    even on the official transport — sending an empty string would 400."""
+    from types import SimpleNamespace
+
+    captured: dict[str, Any] = {}
+
+    def fake_create(**kwargs: Any) -> Any:
+        captured.update(kwargs)
+        choice = SimpleNamespace(message=SimpleNamespace(content='{"k": 1}'))
+        return SimpleNamespace(
+            choices=[choice],
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+        )
+
+    t = OpenAIOfficialTransport(api_key="dummy", base_url="https://api.openai.com/v1", timeout=10)
+    monkeypatch.setattr(t._client.chat.completions, "create", fake_create)
+    t.chat(
+        model="o1-mini",
+        system="s",
+        user="u",
+        temperature=0.0,
+        max_tokens=8,
+        thinking=False,
+        reasoning_effort="",
+    )
+    assert "reasoning_effort" not in captured
+
+
 def test_select_transport_class_defaults_to_generic() -> None:
     """Unknown base_urls fall back to GenericOpenAITransport — this preserves
-    the v0.6 behavior (no thinking knob) for every previously-supported
-    provider, so no migration of stored configs is required."""
+    the v0.5 behavior (no thinking knob) for every previously-supported
+    provider, so no migration of stored configs is required.
+
+    v0.6 — ``api.openai.com`` is now explicitly routed to
+    :class:`OpenAIOfficialTransport` so the ``reasoning_effort`` knob
+    actually reaches the wire; that case is covered separately below.
+    """
     assert _select_transport_class("https://api.deepseek.com") is GenericOpenAITransport
-    assert _select_transport_class("https://api.openai.com/v1") is GenericOpenAITransport
     assert _select_transport_class("https://api.moonshot.cn/v1") is GenericOpenAITransport

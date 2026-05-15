@@ -486,3 +486,82 @@ def test_cache_payload_round_trip_preserves_dtypes(client: TushareClient) -> Non
         assert out[col].dtype == df[col].dtype, f"dtype drift on {col}: {out[col].dtype}"
     assert out["trade_date"].tolist() == ["20260427", "20260428"]
     assert (out["ann_dt"] == df["ann_dt"]).all()
+
+
+# ---------------------------------------------------------------------------
+# v0.6 M9 — cache_overrides + unknown-API one-shot INFO log
+# ---------------------------------------------------------------------------
+
+
+def test_cache_overrides_take_priority_over_curated_table(
+    db: Database, transport: FixtureTransport
+) -> None:
+    """A plugin-supplied override must beat the framework's curated
+    ``API_CACHE_CLASS`` entry. Use ``daily`` (curated as
+    ``trade_day_immutable``) flipped to ``trade_day_mutable`` and verify
+    the new path participates in the resolver result."""
+    overridden = TushareClient(
+        db,
+        transport,
+        plugin_id=TEST_PLUGIN_ID,
+        rps=1000.0,
+        cache_overrides={"daily": "trade_day_mutable"},
+    )
+    # Internal resolver is the only single check that doesn't require
+    # rerunning the entire cache-hit pipeline; assert it directly.
+    assert overridden._resolve_cache_class("daily") == "trade_day_mutable"
+    # Baseline client without overrides keeps the curated value.
+    plain = TushareClient(db, transport, plugin_id=TEST_PLUGIN_ID, rps=1000.0)
+    assert plain._resolve_cache_class("daily") == "trade_day_immutable"
+
+
+def test_cache_overrides_classify_unknown_api(db: Database, transport: FixtureTransport) -> None:
+    """An API the framework doesn't know about must be classifiable via
+    metadata-supplied ``cache_overrides`` — without ever hitting the
+    "default to trade_day_immutable + INFO log" branch."""
+    import deeptrade.core.tushare_client as tc_mod
+
+    tc_mod._UNKNOWN_API_LOGGED.clear()  # reset process-level dedup state
+
+    client = TushareClient(
+        db,
+        transport,
+        plugin_id=TEST_PLUGIN_ID,
+        rps=1000.0,
+        cache_overrides={"my_plugin_special": "hot_or_anns"},
+    )
+    assert client._resolve_cache_class("my_plugin_special") == "hot_or_anns"
+    # Override path doesn't pollute the process-level "unknown" log set.
+    assert "my_plugin_special" not in tc_mod._UNKNOWN_API_LOGGED
+
+
+def test_unknown_api_logs_once_per_process(
+    db: Database, transport: FixtureTransport, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Unknown APIs default to ``trade_day_immutable`` and emit ONE INFO log
+    line per process — repeated calls on the same client (or a second
+    client) must not spam the log."""
+    import logging
+
+    import deeptrade.core.tushare_client as tc_mod
+
+    tc_mod._UNKNOWN_API_LOGGED.clear()
+
+    client_a = TushareClient(db, transport, plugin_id=TEST_PLUGIN_ID, rps=1000.0)
+    client_b = TushareClient(db, transport, plugin_id=TEST_PLUGIN_ID, rps=1000.0)
+
+    with caplog.at_level(logging.INFO, logger="deeptrade.core.tushare_client"):
+        assert client_a._resolve_cache_class("never_seen_api") == "trade_day_immutable"
+        assert client_a._resolve_cache_class("never_seen_api") == "trade_day_immutable"
+        assert client_b._resolve_cache_class("never_seen_api") == "trade_day_immutable"
+
+    matched = [
+        rec
+        for rec in caplog.records
+        if "never_seen_api" in rec.getMessage() and rec.levelno == logging.INFO
+    ]
+    assert len(matched) == 1, (
+        f"unknown-api INFO log should be one-shot per process; got {len(matched)} entries"
+    )
+    assert "trade_day_immutable" in matched[0].getMessage()
+    assert "cache_overrides" in matched[0].getMessage()

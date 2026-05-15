@@ -42,6 +42,9 @@ from deeptrade.plugins_api.metadata import (
 logger = logging.getLogger(__name__)
 
 CURRENT_API_VERSION = "1"
+# v0.6 — both legacy v1 and ctx-aware v2 dispatch are first-class. New
+# plugin authors should use "2"; "1" is supported without deprecation.
+SUPPORTED_API_VERSIONS: frozenset[str] = frozenset({"1", "2"})
 
 # Reserved framework-level command names. A plugin_id colliding with any of
 # these would shadow framework dispatch and is rejected at install time.
@@ -270,9 +273,10 @@ class PluginManager:
                 f"(reserved: {sorted(RESERVED_PLUGIN_IDS)})"
             )
 
-        if meta.api_version != CURRENT_API_VERSION:
+        if meta.api_version not in SUPPORTED_API_VERSIONS:
             raise PluginInstallError(
-                f"plugin api_version {meta.api_version} != framework {CURRENT_API_VERSION}"
+                f"plugin api_version {meta.api_version!r} not supported by framework "
+                f"(supported: {sorted(SUPPORTED_API_VERSIONS)})"
             )
 
         # M3 hard-constraint enforcement (Pydantic Literal[False] also catches it)
@@ -539,9 +543,10 @@ class PluginManager:
                 f"如需降级，请先 `deeptrade plugin uninstall {meta.plugin_id} --purge`"
             )
 
-        if meta.api_version != CURRENT_API_VERSION:
+        if meta.api_version not in SUPPORTED_API_VERSIONS:
             raise PluginInstallError(
-                f"plugin api_version {meta.api_version} != framework {CURRENT_API_VERSION}"
+                f"plugin api_version {meta.api_version!r} not supported by framework "
+                f"(supported: {sorted(SUPPORTED_API_VERSIONS)})"
             )
         if meta.permissions.llm_tools is not False:
             raise PluginInstallError("permissions.llm_tools=true is forbidden")

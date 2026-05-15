@@ -28,23 +28,79 @@ class _KeyringBackend(Protocol):
     def delete_password(self, service_name: str, username: str) -> None: ...
 
 
+# M8 — module-level cache so the keyring probe runs at most once per process.
+# Pre-v0.6 each ``SecretStore.__init__`` round-tripped a `__probe__` credential
+# through the OS credential store (macOS Keychain / Windows Credential Manager
+# / Linux Secret Service), which (a) cost a syscall per construction and (b)
+# polluted the credential store's audit log every time. v0.6 inspects the
+# selected backend's class instead and only marks the keyring unavailable
+# when it's an explicitly broken backend (``null`` / ``fail`` family).
+_keyring_cache: _KeyringBackend | None = None
+_keyring_probed: bool = False
+
+
+def _invalidate_keyring_cache() -> None:
+    """Test hook — clear the module-level probe cache so the next
+    ``_try_load_keyring`` re-probes. Production code never calls this."""
+    global _keyring_cache, _keyring_probed
+    _keyring_cache = None
+    _keyring_probed = False
+
+
 def _try_load_keyring() -> _KeyringBackend | None:
-    """Attempt to import & probe keyring. Return backend or None on failure."""
+    """Detect whether a usable keyring backend is present.
+
+    Strategy (v0.6 M8 — non-write probe):
+
+    1. Import ``keyring``; missing module → return None.
+    2. Inspect the active backend class via ``keyring.get_keyring()``.
+       The standard library distinguishes "no usable backend" as the
+       ``keyring.backends.fail.Keyring`` / ``keyring.backends.null.Keyring``
+       classes (matched by FQCN substring so we don't have to import
+       optional internals).
+    3. Any other backend (Windows Credential Manager, macOS Keychain,
+       Secret Service, kwallet, chainer, ...) is trusted. We do NOT
+       round-trip a sentinel credential — that was the v0.5 behavior and
+       it polluted the credential store on every ``SecretStore.__init__``.
+
+    The result is cached at module level (:func:`_invalidate_keyring_cache`
+    is the test escape hatch). Process-global cache is safe because
+    keyring backends are themselves process-global state.
+    """
+    global _keyring_cache, _keyring_probed
+    if _keyring_probed:
+        return _keyring_cache
+
+    _keyring_probed = True
     try:
         import keyring  # noqa: PLC0415 — deferred import on purpose
-        from keyring.errors import KeyringError  # noqa: PLC0415
     except ImportError:
+        _keyring_cache = None
         return None
     try:
-        # Probe: round-trip a sentinel
-        keyring.set_password(_KR_SERVICE, "__probe__", "ok")
-        if keyring.get_password(_KR_SERVICE, "__probe__") != "ok":
-            return None
-        keyring.delete_password(_KR_SERVICE, "__probe__")
-        return keyring  # type: ignore[return-value]
-    except (KeyringError, Exception) as e:  # noqa: BLE001 — capture all backend errors
-        logger.warning("keyring unavailable: %s; falling back to plaintext", e)
+        backend = keyring.get_keyring()
+    except Exception as e:  # noqa: BLE001 — keyring init can fail on weird hosts
+        logger.warning("keyring backend introspection failed: %s; using plaintext", e)
+        _keyring_cache = None
         return None
+
+    # Reject only the explicitly-broken backend classes; everything else
+    # is presumed functional. Match by FQCN substring rather than isinstance
+    # so we avoid importing optional internals that may not exist on every
+    # keyring version.
+    backend_fqcn = f"{type(backend).__module__}.{type(backend).__name__}"
+    if any(
+        marker in backend_fqcn for marker in ("keyring.backends.fail.", "keyring.backends.null.")
+    ):
+        logger.info(
+            "keyring backend is %s (no usable credential store); using plaintext",
+            backend_fqcn,
+        )
+        _keyring_cache = None
+        return None
+
+    _keyring_cache = keyring  # type: ignore[assignment]
+    return _keyring_cache
 
 
 @dataclass

@@ -1,4 +1,4 @@
-"""Plugin contract — api_version "1".
+"""Plugin contract — api_version "1" (legacy) and "2" (v0.6+).
 
 A plugin is a Python class implementing this Protocol. The framework loads it
 via the dotted entrypoint declared in the YAML metadata. The framework knows
@@ -6,7 +6,19 @@ NOTHING about the plugin's domain semantics; the plugin owns its own command
 parsing, execution, persistence, and output.
 
 ``PluginContext`` is the minimal services bundle the framework hands to every
-plugin's ``validate_static`` (during install).
+plugin's ``validate_static`` (during install). v0.6 ``api_version="2"``
+plugins ALSO receive it at dispatch time, removing the need to reach into
+``deeptrade.core.*`` from plugin code.
+
+Dispatch signatures by ``api_version``:
+
+* ``"1"`` — ``def dispatch(self, argv: list[str]) -> int`` (legacy).
+  Plugin reaches back into ``deeptrade.core.*`` for DB / config / etc.
+* ``"2"`` — ``def dispatch(self, ctx: PluginContext, argv: list[str]) -> int``.
+  Framework hands the same ``PluginContext`` shape ``validate_static``
+  gets, so plugins can stay on the public surface.
+
+Both versions remain supported; v0.6 does NOT deprecate v1.
 """
 
 from __future__ import annotations
@@ -49,8 +61,13 @@ class Plugin(Protocol):
         install (the framework will roll back).
         """
 
-    def dispatch(self, argv: list[str]) -> int:
+    def dispatch(self, *args: object) -> int:
         """CLI dispatch entry point.
+
+        Signature depends on ``metadata.api_version``:
+
+        * ``"1"`` — ``dispatch(self, argv: list[str]) -> int``.
+        * ``"2"`` — ``dispatch(self, ctx: PluginContext, argv: list[str]) -> int``.
 
         ``argv`` is the remaining command-line tail after the framework strips
         the leading ``<plugin_id>`` token. For example, when the user runs
@@ -59,4 +76,10 @@ class Plugin(Protocol):
 
         The plugin owns parsing, ``--help`` rendering, execution, persistence,
         and output. Returns the process exit code (0 = success).
+
+        The Protocol is declared variadic so ``isinstance(obj, Plugin)`` works
+        for both v1 and v2 implementations — ``runtime_checkable`` only
+        verifies attribute presence, never argument arity. The framework's
+        ``cli._dispatch`` decides which form to call based on
+        ``metadata.api_version``.
         """

@@ -126,8 +126,29 @@ def _build_plugin_command(plugin_id: str) -> click.Command | None:
         if not hasattr(plugin, "dispatch"):
             typer.echo(f"✘ 插件 {plugin_id!r} 未实现 dispatch()")
             raise typer.Exit(2)
+
+        argv = list(ctx.args)
         try:
-            rc = plugin.dispatch(list(ctx.args))
+            # v0.6 H4 — dispatch arity is selected by ``metadata.api_version``.
+            # ``"1"`` (legacy) keeps the historical ``dispatch(argv)`` signature
+            # so already-shipped plugins remain runnable without a rebuild.
+            # ``"2"`` receives the same ``PluginContext`` shape passed to
+            # ``validate_static`` at install time, removing the need for plugins
+            # to import ``deeptrade.core.*`` private modules.
+            if rec.api_version == "2":
+                from deeptrade.core.config import ConfigService
+                from deeptrade.plugins_api.base import PluginContext
+
+                # Reuse the framework's open Database / dispose lifecycle —
+                # plugins should NOT manage the framework's DB handle.
+                db = Database(paths.db_path())
+                try:
+                    plugin_ctx = PluginContext(db=db, config=ConfigService(db), plugin_id=plugin_id)
+                    rc = plugin.dispatch(plugin_ctx, argv)
+                finally:
+                    db.close()
+            else:
+                rc = plugin.dispatch(argv)
         except (SystemExit, KeyboardInterrupt):
             # Exit codes / Ctrl-C must propagate unaltered.
             raise
