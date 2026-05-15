@@ -177,3 +177,46 @@ def test_plugins_api_exposes_llm_manager_and_tushare_client() -> None:
     assert api.TushareClient is CoreTushareClient
     assert "LLMManager" in api.__all__
     assert "TushareClient" in api.__all__
+
+
+def test_framework_startup_does_not_import_pandas() -> None:
+    """Regression lock: importing ``deeptrade.cli`` must NOT pull
+    ``pandas`` into ``sys.modules``.
+
+    ``pandas`` is intentionally NOT a framework dependency — it lives
+    under ``[project.optional-dependencies].plugin-runtime`` and is
+    installed by plugins that depend on ``TushareClient``. The v0.6
+    public re-export of ``TushareClient`` from ``plugins_api`` was a
+    one-shot regression that broke this invariant (and the PyPI Smoke
+    test caught it). Lazy ``__getattr__`` fixes it; this test makes sure
+    a future "let's just eagerly import for convenience" PR fails CI."""
+    import importlib
+    import subprocess
+    import sys
+
+    # Cleanest probe: spawn a fresh interpreter so we measure the
+    # baseline import cost without any state this test session has
+    # already accumulated. Equivalent to what `deeptrade --help` does on
+    # a clean PyPI install (the Smoke test scenario in release.yml).
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import deeptrade.cli; import sys; "
+            "print('pandas' in sys.modules or any(m.startswith('pandas.') for m in sys.modules))",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, (
+        f"`import deeptrade.cli` failed in a fresh interpreter:\n"
+        f"stdout={result.stdout!r}\nstderr={result.stderr!r}"
+    )
+    assert result.stdout.strip() == "False", (
+        "`deeptrade.cli` import path drags pandas into sys.modules. Pandas "
+        "is plugin-runtime, NOT a framework dep — re-check any new eager "
+        "import you may have added to deeptrade/plugins_api/__init__.py or "
+        "deeptrade/core/*.py."
+    )
+    del importlib  # silence unused-import lint
