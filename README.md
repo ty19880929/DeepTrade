@@ -4,7 +4,7 @@
 
 > 📖 **在线文档**：[deeptrade.tiey.ai](https://deeptrade.tiey.ai) — 用户手册 + 开发者手册 + 官方插件目录
 
-[![tests](https://img.shields.io/badge/tests-passing-brightgreen)](#) [![python](https://img.shields.io/badge/python-3.11+-blue)](#) [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE) [![version](https://img.shields.io/badge/version-0.3.0-blue)](CHANGELOG.md)
+[![tests](https://img.shields.io/badge/tests-passing-brightgreen)](#) [![python](https://img.shields.io/badge/python-3.11+-blue)](#) [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE) [![version](https://img.shields.io/badge/version-0.4.2-blue)](CHANGELOG.md)
 
 ## ✨ 主要特性
 
@@ -75,6 +75,13 @@ deeptrade volume-anomaly evaluate         # T+N 自动回测闭环
 deeptrade volume-anomaly stats            # 收益统计聚合
 ```
 
+> **插件 Python 依赖（v0.4.0+）**：`deeptrade_plugin.yaml::dependencies` 中以 PEP 508 形式声明的依赖，会在 `plugin install` / `plugin upgrade` 期间被框架自动装入当前 Python 解释器（探测顺序 `uv pip install` → `python -m pip install`，已满足条件的 spec 跳过）。
+>
+> - `--no-deps`：跳过依赖安装步骤（适合离线环境，需自行 `pip install` 准备运行环境）
+> - `--reinstall-deps`：对全部声明的 spec 强制重跑 installer（带 `--upgrade`）
+> - 失败时框架会在错误信息中归因到"框架核心依赖"或具体已装插件，便于排查 spec 冲突
+> - 超时阈值（默认 300s）可用 `DEEPTRADE_DEP_INSTALL_TIMEOUT` 覆盖
+
 > **第三方 / 本地开发插件**：`deeptrade plugin install <SOURCE>` 三种来源统一处理，判定顺序为 *本地目录存在 → git URL → 注册表短名*：
 >
 > - `deeptrade plugin install ./path/to/my-plugin` — 本地目录
@@ -95,11 +102,11 @@ deeptrade volume-anomaly stats            # 收益统计聚合
 | `deeptrade db init` / `db upgrade` | 显式建库 / 应用待执行迁移 |
 | `deeptrade config {show, set, set-tushare, set-llm, list-llm, test-llm}` | 全局配置 |
 | `deeptrade plugin search [keyword] [--no-cache]` | 浏览官方注册表 |
-| `deeptrade plugin install <SOURCE> [--ref <REF>] [-y]` | 注册表短名 / GitHub URL / 本地路径 |
+| `deeptrade plugin install <SOURCE> [--ref <REF>] [--no-deps] [--reinstall-deps] [-y]` | 注册表短名 / GitHub URL / 本地路径；依赖按 PEP 508 自动解析装入框架解释器 |
 | `deeptrade plugin list` / `info <id>` | 列表 / 详情（未安装时回退注册表条目） |
 | `deeptrade plugin enable <id>` / `disable <id>` | 启 / 停 |
-| `deeptrade plugin uninstall <id> [--purge]` | 卸载（`--purge` 才 DROP 表） |
-| `deeptrade plugin upgrade <SOURCE> [--ref <REF>]` | 升级（SemVer 比较，禁止降级；增量 migrations） |
+| `deeptrade plugin uninstall <id> [--purge]` | 卸载（`--purge` 才 DROP 表；依赖**不**反向卸载） |
+| `deeptrade plugin upgrade <SOURCE> [--ref <REF>] [--no-deps] [--reinstall-deps]` | 升级（SemVer 比较，禁止降级；只跑增量 migrations + 依赖） |
 | `deeptrade data sync ...` | （暂停用，下版本恢复；改用插件自带的 sync 子命令） |
 
 保留字（不可作为 plugin_id）：`init / config / plugin / data / db`。
@@ -138,6 +145,20 @@ deeptrade volume-anomaly stats            # 收益统计聚合
 ```
 
 每个插件通过自己的 migrations 声明并拥有 `<prefix>_*` 业务表；`tushare_sync_state` / `tushare_calls` / `llm_calls` 按 `plugin_id` 维度隔离，`__framework__` 为框架自身保留 sentinel。
+
+## 🛠️ Troubleshooting / 环境变量
+
+框架行为通过环境变量调节；以下几个在排错与隔离测试时最常用：
+
+| 变量 | 默认 | 行为 |
+|---|---|---|
+| `DEEPTRADE_DEBUG` | unset | 置 `1` / `true` / `yes` / `on` 时，插件 dispatch 报错改为输出完整 `traceback`（含 `__cause__` 链）；否则只打一行 `✘ {ExcType}: {msg}` |
+| `DEEPTRADE_SKIP_AUTO_MIGRATE` | unset | 逃生通道：置 `1` 时跳过 `Database()` 构造时的自动 `apply_core_migrations`。仅用于"一次失败迁移把所有 CLI 命令都堵住"的恢复场景，正常流程**不要**用 |
+| `DEEPTRADE_DEP_INSTALL_TIMEOUT` | `300` | 单次 `uv pip install` / `python -m pip install` 子进程的秒级超时上限 |
+| `DEEPTRADE_HOME` | `~/.deeptrade` | 本地工件根目录覆盖（DuckDB 文件、插件安装目录、注册表缓存、reports 都在这下） |
+| `DEEPTRADE_DB_PATH` | `<DEEPTRADE_HOME>/deeptrade.duckdb` | 单独覆盖 DuckDB 文件路径（不影响其他工件） |
+
+凡 `Database()` 构造时（即任何 `deeptrade <…>` 命令首次落地）都会跑一次 `apply_core_migrations`，所以 0.4.2+ 的用户升级后无需再手动 `deeptrade db upgrade`。
 
 ## 📖 参考
 
