@@ -2,6 +2,28 @@
 
 All notable changes to DeepTrade. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and SemVer.
 
+## [v0.8.1] — 2026-05-16 — Moonshot reasoning 模型 temperature 兼容性
+
+`limit-up-board` 等插件接入 Kimi K2.6（``base_url = https://api.moonshot.cn/v1``）后，**所有** LLM 调用 100% 命中 ``HTTP 400 invalid temperature: only 1 is allowed for this model``。根因：Kimi K2 系列的 thinking / reasoning 变体（与 OpenAI o1/o3、Anthropic Sonnet thinking 同侧设计）在服务端硬约束 ``temperature``——仅接受模型专属的固定值，而插件 ``StageProfile`` 出于复现性给的是 ``0.0 ~ 0.2``。
+
+修复职责完全在框架：插件不应感知具体 provider/model 的服务端约束，框架的契约是「插件给一个温度意图，框架在真正发出请求前 sanitize 到目标 provider/model 能接受的取值」。
+
+### Changed
+
+- ``deeptrade/core/llm_client.py::OpenAICompatTransport``：新增 ``_adjust_temperature(model, temperature) -> float`` 钩子，默认 identity；``chat()`` 在写 kwargs 前调用钩子，并在改写时打一行 ``logger.info`` 便于排查。非 Moonshot 路径完全无感。
+- 新增 ``MoonshotTransport(OpenAICompatTransport)``：``_FORCED_TEMPERATURE`` prefix 表强制 ``kimi-k2-thinking`` / ``kimi-k2.5`` / ``kimi-k2.6`` 到 ``1.0``、``kimi-for-coding`` 到 ``0.6``；fallthrough 走 ``min(temperature, 1.0)`` 兼顾非 reasoning 模型（``moonshot-v1-*`` / ``kimi-k2-instruct-*``）的 ``[0, 1]`` 上限——Pydantic 字段允许到 2.0，超界一样 400。
+- ``_TRANSPORT_BY_BASE_URL`` 新增 ``("api.moonshot.cn", MoonshotTransport)``。substring 匹配自动覆盖 ``api.moonshot.cn`` / ``api.moonshot.cn/v1`` 所有形式；国际站 ``api.moonshot.ai`` 暂未支持，若后续需要追加一行即可。
+
+### Why prefix match, not exact / regex
+
+Moonshot 命名空间 ``<major>.<minor>[-<dated-revision>]`` 的天然分界就在 prefix。exact 会让 ``kimi-k2.6-1106`` / ``kimi-k2-thinking-128k`` 这类 dated revision 漏网，触发 0day 失败；regex 转义复杂度抬高 review 成本，收益不抵。
+
+### Migration notes
+
+- 插件零改动。``limit_up_board`` / 其他第三方插件的 ``profiles.py`` 不需要感知该约束。
+- 用户原本在 Kimi reasoning 模型上设的 ``temperature=0.0`` 在改写后会被强制为 ``1.0``——这本来就是服务端唯一允许的取值，不改写就是 100% 失败。
+- ``app.profile`` / ``llm.providers`` 配置无变动。
+
 ## [v0.8.0] — 2026-05-16 — 插件 install / upgrade 走 CDN，零 GitHub API 调用
 
 `deeptrade plugin install` 与 `deeptrade plugin upgrade` 此前在解析"最新版本"与下载 tarball 时各打一次 ``api.github.com``，未认证用户共享 60/h 的 IP 级配额。一旦插件用户数上来，或者用户与浏览器 / `gh` CLI / `git clone` 公共仓库共用同一公网 IP，``HTTP 403: rate limit exceeded`` 就会把 install / upgrade 直接打死。共享 token 会违反 GitHub ToS，且配额仍会在那个 token 上聚合——不是解。

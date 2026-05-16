@@ -22,6 +22,7 @@ from deeptrade.core.llm_client import (
     LLMTransport,
     LLMTransportError,
     LLMValidationError,
+    MoonshotTransport,
     OpenAICompatTransport,
     OpenAIOfficialTransport,
     RecordedTransport,
@@ -408,6 +409,96 @@ def test_select_transport_class_routes_dashscope_by_base_url() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Moonshot — server-side temperature constraint sanitization
+# ---------------------------------------------------------------------------
+
+
+def test_base_transport_adjust_temperature_is_identity() -> None:
+    """Default hook MUST NOT alter temperature — every non-Moonshot transport
+    relies on this. If this regresses, DashScope / DeepSeek / OpenAI / … will
+    silently start sending different temperatures than the caller requested.
+    """
+    t = GenericOpenAITransport(api_key="dummy", base_url="https://api.deepseek.com", timeout=10)
+    assert t._adjust_temperature(model="deepseek-chat", temperature=0.0) == 0.0
+    assert t._adjust_temperature(model="deepseek-chat", temperature=0.7) == 0.7
+    assert t._adjust_temperature(model="anything", temperature=1.5) == 1.5
+
+
+def test_moonshot_transport_forces_temperature_for_reasoning_variants() -> None:
+    """Kimi K2 reasoning variants only accept ``temperature == <forced>`` on
+    the wire; any other value returns HTTP 400. The transport must clamp to
+    the forced value regardless of what the StageProfile asks for.
+    """
+    t = MoonshotTransport(api_key="dummy", base_url="https://api.moonshot.cn/v1", timeout=10)
+    # forced to 1.0
+    assert t._adjust_temperature(model="kimi-k2.6", temperature=0.2) == 1.0
+    assert t._adjust_temperature(model="kimi-k2.6-1106", temperature=0.1) == 1.0
+    assert t._adjust_temperature(model="kimi-k2-thinking", temperature=0.0) == 1.0
+    assert t._adjust_temperature(model="kimi-k2-thinking-128k", temperature=0.5) == 1.0
+    assert t._adjust_temperature(model="kimi-k2.5", temperature=0.2) == 1.0
+    # forced to 0.6
+    assert t._adjust_temperature(model="kimi-for-coding", temperature=0.0) == 0.6
+    # no-op when caller already supplied the forced value
+    assert t._adjust_temperature(model="kimi-k2.6", temperature=1.0) == 1.0
+
+
+def test_moonshot_transport_clamps_non_reasoning_to_one() -> None:
+    """Non-reasoning Moonshot models accept [0, 1]; values above 1 also 400.
+    Pass through inside the range; clamp above."""
+    t = MoonshotTransport(api_key="dummy", base_url="https://api.moonshot.cn/v1", timeout=10)
+    assert t._adjust_temperature(model="moonshot-v1-32k", temperature=0.1) == 0.1
+    assert t._adjust_temperature(model="kimi-k2-instruct-0905", temperature=0.2) == 0.2
+    assert t._adjust_temperature(model="moonshot-v1-32k", temperature=1.0) == 1.0
+    assert t._adjust_temperature(model="moonshot-v1-32k", temperature=1.5) == 1.0
+
+
+def test_moonshot_transport_sends_forced_temperature_on_wire(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end wire-shape regression: chat() composes kwargs with the
+    *adjusted* temperature, not the caller's original value."""
+    from types import SimpleNamespace
+
+    captured: dict[str, Any] = {}
+
+    def fake_create(**kwargs: Any) -> Any:
+        captured.update(kwargs)
+        choice = SimpleNamespace(message=SimpleNamespace(content='{"k": 1}'))
+        return SimpleNamespace(
+            choices=[choice],
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+        )
+
+    t = MoonshotTransport(api_key="dummy", base_url="https://api.moonshot.cn/v1", timeout=10)
+    monkeypatch.setattr(t._client.chat.completions, "create", fake_create)
+    t.chat(
+        model="kimi-k2.6",
+        system="s",
+        user="u",
+        temperature=0.2,
+        max_tokens=64,
+        thinking=False,
+        reasoning_effort="",
+    )
+    assert captured["temperature"] == 1.0
+
+
+def test_select_transport_class_routes_moonshot() -> None:
+    """``api.moonshot.cn`` (with or without ``/v1``) routes to MoonshotTransport
+    via substring match, same pattern as the other entries in the routing table.
+    """
+    assert _select_transport_class("https://api.moonshot.cn/v1") is MoonshotTransport
+    assert _select_transport_class("https://api.moonshot.cn") is MoonshotTransport
+
+
+def test_moonshot_transport_inherits_reasoning_effort_default() -> None:
+    """Moonshot does not document support for the ``reasoning_effort`` field;
+    it inherits the base-class default (False) — confirm we didn't accidentally
+    flip it on along with adding the transport."""
+    assert MoonshotTransport.supports_reasoning_effort is False
+
+
+# ---------------------------------------------------------------------------
 # v0.6 H5 — reasoning_effort gating
 # ---------------------------------------------------------------------------
 
@@ -532,4 +623,4 @@ def test_select_transport_class_defaults_to_generic() -> None:
     actually reaches the wire; that case is covered separately below.
     """
     assert _select_transport_class("https://api.deepseek.com") is GenericOpenAITransport
-    assert _select_transport_class("https://api.moonshot.cn/v1") is GenericOpenAITransport
+    assert _select_transport_class("https://openrouter.ai/api/v1") is GenericOpenAITransport

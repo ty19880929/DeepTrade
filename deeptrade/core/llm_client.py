@@ -162,6 +162,16 @@ class OpenAICompatTransport(LLMTransport):
         del thinking  # base class has no provider knobs
         return {}
 
+    def _adjust_temperature(self, *, model: str, temperature: float) -> float:
+        """Provider/model-specific temperature sanitization hook.
+
+        Default: identity. Subclasses override to clamp / force temperature
+        for models with server-side hard constraints (e.g. Moonshot reasoning
+        variants that only accept ``temperature == 1``).
+        """
+        del model  # base class has no per-model constraints
+        return temperature
+
     def chat(
         self,
         *,
@@ -175,6 +185,15 @@ class OpenAICompatTransport(LLMTransport):
     ) -> LLMResponse:
         from openai import APIError, APITimeoutError  # noqa: PLC0415
 
+        adjusted_temperature = self._adjust_temperature(model=model, temperature=temperature)
+        if adjusted_temperature != temperature:
+            logger.info(
+                "transport adjusted temperature for model=%s: %.3f -> %.3f",
+                model,
+                temperature,
+                adjusted_temperature,
+            )
+
         kwargs: dict[str, Any] = {
             "model": model,
             "messages": [
@@ -182,7 +201,7 @@ class OpenAICompatTransport(LLMTransport):
                 {"role": "user", "content": user},
             ],
             "response_format": {"type": "json_object"},
-            "temperature": temperature,
+            "temperature": adjusted_temperature,
             "max_tokens": max_tokens,
             "stream": False,
         }
@@ -236,6 +255,47 @@ class DashScopeTransport(OpenAICompatTransport):
         return {"enable_thinking": thinking}
 
 
+class MoonshotTransport(OpenAICompatTransport):
+    """Moonshot Kimi (``api.moonshot.cn``).
+
+    Reasoning-variant models (``kimi-k2-thinking`` / ``kimi-k2.5`` /
+    ``kimi-k2.6``) have a server-side hard constraint: ``temperature`` MUST
+    equal a model-specific fixed value (1.0 for thinking variants, 0.6 for
+    ``kimi-for-coding``). Any other value returns HTTP 400 ``invalid
+    temperature``.
+
+    Non-reasoning Moonshot models accept the full ``[0, 1]`` range; values
+    above 1 also 400. We handle both: forced equality on known reasoning
+    variants, then fall through to range clamp for everyone else.
+
+    ``_FORCED_TEMPERATURE`` uses **prefix** match so that dated revisions
+    (``kimi-k2.6-1106``, ``kimi-k2-thinking-128k``, …) inherit the same
+    constraint without a code change. Only include models with confirmed
+    server-side enforcement, not just "recommended" values.
+
+    Note: the international site (``api.moonshot.ai``) shares the same
+    constraints — add a routing-table entry there if/when the framework
+    supports it.
+    """
+
+    # model-name prefix → forced temperature value
+    _FORCED_TEMPERATURE: tuple[tuple[str, float], ...] = (
+        ("kimi-k2-thinking", 1.0),
+        ("kimi-k2.5", 1.0),
+        ("kimi-k2.6", 1.0),
+        ("kimi-for-coding", 0.6),
+    )
+
+    def _adjust_temperature(self, *, model: str, temperature: float) -> float:
+        for prefix, forced in self._FORCED_TEMPERATURE:
+            if model.startswith(prefix):
+                return forced
+        # Moonshot accepts only [0, 1] across the whole API; upper-clamp guards
+        # non-reasoning models (moonshot-v1-*, kimi-k2-instruct-*) against a
+        # StageProfile that goes above 1.0 (the Pydantic field allows up to 2).
+        return min(temperature, 1.0)
+
+
 class OpenAIOfficialTransport(OpenAICompatTransport):
     """OpenAI's own ``api.openai.com`` endpoint.
 
@@ -259,6 +319,7 @@ class OpenAIOfficialTransport(OpenAICompatTransport):
 # nowhere else; user-facing config has no "dialect" knob on purpose.
 _TRANSPORT_BY_BASE_URL: tuple[tuple[str, type[OpenAICompatTransport]], ...] = (
     ("dashscope.aliyuncs.com", DashScopeTransport),
+    ("api.moonshot.cn", MoonshotTransport),
     ("api.openai.com", OpenAIOfficialTransport),
 )
 
