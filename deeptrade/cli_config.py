@@ -149,6 +149,7 @@ _DEFAULT_BASE_URLS: dict[str, str] = {
     "qwen": "https://dashscope.aliyuncs.com/compatible-mode/v1",
     "kimi": "https://api.moonshot.cn/v1",
     "doubao": "https://ark.cn-beijing.volces.com/api/v3",
+    "openai": "https://api.openai.com/v1",
 }
 
 
@@ -186,7 +187,7 @@ def cmd_set_llm() -> None:
 
 
 def _set_llm_new(svc: ConfigService) -> None:
-    name = questionary.text("Provider 名称（如 deepseek、qwen-plus、kimi）：").ask()
+    name = questionary.text("Provider 名称（如 deepseek、qwen-plus、kimi、openai）：").ask()
     if not name:
         raise typer.Exit(1)
     name = name.strip()

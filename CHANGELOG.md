@@ -2,6 +2,22 @@
 
 All notable changes to DeepTrade. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and SemVer.
 
+## [v0.9.1] — 2026-05-16 — `set-llm` 默认值表新增 OpenAI 官方端点
+
+交互式 `deeptrade config set-llm` 在用户敲入 provider 名称后会用首段（split-by-dash 第一段）去 `_DEFAULT_BASE_URLS` 查一个默认 base URL 预填到下一步表单。此前该表只覆盖 deepseek / qwen / kimi / doubao 四家国内供应商，命名 `openai` 时默认值为空字符串，用户需要自己记忆 / 粘贴 `https://api.openai.com/v1` 才能继续。
+
+底层 `OpenAIOfficialTransport` 早已存在并通过 `_TRANSPORT_BY_BASE_URL` 上的 `api.openai.com` substring 命中（v0.6 起），是唯一会把 `StageProfile.reasoning_effort` 真正写到 wire 的 transport（o1 / o3 reasoning 系列依赖）。这一版纯粹是补齐 wizard 的可发现性，运行时无任何行为差异。
+
+### Changed
+
+- `deeptrade/cli_config.py::_DEFAULT_BASE_URLS` 新增 `"openai": "https://api.openai.com/v1"`。命名为 `openai` / `openai-*`（如 `openai-o3`）的 provider 会自动预填该 base URL。
+- `_set_llm_new` 的 provider 名称提示串补上 `openai` 作为示例。
+
+### Migration notes
+
+- 已有的 OpenAI provider 配置（如果用户在更早版本手动建过）不受影响——`_DEFAULT_BASE_URLS` 仅在新增时作为表单默认值使用，存量记录不会被回写。
+- transport 路由、`reasoning_effort` 转发逻辑、`llm_calls` 审计字段全部不变。
+
 ## [v0.9.0] — 2026-05-16 — LLM transport 改流式，规避网关 idle-timeout
 
 打板等长生成场景下，`kimi-k2.6` 等 thinking 模型的非流式调用 100% 触发 `LLMTransportError: Request timed out.`，单次失败耗时 ~27 分钟（外层 tenacity 3 次 × openai SDK 3 次 × 180 s）。Moonshot 官方文档明确：思考模型在 server 端先思考再生成，**任何中间网关（包括 Moonshot 自家网关）只要看到长时间无 header 返回就会把 TCP 当僵尸连接切掉**，这是非流式的设计性缺陷，与 base_url / DNS / TLS 均无关。
