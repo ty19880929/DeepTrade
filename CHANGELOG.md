@@ -2,6 +2,40 @@
 
 All notable changes to DeepTrade. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and SemVer.
 
+## [v0.8.0] — 2026-05-16 — 插件 install / upgrade 走 CDN，零 GitHub API 调用
+
+`deeptrade plugin install` 与 `deeptrade plugin upgrade` 此前在解析"最新版本"与下载 tarball 时各打一次 ``api.github.com``，未认证用户共享 60/h 的 IP 级配额。一旦插件用户数上来，或者用户与浏览器 / `gh` CLI / `git clone` 公共仓库共用同一公网 IP，``HTTP 403: rate limit exceeded`` 就会把 install / upgrade 直接打死。共享 token 会违反 GitHub ToS，且配额仍会在那个 token 上聚合——不是解。
+
+本版改造将插件分发热路径全部搬到 CDN 端点：
+
+- **Tarball 下载**改走 ``codeload.github.com/<owner>/<repo>/tar.gz/<ref>``。codeload 是 CDN-backed 静态端点，不计入 REST API 限流。
+- **"最新版本"**改从注册表 ``index.json`` 的新字段 ``latest_version`` 读取（``raw.githubusercontent.com`` 同样不限流，且已有 ETag 缓存）。
+- **URL 形式安装**（``deeptrade plugin install https://github.com/...``）无 ``--ref`` 时默认 ``main`` 分支；其他默认分支需显式 ``--ref``。
+
+净效果：未认证用户走 ``install`` / ``upgrade`` 全流程**零 API 调用**，60/h 限制对默认路径不再存在。``GITHUB_TOKEN`` 不再被框架读取，文档不再推荐设置。
+
+### Changed
+
+- ``deeptrade/core/github_fetch.py``：删除 ``latest_release_tag`` / ``NoMatchingReleaseError``；``fetch_tarball`` 改写为 codeload 单端点（移除 ``GITHUB_TOKEN`` / ``X-GitHub-Api-Version`` header）。
+- ``deeptrade/core/registry.py``：``RegistryEntry`` 新增可选字段 ``latest_version: str | None``；解析器引入 ``_OPTIONAL_FIELDS`` 集合，含字段时填入，缺省 ``None``。schema_version 不变（仍为 1，向后兼容旧注册表文件）。
+- ``deeptrade/core/plugin_source.py``：``_resolve_short_name`` 用 ``entry.latest_version`` 替代 ``latest_release_tag``；缺字段且无 ``--ref`` 时抛 ``SourceResolveError`` 提示需补 ``--ref``。``_resolve_url`` 无 ``--ref`` 默认 ``main``；codeload 失败时错误信息提示用户切换 ``--ref``。
+- ``deeptrade/cli_plugin.py``：移除 ``NoMatchingReleaseError`` 引用。
+
+### Removed
+
+- ``latest_release_tag`` 公共函数与 ``NoMatchingReleaseError`` 异常类。
+- 对 ``GITHUB_TOKEN`` 环境变量的读取（github_fetch.py 中）。
+
+### Migration notes
+
+- **注册表维护者**：在 ``DeepTradePluginOfficial/registry/index.json`` 每个 plugin entry 中加 ``latest_version`` 字段，每次插件发版后同步该字段。可由 plugin 仓库 release workflow 自动 PR 到注册表仓库。
+- **存量旧版框架用户**：旧版（v0.7 及以下）仍会调 ``api.github.com``。``latest_version`` 字段是可选的、旧框架读取时会被忽略，不破坏现有用户；旧用户升级到本版后限流问题自动消失。
+- **URL 形式高级用户**：若你 host 的仓库默认分支不是 ``main``，``deeptrade plugin install https://github.com/<your>/<repo>`` 需显式 ``--ref <branch>``。
+
+### Why not "use a shared token"
+
+GitHub ToS 明确禁止 token 跨用户共享（被发现 token 会被吊销）；即便允许，5000/h 也会被规模化使用快速吃掉，且 token 泄露需要维护者承担权限滥用风险。CDN 改造是唯一既不需要每用户认证、又能稳定服务的方案。未来若需要支持私有仓库或企业内部分发，再走 OAuth Device Flow（``gh auth login`` 同款流程）让每个用户认证自己的 token。
+
 ## [v0.7.0] — 2026-05-15 — 依赖隔离稳健化 + timezone IANA 校验
 
 本版按 2026-05-15 评审研判文档 §5 v0.7 路线落地 2 项主线，至此 v0.5 § 5 全部"采纳项"清零：

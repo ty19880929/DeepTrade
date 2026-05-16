@@ -12,7 +12,6 @@ from deeptrade.core import paths
 from deeptrade.core.db import Database
 from deeptrade.core.github_fetch import (
     GitHubFetchError,
-    NoMatchingReleaseError,
     TarballFetchError,
 )
 from deeptrade.core.plugin_manager import (
@@ -41,7 +40,6 @@ _RESOLVE_ERRORS: tuple[type[Exception], ...] = (
     RegistryNotFoundError,
     RegistryFetchError,
     RegistrySchemaError,
-    NoMatchingReleaseError,
     TarballFetchError,
     GitHubFetchError,
     SourceResolveError,

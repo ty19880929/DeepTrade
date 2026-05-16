@@ -1,20 +1,23 @@
-"""GitHub release / tarball helpers.
+"""GitHub tarball download helper (CDN-only).
 
-Used by the plugin source resolver to (a) find the latest SemVer release tag
-matching a prefix and (b) download + extract a repo tarball into a directory.
+The plugin install / upgrade path downloads release tarballs from
+``codeload.github.com`` instead of ``api.github.com``. codeload is a
+CDN-backed static endpoint and does **not** count against the GitHub REST
+API rate limit (60/h for anonymous IPs), so plugin install works for
+every user out of the box — no ``GITHUB_TOKEN`` required.
 
-Implementation uses stdlib ``urllib.request`` + ``tarfile``; no third-party
-HTTP dependency. ``GITHUB_TOKEN`` env var is honored for rate-limit relief.
+"Latest version" used to be resolved via ``GET /repos/<repo>/releases``,
+but that costs an API request per install. It now comes from the
+``latest_version`` field in the registry index, which is served from
+``raw.githubusercontent.com`` (also CDN, also un-metered). See
+``deeptrade.core.plugin_source`` for the wiring.
 
-See ``CHANGELOG.md`` v0.3 entries for the distribution / install design context.
+See ``CHANGELOG.md`` for the distribution / install design context.
 """
 
 from __future__ import annotations
 
-import json
 import logging
-import os
-import re
 import shutil
 import tarfile
 import tempfile
@@ -22,23 +25,17 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from packaging.version import InvalidVersion, Version
-
 logger = logging.getLogger(__name__)
 
-GITHUB_API_BASE = "https://api.github.com"
+CODELOAD_BASE = "https://codeload.github.com"
 
 
 class GitHubFetchError(Exception):
-    """Generic GitHub API / fetch error."""
+    """Generic GitHub fetch error."""
 
 
 class TarballFetchError(GitHubFetchError):
     """Tarball download or extraction failure."""
-
-
-class NoMatchingReleaseError(GitHubFetchError):
-    """No releases match the requested tag_prefix."""
 
 
 def _user_agent() -> str:
@@ -47,119 +44,42 @@ def _user_agent() -> str:
     return f"deeptrade-cli/{__version__}"
 
 
-def _build_request(url: str, *, accept: str = "*/*") -> Request:
-    headers = {
-        "Accept": accept,
-        "User-Agent": _user_agent(),
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-    token = os.environ.get("GITHUB_TOKEN")
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    return Request(url, headers=headers)
-
-
-_NEXT_LINK_RE = re.compile(r'<([^>]+)>;\s*rel="next"')
-
-
-def _next_link(link_header: str | None) -> str | None:
-    if not link_header:
-        return None
-    for part in link_header.split(","):
-        m = _NEXT_LINK_RE.search(part)
-        if m:
-            return m.group(1)
-    return None
-
-
-def latest_release_tag(repo: str, tag_prefix: str = "", *, timeout: float = 15.0) -> str:
-    """Return the SemVer-highest release tag for ``repo``.
-
-    If ``tag_prefix`` is non-empty, only tags starting with it are considered;
-    after stripping the prefix and an optional leading ``v``, the remainder is
-    parsed as a SemVer version and the highest is returned.
-
-    If ``tag_prefix`` is empty, all release tags are considered (used for the
-    URL-direct install case).
-
-    Drafts and prereleases are skipped. Tags that do not parse as SemVer are
-    skipped silently.
-    """
-    url: str | None = f"{GITHUB_API_BASE}/repos/{repo}/releases?per_page=100"
-    candidates: list[tuple[Version, str]] = []
-
-    while url:
-        req = _build_request(url, accept="application/vnd.github+json")
-        try:
-            with urlopen(req, timeout=timeout) as resp:
-                payload = resp.read()
-                link_header = resp.headers.get("Link")
-        except HTTPError as e:
-            raise GitHubFetchError(f"HTTP {e.code} listing releases for {repo}: {e}") from e
-        except URLError as e:
-            raise GitHubFetchError(f"network error listing releases for {repo}: {e}") from e
-
-        try:
-            data = json.loads(payload.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as e:
-            raise GitHubFetchError(f"invalid JSON in releases response for {repo}: {e}") from e
-
-        if not isinstance(data, list):
-            raise GitHubFetchError(
-                f"expected JSON array of releases for {repo}, got {type(data).__name__}"
-            )
-
-        for r in data:
-            if not isinstance(r, dict):
-                continue
-            if r.get("draft") or r.get("prerelease"):
-                continue
-            tag = r.get("tag_name")
-            if not isinstance(tag, str):
-                continue
-            if tag_prefix and not tag.startswith(tag_prefix):
-                continue
-            ver_str = tag[len(tag_prefix) :] if tag_prefix else tag
-            ver_str = ver_str.lstrip("v")
-            try:
-                candidates.append((Version(ver_str), tag))
-            except InvalidVersion:
-                logger.debug("skipping non-semver tag: %s", tag)
-
-        url = _next_link(link_header)
-
-    if not candidates:
-        suffix = f" with tag_prefix {tag_prefix!r}" if tag_prefix else ""
-        raise NoMatchingReleaseError(f"no releases found for {repo}{suffix}")
-
-    candidates.sort(reverse=True)
-    return candidates[0][1]
+def _build_request(url: str) -> Request:
+    return Request(url, headers={"User-Agent": _user_agent()})
 
 
 def fetch_tarball(repo: str, ref: str, dest_dir: Path, *, timeout: float = 60.0) -> Path:
-    """Download ``repo`` at ``ref`` from the GitHub tarball API and extract.
+    """Download ``repo`` at ``ref`` from codeload.github.com and extract.
+
+    ``ref`` may be a tag (``v1.0.0`` or ``limit-up-board/v0.4.0``), a branch
+    name (``main``), a SHA, or a full git ref (``refs/tags/v1.0.0`` /
+    ``refs/heads/main``). codeload resolves all of these transparently.
 
     Returns the unique top-level directory created inside ``dest_dir``
-    (GitHub tarballs are wrapped in ``<owner>-<repo>-<sha7>/``).
+    (codeload tarballs are wrapped in ``<owner>-<repo>-<sha7>/``).
 
     Raises :class:`TarballFetchError` on network, HTTP, or extraction failure.
     """
     dest_dir.mkdir(parents=True, exist_ok=True)
-    url = f"{GITHUB_API_BASE}/repos/{repo}/tarball/{ref}"
+    url = f"{CODELOAD_BASE}/{repo}/tar.gz/{ref}"
 
     tmp_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
             tmp_path = Path(tmp.name)
 
-        req = _build_request(url, accept="application/vnd.github+json")
+        req = _build_request(url)
         try:
             with urlopen(req, timeout=timeout) as resp, tmp_path.open("wb") as fout:
                 shutil.copyfileobj(resp, fout)
         except HTTPError as e:
-            raise TarballFetchError(f"HTTP {e.code} downloading tarball {repo}@{ref}: {e}") from e
+            raise TarballFetchError(
+                f"HTTP {e.code} downloading tarball {repo}@{ref} from codeload: {e}"
+            ) from e
         except URLError as e:
-            raise TarballFetchError(f"network error downloading tarball {repo}@{ref}: {e}") from e
+            raise TarballFetchError(
+                f"network error downloading tarball {repo}@{ref} from codeload: {e}"
+            ) from e
 
         try:
             with tarfile.open(tmp_path, mode="r:gz") as tf:

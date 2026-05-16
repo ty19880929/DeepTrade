@@ -87,6 +87,12 @@ This is the **public** surface; the rest of `deeptrade.*` is internal. Stable as
 
 `SourceResolver` (`deeptrade/core/plugin_source.py`) resolves three source forms in this fixed order: local directory exists → GitHub URL (`http(s)://github.com/...` or `git@github.com:...`) → registry short name. The registry index is fetched from `raw.githubusercontent.com/.../DeepTradePluginOfficial/main/registry/index.json` with ETag caching to `~/.deeptrade/plugins/registry-cache.json`; cache is reused on network error.
 
+**The install/upgrade path must not hit `api.github.com`.** The 60/h anonymous rate limit makes the framework unusable for any user who didn't set `GITHUB_TOKEN`. Both metadata and tarball fetches go through CDN endpoints (`raw.githubusercontent.com` for the registry index, `codeload.github.com` for tarballs), neither of which counts against that quota. To support this:
+
+- The registry entry carries a `latest_version` field (optional in the schema, but populated for every published plugin) — short-name installs read this directly instead of calling `GET /repos/.../releases`. Plugin release CI is responsible for keeping `registry/index.json` in sync after each tag push.
+- `fetch_tarball(repo, ref, ...)` in `deeptrade/core/github_fetch.py` posts only to `codeload.github.com/<repo>/tar.gz/<ref>`. Do not add a code path that calls `api.github.com` from this module — even for "just one feature" — without re-evaluating the rate-limit story.
+- URL-form installs without `--ref` default to the `main` branch. Repos with a different default branch must be installed with an explicit `--ref`.
+
 ### DuckDB — single-process, single-writer
 
 `deeptrade/core/db.py::Database` wraps one DuckDB connection guarded by an `RLock` (re-entrant because `transaction()` and the user code inside it both acquire it). **The lock must span both `execute` AND `fetch`** on the same statement — releasing between them on the same connection causes Windows native heap corruption (0xC0000374). `transaction()` is reentrant via depth counting; only the outermost block issues `BEGIN/COMMIT/ROLLBACK`. There is no thread-safety contract — if you ever introduce background workers, route writes through a queue on the main thread.

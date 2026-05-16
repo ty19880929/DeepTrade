@@ -28,6 +28,12 @@ REGISTRY_URL = (
 _REQUIRED_FIELDS = frozenset(
     {"name", "type", "description", "repo", "subdir", "tag_prefix", "min_framework_version"}
 )
+# Optional fields parsed when present; absence is not a schema error.
+# ``latest_version``: registry-curated "current release tag", consumed by the
+# install/upgrade resolver so it never has to hit ``api.github.com`` to find
+# the latest release. Plugin release CI should keep this field up-to-date
+# in ``DeepTradePluginOfficial/registry/index.json``.
+_OPTIONAL_FIELDS = frozenset({"latest_version"})
 
 
 class RegistryError(Exception):
@@ -56,6 +62,10 @@ class RegistryEntry:
     subdir: str
     tag_prefix: str
     min_framework_version: str
+    # CDN-only install path: when present, the resolver uses this as the
+    # tag to download from codeload instead of calling the GitHub releases
+    # API. Optional for backward compat with registries written before v0.8.
+    latest_version: str | None = None
 
 
 @dataclass(frozen=True)
@@ -93,10 +103,11 @@ def _parse_registry(data: Any) -> Registry:
         missing = _REQUIRED_FIELDS - set(raw)
         if missing:
             raise RegistrySchemaError(f"plugins.{plugin_id} missing fields: {sorted(missing)}")
-        entries[plugin_id] = RegistryEntry(
-            plugin_id=plugin_id,
-            **{k: raw[k] for k in _REQUIRED_FIELDS},
-        )
+        fields: dict[str, Any] = {k: raw[k] for k in _REQUIRED_FIELDS}
+        for k in _OPTIONAL_FIELDS:
+            if k in raw:
+                fields[k] = raw[k]
+        entries[plugin_id] = RegistryEntry(plugin_id=plugin_id, **fields)
     return Registry(schema_version=schema_version, plugins=entries)
 
 

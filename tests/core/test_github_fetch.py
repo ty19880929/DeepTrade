@@ -1,27 +1,26 @@
 """Unit tests for deeptrade.core.github_fetch.
 
 Network calls (``urlopen``) are patched. Tarball extraction is exercised on
-real .tar.gz produced in-memory.
+real .tar.gz produced in-memory. Since the v0.8 CDN refactor, github_fetch
+only exposes ``fetch_tarball`` (latest-tag resolution moved to the registry
+``latest_version`` field).
 """
 
 from __future__ import annotations
 
 import io
-import json
 import tarfile
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
-from urllib.error import HTTPError, URLError
+from urllib.error import HTTPError
 
 import pytest
 
 from deeptrade.core.github_fetch import (
-    GitHubFetchError,
-    NoMatchingReleaseError,
+    CODELOAD_BASE,
     TarballFetchError,
     fetch_tarball,
-    latest_release_tag,
 )
 
 # ---------------------------------------------------------------------------
@@ -44,109 +43,10 @@ class _FakeResponse:
         self._buf.close()
 
 
-def _release(tag: str, *, draft: bool = False, prerelease: bool = False) -> dict[str, Any]:
-    return {"tag_name": tag, "draft": draft, "prerelease": prerelease}
-
-
-def _releases_response(*tags: str | dict[str, Any]) -> _FakeResponse:
-    items = [t if isinstance(t, dict) else _release(t) for t in tags]
-    return _FakeResponse(json.dumps(items).encode("utf-8"))
-
-
-# ---------------------------------------------------------------------------
-# latest_release_tag
-# ---------------------------------------------------------------------------
-
-
-def test_latest_release_tag_filters_by_prefix_and_picks_highest() -> None:
-    response = _releases_response(
-        "limit-up-board/v0.3.0",
-        "limit-up-board/v0.4.0",
-        "limit-up-board/v0.4.1",
-        "volume-anomaly/v0.6.0",
-    )
-    with patch("deeptrade.core.github_fetch.urlopen", return_value=response):
-        tag = latest_release_tag("foo/bar", "limit-up-board/")
-    assert tag == "limit-up-board/v0.4.1"
-
-
-def test_latest_release_tag_skips_drafts_and_prereleases() -> None:
-    response = _releases_response(
-        _release("limit-up-board/v1.0.0", prerelease=True),
-        _release("limit-up-board/v0.9.0", draft=True),
-        "limit-up-board/v0.4.0",
-    )
-    with patch("deeptrade.core.github_fetch.urlopen", return_value=response):
-        tag = latest_release_tag("foo/bar", "limit-up-board/")
-    assert tag == "limit-up-board/v0.4.0"
-
-
-def test_latest_release_tag_skips_non_semver_tags() -> None:
-    response = _releases_response(
-        "limit-up-board/release-final",
-        "limit-up-board/v0.4.0",
-    )
-    with patch("deeptrade.core.github_fetch.urlopen", return_value=response):
-        tag = latest_release_tag("foo/bar", "limit-up-board/")
-    assert tag == "limit-up-board/v0.4.0"
-
-
-def test_latest_release_tag_no_match_raises() -> None:
-    response = _releases_response("volume-anomaly/v0.6.0")
-    with patch("deeptrade.core.github_fetch.urlopen", return_value=response):
-        with pytest.raises(NoMatchingReleaseError):
-            latest_release_tag("foo/bar", "limit-up-board/")
-
-
-def test_latest_release_tag_empty_prefix_considers_all() -> None:
-    response = _releases_response("v0.1.0", "v0.2.0")
-    with patch("deeptrade.core.github_fetch.urlopen", return_value=response):
-        tag = latest_release_tag("foo/bar", "")
-    assert tag == "v0.2.0"
-
-
-def test_latest_release_tag_pagination() -> None:
-    page1 = _FakeResponse(
-        json.dumps([_release("limit-up-board/v0.3.0"), _release("limit-up-board/v0.3.1")]).encode(
-            "utf-8"
-        ),
-        headers={"Link": '<https://api.github.com/page2>; rel="next"'},
-    )
-    page2 = _releases_response("limit-up-board/v0.5.0")
-
-    responses = iter([page1, page2])
-
-    def fake_urlopen(*args: Any, **kwargs: Any) -> _FakeResponse:
-        return next(responses)
-
-    with patch("deeptrade.core.github_fetch.urlopen", side_effect=fake_urlopen):
-        tag = latest_release_tag("foo/bar", "limit-up-board/")
-    assert tag == "limit-up-board/v0.5.0"
-
-
-def test_latest_release_tag_http_error_raises() -> None:
-    err = HTTPError("https://x", 403, "rate limited", {}, None)  # type: ignore[arg-type]
-    with patch("deeptrade.core.github_fetch.urlopen", side_effect=err):
-        with pytest.raises(GitHubFetchError, match="HTTP 403"):
-            latest_release_tag("foo/bar", "limit-up-board/")
-
-
-def test_latest_release_tag_url_error_raises() -> None:
-    with patch("deeptrade.core.github_fetch.urlopen", side_effect=URLError("dns")):
-        with pytest.raises(GitHubFetchError, match="network error"):
-            latest_release_tag("foo/bar", "limit-up-board/")
-
-
-# ---------------------------------------------------------------------------
-# fetch_tarball
-# ---------------------------------------------------------------------------
-
-
 def _build_tarball(top_dir: str, files: dict[str, bytes]) -> bytes:
     """Build an in-memory .tar.gz with a single top-level directory."""
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tf:
-        # Add the top dir
         info = tarfile.TarInfo(name=top_dir)
         info.type = tarfile.DIRTYPE
         info.mode = 0o755
@@ -157,6 +57,11 @@ def _build_tarball(top_dir: str, files: dict[str, bytes]) -> bytes:
             info.mode = 0o644
             tf.addfile(info, io.BytesIO(content))
     return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# fetch_tarball
+# ---------------------------------------------------------------------------
 
 
 def test_fetch_tarball_extracts_and_returns_top_dir(tmp_path: Path) -> None:
@@ -176,6 +81,23 @@ def test_fetch_tarball_extracts_and_returns_top_dir(tmp_path: Path) -> None:
     assert (top / "data.py").read_text() == "# code\n"
 
 
+def test_fetch_tarball_uses_codeload_url(tmp_path: Path) -> None:
+    """Sanity-check the new endpoint: no api.github.com, codeload only."""
+    tarball = _build_tarball("owner-repo-abc1234", {"x": b""})
+    captured: dict[str, str] = {}
+
+    def fake_urlopen(req: Any, **_: Any) -> _FakeResponse:
+        captured["url"] = req.full_url
+        return _FakeResponse(tarball)
+
+    with patch("deeptrade.core.github_fetch.urlopen", side_effect=fake_urlopen):
+        fetch_tarball("owner/repo", "limit-up-board/v0.4.0", tmp_path)
+
+    assert captured["url"].startswith(CODELOAD_BASE + "/")
+    assert "api.github.com" not in captured["url"]
+    assert "owner/repo/tar.gz/limit-up-board/v0.4.0" in captured["url"]
+
+
 def test_fetch_tarball_http_error_raises(tmp_path: Path) -> None:
     err = HTTPError("https://x", 404, "Not Found", {}, None)  # type: ignore[arg-type]
     with patch("deeptrade.core.github_fetch.urlopen", side_effect=err):
@@ -191,7 +113,6 @@ def test_fetch_tarball_blocks_path_traversal(tmp_path: Path) -> None:
         info = tarfile.TarInfo(name="owner-repo-abc/")
         info.type = tarfile.DIRTYPE
         tf.addfile(info)
-        # This member resolves to dest_dir's parent — outside the destination
         info = tarfile.TarInfo(name="../escaped.txt")
         info.size = 4
         tf.addfile(info, io.BytesIO(b"evil"))
@@ -202,5 +123,4 @@ def test_fetch_tarball_blocks_path_traversal(tmp_path: Path) -> None:
     ):
         with pytest.raises(TarballFetchError, match="extract"):
             fetch_tarball("owner/repo", "v1.0.0", dest)
-    # Sanity: the escaped file was NOT written outside dest
     assert not (tmp_path / "escaped.txt").exists()

@@ -28,9 +28,7 @@ from packaging.version import InvalidVersion, Version
 
 from deeptrade.core.github_fetch import (
     GitHubFetchError,
-    NoMatchingReleaseError,
     fetch_tarball,
-    latest_release_tag,
 )
 from deeptrade.core.registry import (
     RegistryClient,
@@ -109,14 +107,20 @@ class SourceResolver:
         self._check_framework_version(entry)
 
         if ref is None:
-            try:
-                ref = latest_release_tag(entry.repo, entry.tag_prefix)
-            except (NoMatchingReleaseError, GitHubFetchError) as e:
-                raise SourceResolveError(str(e)) from e
+            if not entry.latest_version:
+                raise SourceResolveError(
+                    f"registry entry for {plugin_id!r} is missing 'latest_version' and no "
+                    f"--ref was supplied; pass --ref <tag> explicitly, or wait for the "
+                    f"registry to publish a latest_version for this plugin"
+                )
+            ref = entry.latest_version
 
         tmp = tempfile.TemporaryDirectory(prefix="deeptrade-plugin-")
         try:
-            top = fetch_tarball(entry.repo, ref, Path(tmp.name))
+            try:
+                top = fetch_tarball(entry.repo, ref, Path(tmp.name))
+            except GitHubFetchError as e:
+                raise SourceResolveError(str(e)) from e
             plugin_path = top / entry.subdir
             if not plugin_path.is_dir():
                 raise SourceResolveError(f"subdir {entry.subdir!r} not found in {entry.repo}@{ref}")
@@ -145,15 +149,22 @@ class SourceResolver:
         owner, repo_name = _parse_github_url(url)
         repo = f"{owner}/{repo_name}"
 
+        # URL form has no registry entry to consult, so we cannot know the
+        # "latest release tag" without hitting api.github.com (which the v0.8
+        # CDN refactor explicitly avoids). Default to the ``main`` branch; if
+        # the repo's default branch is something else, the codeload 404 surfaces
+        # with a hint to pass ``--ref`` explicitly.
         if ref is None:
-            try:
-                ref = latest_release_tag(repo, "")
-            except (NoMatchingReleaseError, GitHubFetchError) as e:
-                raise SourceResolveError(str(e)) from e
+            ref = "main"
 
         tmp = tempfile.TemporaryDirectory(prefix="deeptrade-plugin-")
         try:
-            top = fetch_tarball(repo, ref, Path(tmp.name))
+            try:
+                top = fetch_tarball(repo, ref, Path(tmp.name))
+            except GitHubFetchError as e:
+                raise SourceResolveError(
+                    f"{e}; if your repo's default branch is not 'main', pass --ref <branch-or-tag>"
+                ) from e
             yaml_path = top / "deeptrade_plugin.yaml"
             if not yaml_path.is_file():
                 raise SourceResolveError(

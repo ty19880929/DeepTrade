@@ -1,4 +1,10 @@
-"""Unit tests for deeptrade.core.plugin_source — SourceResolver."""
+"""Unit tests for deeptrade.core.plugin_source — SourceResolver.
+
+The v0.8 CDN refactor removed all api.github.com usage from the resolver:
+short-name flow reads the registry's ``latest_version`` field; URL flow
+defaults to the ``main`` branch when ``--ref`` is omitted. These tests
+exercise both paths.
+"""
 
 from __future__ import annotations
 
@@ -30,6 +36,7 @@ def _entry(**overrides: Any) -> RegistryEntry:
         "subdir": "limit_up_board",
         "tag_prefix": "limit-up-board/",
         "min_framework_version": "0.1.0",
+        "latest_version": "limit-up-board/v0.4.0",
     }
     base.update(overrides)
     return RegistryEntry(**base)
@@ -61,12 +68,15 @@ def test_resolve_local_path(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_resolve_short_name_happy_path(tmp_path: Path) -> None:
+def test_resolve_short_name_uses_registry_latest_version(tmp_path: Path) -> None:
     registry = MagicMock()
     registry.resolve.return_value = _entry()
 
-    # Stand up a fake extracted tarball: tmp/<top>/limit_up_board/deeptrade_plugin.yaml
+    captured: dict[str, str] = {}
+
     def fake_fetch_tarball(repo: str, ref: str, dest_dir: Path) -> Path:
+        captured["repo"] = repo
+        captured["ref"] = ref
         top = dest_dir / "ty19880929-DeepTradePluginOfficial-abc1234"
         plugin = top / "limit_up_board"
         plugin.mkdir(parents=True)
@@ -74,18 +84,13 @@ def test_resolve_short_name_happy_path(tmp_path: Path) -> None:
         return top
 
     resolver = SourceResolver(registry=registry, framework_version="0.1.0")
-    with (
-        patch(
-            "deeptrade.core.plugin_source.latest_release_tag",
-            return_value="limit-up-board/v0.4.0",
-        ),
-        patch(
-            "deeptrade.core.plugin_source.fetch_tarball",
-            side_effect=fake_fetch_tarball,
-        ),
+    with patch(
+        "deeptrade.core.plugin_source.fetch_tarball",
+        side_effect=fake_fetch_tarball,
     ):
         resolved = resolver.resolve("limit-up-board")
 
+    assert captured["ref"] == "limit-up-board/v0.4.0"
     assert resolved.origin == "github_registry"
     assert resolved.path.name == "limit_up_board"
     assert (resolved.path / "deeptrade_plugin.yaml").is_file()
@@ -94,11 +99,14 @@ def test_resolve_short_name_happy_path(tmp_path: Path) -> None:
     resolved.cleanup()
 
 
-def test_resolve_short_name_explicit_ref(tmp_path: Path) -> None:
+def test_resolve_short_name_explicit_ref_overrides_latest(tmp_path: Path) -> None:
     registry = MagicMock()
     registry.resolve.return_value = _entry()
 
+    captured: dict[str, str] = {}
+
     def fake_fetch_tarball(repo: str, ref: str, dest_dir: Path) -> Path:
+        captured["ref"] = ref
         top = dest_dir / "top"
         plugin = top / "limit_up_board"
         plugin.mkdir(parents=True)
@@ -106,16 +114,22 @@ def test_resolve_short_name_explicit_ref(tmp_path: Path) -> None:
         return top
 
     resolver = SourceResolver(registry=registry, framework_version="0.1.0")
-    with (
-        patch("deeptrade.core.plugin_source.latest_release_tag") as mock_latest,
-        patch(
-            "deeptrade.core.plugin_source.fetch_tarball",
-            side_effect=fake_fetch_tarball,
-        ),
+    with patch(
+        "deeptrade.core.plugin_source.fetch_tarball",
+        side_effect=fake_fetch_tarball,
     ):
         resolver.resolve("limit-up-board", ref="limit-up-board/v0.3.0")
 
-    mock_latest.assert_not_called()
+    assert captured["ref"] == "limit-up-board/v0.3.0"
+
+
+def test_resolve_short_name_no_latest_version_and_no_ref_raises() -> None:
+    """Registry entry without latest_version + no --ref → clear error."""
+    registry = MagicMock()
+    registry.resolve.return_value = _entry(latest_version=None)
+    resolver = SourceResolver(registry=registry, framework_version="0.1.0")
+    with pytest.raises(SourceResolveError, match="latest_version"):
+        resolver.resolve("limit-up-board")
 
 
 def test_resolve_short_name_unknown_raises() -> None:
@@ -141,15 +155,10 @@ def test_resolve_short_name_subdir_missing_raises() -> None:
     def fake_fetch_tarball(repo: str, ref: str, dest_dir: Path) -> Path:
         top = dest_dir / "top"
         top.mkdir()
-        # Note: subdir 'limit_up_board' NOT created
         return top
 
     resolver = SourceResolver(registry=registry, framework_version="0.1.0")
     with (
-        patch(
-            "deeptrade.core.plugin_source.latest_release_tag",
-            return_value="limit-up-board/v0.4.0",
-        ),
         patch(
             "deeptrade.core.plugin_source.fetch_tarball",
             side_effect=fake_fetch_tarball,
@@ -173,34 +182,66 @@ def test_resolve_short_name_subdir_missing_raises() -> None:
         ("git@github.com:foo/bar.git", "foo/bar"),
     ],
 )
-def test_resolve_url_parses_owner_repo(url: str, expected_repo: str) -> None:
+def test_resolve_url_defaults_to_main(url: str, expected_repo: str) -> None:
+    captured: dict[str, str] = {}
+
     def fake_fetch_tarball(repo: str, ref: str, dest_dir: Path) -> Path:
+        captured["repo"] = repo
+        captured["ref"] = ref
         top = dest_dir / "top"
         top.mkdir()
         (top / "deeptrade_plugin.yaml").touch()
         return top
 
-    captured: dict[str, str] = {}
-
-    def fake_latest(repo: str, prefix: str) -> str:
-        captured["repo"] = repo
-        captured["prefix"] = prefix
-        return "v1.0.0"
-
     resolver = SourceResolver(registry=MagicMock(), framework_version="0.1.0")
-    with (
-        patch("deeptrade.core.plugin_source.latest_release_tag", side_effect=fake_latest),
-        patch(
-            "deeptrade.core.plugin_source.fetch_tarball",
-            side_effect=fake_fetch_tarball,
-        ),
+    with patch(
+        "deeptrade.core.plugin_source.fetch_tarball",
+        side_effect=fake_fetch_tarball,
     ):
         resolved = resolver.resolve(url)
 
     assert captured["repo"] == expected_repo
-    assert captured["prefix"] == ""  # URL form uses empty prefix
+    assert captured["ref"] == "main"
     assert resolved.origin == "github_url"
     resolved.cleanup()
+
+
+def test_resolve_url_explicit_ref_is_passed_through() -> None:
+    captured: dict[str, str] = {}
+
+    def fake_fetch_tarball(repo: str, ref: str, dest_dir: Path) -> Path:
+        captured["ref"] = ref
+        top = dest_dir / "top"
+        top.mkdir()
+        (top / "deeptrade_plugin.yaml").touch()
+        return top
+
+    resolver = SourceResolver(registry=MagicMock(), framework_version="0.1.0")
+    with patch(
+        "deeptrade.core.plugin_source.fetch_tarball",
+        side_effect=fake_fetch_tarball,
+    ):
+        resolver.resolve("https://github.com/foo/bar", ref="v1.2.3")
+
+    assert captured["ref"] == "v1.2.3"
+
+
+def test_resolve_url_404_suggests_ref_flag() -> None:
+    """When default 'main' is missing, the error message hints at --ref."""
+    from deeptrade.core.github_fetch import TarballFetchError
+
+    def fake_fetch_tarball(repo: str, ref: str, dest_dir: Path) -> Path:
+        raise TarballFetchError("HTTP 404 downloading tarball foo/bar@main from codeload")
+
+    resolver = SourceResolver(registry=MagicMock(), framework_version="0.1.0")
+    with (
+        patch(
+            "deeptrade.core.plugin_source.fetch_tarball",
+            side_effect=fake_fetch_tarball,
+        ),
+        pytest.raises(SourceResolveError, match="--ref"),
+    ):
+        resolver.resolve("https://github.com/foo/bar")
 
 
 def test_resolve_url_rejects_non_github() -> None:
@@ -213,12 +254,10 @@ def test_resolve_url_no_yaml_at_root_raises() -> None:
     def fake_fetch_tarball(repo: str, ref: str, dest_dir: Path) -> Path:
         top = dest_dir / "top"
         top.mkdir()
-        # NO deeptrade_plugin.yaml at root (e.g. monorepo)
         return top
 
     resolver = SourceResolver(registry=MagicMock(), framework_version="0.1.0")
     with (
-        patch("deeptrade.core.plugin_source.latest_release_tag", return_value="v1.0.0"),
         patch(
             "deeptrade.core.plugin_source.fetch_tarball",
             side_effect=fake_fetch_tarball,

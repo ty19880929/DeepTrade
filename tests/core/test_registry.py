@@ -250,6 +250,31 @@ def test_resolve_known_plugin(cache_path: Path) -> None:
     assert entry.subdir == "limit_up_board"
 
 
+def test_latest_version_optional_default_none(cache_path: Path) -> None:
+    """Registry entries without ``latest_version`` parse fine; field is None."""
+    body = json.dumps(_valid_payload()).encode("utf-8")
+    client = RegistryClient(url="https://x", cache_path=cache_path)
+    with patch(
+        "deeptrade.core.registry.urlopen",
+        return_value=_FakeResponse(body),
+    ):
+        entry = client.resolve("limit-up-board")
+    assert entry.latest_version is None
+
+
+def test_latest_version_parsed_when_present(cache_path: Path) -> None:
+    payload = _valid_payload()
+    payload["plugins"]["limit-up-board"]["latest_version"] = "limit-up-board/v0.4.0"
+    body = json.dumps(payload).encode("utf-8")
+    client = RegistryClient(url="https://x", cache_path=cache_path)
+    with patch(
+        "deeptrade.core.registry.urlopen",
+        return_value=_FakeResponse(body),
+    ):
+        entry = client.resolve("limit-up-board")
+    assert entry.latest_version == "limit-up-board/v0.4.0"
+
+
 def test_resolve_unknown_plugin_raises(cache_path: Path) -> None:
     body = json.dumps(_valid_payload()).encode("utf-8")
     client = RegistryClient(url="https://x", cache_path=cache_path)
