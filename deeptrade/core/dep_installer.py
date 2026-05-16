@@ -27,7 +27,9 @@ import subprocess
 import sys
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from datetime import datetime
 from importlib import metadata as importlib_metadata
+from pathlib import Path
 
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.utils import canonicalize_name
@@ -35,6 +37,9 @@ from packaging.utils import canonicalize_name
 logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT_SECONDS = 300
+# Plan §2.6: dry-run preflight gets its own short timeout so a stuck `uv`
+# can't block the real install path.
+DRY_RUN_TIMEOUT_SECONDS = 60
 
 
 class DepInstallError(Exception):
@@ -224,3 +229,206 @@ def _resolved_timeout() -> int:
             DEFAULT_TIMEOUT_SECONDS,
         )
         return DEFAULT_TIMEOUT_SECONDS
+
+
+# ---------------------------------------------------------------------------
+# v0.7 H6 — dry-run preflight + dep snapshot
+# ---------------------------------------------------------------------------
+
+
+def framework_core_canonicals() -> set[str]:
+    """Return canonical names of every direct dependency declared by the
+    installed ``deeptrade-quant`` distribution. Used by the dry-run
+    preflight (H6-a) to flag plugin installs that would silently mutate
+    framework deps.
+
+    Returns an empty set when the framework isn't installed via a wheel
+    (running from source without ``pip install -e``); the protection is
+    best-effort and shouldn't block development setups."""
+    try:
+        dist = importlib_metadata.distribution("deeptrade-quant")
+    except importlib_metadata.PackageNotFoundError:
+        return set()
+    out: set[str] = set()
+    for raw in dist.requires or []:
+        try:
+            req = Requirement(raw)
+        except InvalidRequirement:
+            continue
+        # Drop extras-only requirements (e.g. dev / plugin-runtime entries
+        # whose marker is "extra == 'dev'"). They are not part of the
+        # base install footprint we want to protect.
+        if req.marker is not None:
+            try:
+                if not req.marker.evaluate({"extra": ""}):
+                    continue
+            except Exception:  # noqa: BLE001 — marker eval edge cases
+                continue
+        out.add(canonicalize_name(req.name))
+    return out
+
+
+def _parse_dry_run_changes(text: str, watched: set[str]) -> set[str]:
+    """Pull canonical package names out of a uv dry-run output that appear
+    with a change-indicating marker. Returns names that intersect
+    ``watched``.
+
+    uv's dry-run lines we treat as "would touch the existing install":
+
+    * ``- pkg==ver``  — would remove (or downgrade away from current)
+    * ``~ pkg ...``    — would update/downgrade in place
+
+    ``+ pkg==ver`` lines are skipped because they represent a fresh
+    install — by definition that package wasn't already in the env, so it
+    cannot be a framework core dep currently in use."""
+    if not watched:
+        return set()
+    affected: set[str] = set()
+    for line in text.splitlines():
+        stripped = line.strip()
+        if len(stripped) < 3:
+            continue
+        if not (stripped.startswith("- ") or stripped.startswith("~ ")):
+            continue
+        # Grab the first whitespace-separated token after the marker,
+        # then trim any version suffix (``pkg==1.2.3`` → ``pkg``;
+        # ``pkg`` alone is also valid for the ``~`` "from a to b" form).
+        rest = stripped[2:].lstrip().split()[0].split("==", 1)[0]
+        if not rest:
+            continue
+        try:
+            canonical = canonicalize_name(rest)
+        except Exception:  # noqa: BLE001 — defensive against odd uv output
+            continue
+        if canonical in watched:
+            affected.add(canonical)
+    return affected
+
+
+def preflight_dry_run(
+    requirements: list[Requirement],
+    *,
+    watched: set[str] | None = None,
+    timeout_seconds: int = DRY_RUN_TIMEOUT_SECONDS,
+) -> set[str]:
+    """Best-effort preflight: run ``uv pip install --dry-run`` against
+    ``requirements`` and return the subset of ``watched`` (canonical
+    names) the install would upgrade / downgrade / remove.
+
+    Returns an empty set silently when:
+
+    * ``requirements`` is empty;
+    * ``uv`` is not on PATH (``pip`` has no equivalent dry-run shape);
+    * uv exits non-zero (let the real install path surface the real error);
+    * uv times out — we don't want to block on a stuck resolver.
+
+    The caller decides what to do with the affected names: in the v0.7
+    H6 plan, ``PluginManager._handle_dependencies`` raises ``DepInstallError``
+    when the set is non-empty and ``--allow-core-bump`` wasn't passed."""
+    if not requirements:
+        return set()
+    if watched is None:
+        watched = framework_core_canonicals()
+    if not watched:
+        return set()
+
+    uv_path = shutil.which("uv")
+    if not uv_path:
+        # ``pip`` has no analogous structured dry-run output; fall back to
+        # no preflight rather than block the install path.
+        return set()
+
+    argv = [uv_path, "pip", "install", "--dry-run", "--python", sys.executable]
+    argv.extend(str(r) for r in requirements)
+    try:
+        result = subprocess.run(  # noqa: S603 — args fully controlled
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        logger.warning("uv dry-run preflight skipped: %s", e)
+        return set()
+
+    if result.returncode != 0:
+        logger.info(
+            "uv dry-run exited %d; skipping core-bump preflight (real install "
+            "will surface the underlying resolver error)",
+            result.returncode,
+        )
+        return set()
+
+    # uv prints the change plan to stderr; stdout used as fallback for
+    # uv versions that route it differently.
+    output = result.stderr or result.stdout or ""
+    return _parse_dry_run_changes(output, watched)
+
+
+def _snapshot_argv() -> list[str] | None:
+    """Pick the freeze-list command to use for snapshots.
+
+    Mirrors :func:`detect_installer` priority: prefer ``uv pip list``
+    (works on uv-managed venvs which often ship without pip) and fall
+    back to ``python -m pip list``. Returns ``None`` when neither path
+    is usable — snapshot becomes a no-op rather than blocking install."""
+    uv_path = shutil.which("uv")
+    if uv_path:
+        return [uv_path, "pip", "list", "--python", sys.executable, "--format=freeze"]
+    try:
+        check = subprocess.run(  # noqa: S603 — args fully controlled
+            [sys.executable, "-m", "pip", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+    if check.returncode == 0:
+        return [sys.executable, "-m", "pip", "list", "--format=freeze"]
+    return None
+
+
+def write_dep_snapshot(plugin_id: str, dir_root: Path) -> Path | None:
+    """Capture a ``pip list --format=freeze`` baseline to
+    ``<dir_root>/<plugin_id>/pre-install-<UTC-ISO>.txt`` so users have a
+    point-in-time record to diff against when an install goes sideways.
+
+    The snapshotting subprocess prefers ``uv pip list`` (uv venvs often
+    ship without pip) and falls back to ``python -m pip list``. Returns
+    the file path on success; ``None`` if neither is available or the
+    write failed (best-effort — never aborts install)."""
+    argv = _snapshot_argv()
+    if argv is None:
+        logger.warning("dep snapshot skipped — neither uv nor pip is usable for `pip list`")
+        return None
+    try:
+        proc = subprocess.run(  # noqa: S603 — args fully controlled
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=DRY_RUN_TIMEOUT_SECONDS,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        logger.warning("dep snapshot skipped — list subprocess failed: %s", e)
+        return None
+    if proc.returncode != 0:
+        logger.warning(
+            "dep snapshot skipped — list exited %d:\n%s",
+            proc.returncode,
+            (proc.stderr or "").strip(),
+        )
+        return None
+
+    target_dir = dir_root / plugin_id
+    target_dir.mkdir(parents=True, exist_ok=True)
+    # Use UTC for the filename so multi-host installs collated from one
+    # NAS sort sensibly; safe-ish for filenames across OSes (no ``:``).
+    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    path = target_dir / f"pre-install-{ts}.txt"
+    try:
+        path.write_text(proc.stdout, encoding="utf-8")
+    except OSError as e:
+        logger.warning("dep snapshot write failed: %s", e)
+        return None
+    return path

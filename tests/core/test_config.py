@@ -10,6 +10,7 @@ from datetime import time
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from deeptrade.core.config import (
     AppConfig,
@@ -78,6 +79,43 @@ def test_env_var_naming_convention() -> None:
     assert env_var_for("tushare.token") == "DEEPTRADE_TUSHARE_TOKEN"
     assert env_var_for("llm.deepseek.api_key") == "DEEPTRADE_LLM_DEEPSEEK_API_KEY"
     assert env_var_for("app.close_after") == "DEEPTRADE_APP_CLOSE_AFTER"
+
+
+# ---------------------------------------------------------------------------
+# v0.7 L1 — app.timezone IANA validation
+# ---------------------------------------------------------------------------
+
+
+def test_app_timezone_default_is_valid_iana() -> None:
+    """The bundled default ``Asia/Shanghai`` must parse cleanly — otherwise
+    the shipped wheel cannot ``init`` on any host with up-to-date tzdata."""
+    AppConfig()  # would raise if validator broke the default
+
+
+def test_app_timezone_accepts_known_iana_names() -> None:
+    """A handful of well-known zones used by likely users in CN / US / EU
+    must all round-trip cleanly."""
+    for tz in ("Asia/Shanghai", "Asia/Hong_Kong", "UTC", "Europe/London", "America/New_York"):
+        cfg = AppConfig(app_timezone=tz)
+        assert cfg.app_timezone == tz
+
+
+def test_app_timezone_rejects_typo() -> None:
+    """A near-miss like ``Asia/Shangai`` (missing 'h') must be caught at
+    config write time rather than crashing the first time something calls
+    ``ZoneInfo(...)`` further downstream."""
+    with pytest.raises(ValidationError, match="not a valid IANA zone"):
+        AppConfig(app_timezone="Asia/Shangai")
+
+
+def test_app_timezone_rejects_empty_string() -> None:
+    with pytest.raises(ValidationError, match="not a valid IANA zone"):
+        AppConfig(app_timezone="")
+
+
+def test_app_timezone_rejects_random_string() -> None:
+    with pytest.raises(ValidationError, match="not a valid IANA zone"):
+        AppConfig(app_timezone="bogus")
 
 
 def test_env_var_for_normalizes_hyphenated_provider_names() -> None:

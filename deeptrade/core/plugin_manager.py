@@ -28,9 +28,12 @@ from deeptrade.core import paths
 from deeptrade.core.db import Database
 from deeptrade.core.dep_installer import (
     DepInstallError,
+    framework_core_canonicals,
     parse_specs,
     plan_install,
+    preflight_dry_run,
     run_install,
+    write_dep_snapshot,
 )
 from deeptrade.plugins_api.base import Plugin
 from deeptrade.plugins_api.metadata import (
@@ -258,9 +261,15 @@ class PluginManager:
         *,
         install_deps: bool = True,
         reinstall_deps: bool = False,
+        allow_core_bump: bool = False,
     ) -> InstalledPlugin:
         """Install a plugin from a local directory. Network never touched
-        by plugin code; framework may run pip/uv if ``install_deps=True``."""
+        by plugin code; framework may run pip/uv if ``install_deps=True``.
+
+        v0.7 ``allow_core_bump`` — when True, the H6-a dry-run preflight
+        is allowed to proceed even if it would upgrade / downgrade /
+        remove a framework core dep. CLI surfaces this as
+        ``--allow-core-bump``."""
         source_path = source_path.resolve()
         if not source_path.is_dir():
             raise PluginInstallError(f"source path is not a directory: {source_path}")
@@ -309,7 +318,9 @@ class PluginManager:
         # deps stay in the env (see design §4.5).
         if install_deps:
             try:
-                self._handle_dependencies(meta, reinstall=reinstall_deps)
+                self._handle_dependencies(
+                    meta, reinstall=reinstall_deps, allow_core_bump=allow_core_bump
+                )
             except DepInstallError as e:
                 if target.exists():
                     shutil.rmtree(target, ignore_errors=True)
@@ -514,6 +525,7 @@ class PluginManager:
         *,
         install_deps: bool = True,
         reinstall_deps: bool = False,
+        allow_core_bump: bool = False,
     ) -> InstalledPlugin | UpgradeNoop:
         """Upgrade an existing plugin: apply only NEW migrations (S5).
 
@@ -594,7 +606,9 @@ class PluginManager:
         # deps in place (design §4.5).
         if install_deps:
             try:
-                self._handle_dependencies(meta, reinstall=reinstall_deps)
+                self._handle_dependencies(
+                    meta, reinstall=reinstall_deps, allow_core_bump=allow_core_bump
+                )
             except DepInstallError as e:
                 if target.exists():
                     shutil.rmtree(target, ignore_errors=True)
@@ -681,11 +695,27 @@ class PluginManager:
 
     # --- dep handling ------------------------------------------------
 
-    def _handle_dependencies(self, meta: PluginMetadata, *, reinstall: bool) -> None:
+    def _handle_dependencies(
+        self,
+        meta: PluginMetadata,
+        *,
+        reinstall: bool,
+        allow_core_bump: bool = False,
+    ) -> None:
         """Resolve declared deps, fail loudly on conflict, run installer.
 
         Pre-conditions: ``meta.dependencies`` already passed Pydantic
         validation (PEP 508, no URL/VCS, unique names).
+
+        v0.7 H6: before running the installer we
+
+        1. dry-run via ``uv pip install --dry-run`` (best-effort; skipped
+           when uv is absent) and refuse if any framework core dep would
+           be upgraded / downgraded / removed unless the caller passed
+           ``allow_core_bump=True``.
+        2. dump ``pip list --format=freeze`` to
+           ``~/.deeptrade/dep_snapshots/<plugin_id>/pre-install-<UTC>.txt``
+           so the user has a rollback baseline if the install bricks the env.
         """
         if not meta.dependencies:
             return
@@ -715,7 +745,46 @@ class PluginManager:
                 len(plan.skipped),
                 [f"{r.name}=={v}" for r, v in plan.skipped],
             )
-        run_install(targets, reinstall=reinstall)
+
+        # v0.7 H6-a — refuse silently-rewriting framework deps.
+        if targets:
+            watched = framework_core_canonicals()
+            affected = preflight_dry_run(targets, watched=watched)
+            if affected and not allow_core_bump:
+                raise DepInstallError(
+                    f"plugin {meta.plugin_id!r} install would change framework "
+                    f"core dep(s) {sorted(affected)} — pass --allow-core-bump if "
+                    f"this is intentional (a major-version bump of a framework "
+                    f"core dep can break the running interpreter)."
+                )
+            if affected:
+                logger.warning(
+                    "plugin %s: explicit core-bump approved for %s",
+                    meta.plugin_id,
+                    sorted(affected),
+                )
+
+        # v0.7 H6-b — best-effort snapshot before we touch the env.
+        if targets:
+            snap_path = write_dep_snapshot(meta.plugin_id, paths.dep_snapshots_dir())
+            if snap_path is not None:
+                logger.info(
+                    "plugin %s: dep snapshot written to %s "
+                    "(diff this on rollback if install bricks the env)",
+                    meta.plugin_id,
+                    snap_path,
+                )
+
+        try:
+            run_install(targets, reinstall=reinstall)
+        except DepInstallError as e:
+            # H6-b: surface the snapshot directory in the error so users can
+            # diff against the pre-install state without reading the source.
+            raise DepInstallError(
+                f"{e}\n  Tip: diff against the pre-install snapshot under "
+                f"{paths.dep_snapshots_dir() / meta.plugin_id}/ to see what "
+                f"changed mid-install."
+            ) from e
 
     def _build_dep_ownership(self, *, exclude_plugin_id: str) -> dict[str, str]:
         """Map canonical package name → human-readable owner attribution.

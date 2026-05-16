@@ -118,6 +118,28 @@ class AppConfig(BaseModel):
                 return time(int(parts[0]), int(parts[1]), int(parts[2]))
         return v
 
+    @field_validator("app_timezone")
+    @classmethod
+    def _validate_app_timezone(cls, v: str) -> str:
+        """v0.7 L1 — reject ``app.timezone`` values that aren't IANA zone names.
+
+        ``zoneinfo.available_timezones()`` is the authoritative source on the
+        runtime host (Python 3.11+; reads ``/usr/share/zoneinfo`` on Linux,
+        falls back to the bundled ``tzdata`` wheel on Windows). Without this,
+        a typo like ``Asia/Shangai`` reaches the eventual ``ZoneInfo(...)``
+        call and crashes much later with a confusing ``ZoneInfoNotFoundError``.
+        """
+        from zoneinfo import available_timezones  # noqa: PLC0415
+
+        zones = available_timezones()
+        if v not in zones:
+            raise ValueError(
+                f"app.timezone {v!r} is not a valid IANA zone; "
+                f"see `python -c 'import zoneinfo; print(sorted(zoneinfo.available_timezones()))'` "
+                f"for the list this host supports"
+            )
+        return v
+
     @field_validator("llm_providers", mode="before")
     @classmethod
     def _parse_llm_providers(cls, v: Any) -> Any:

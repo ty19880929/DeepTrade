@@ -13,6 +13,7 @@ import hashlib
 import sys
 from importlib import metadata as importlib_metadata
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -504,3 +505,205 @@ def test_cli_install_reinstall_deps_flag(home: Path, monkeypatch: pytest.MonkeyP
     result = runner.invoke(app, ["plugin", "install", str(src), "-y", "--reinstall-deps"])
     assert result.exit_code == 0, result.output
     assert seen == [(["pandas>=2.0"], True)]
+
+
+# ---------------------------------------------------------------------------
+# v0.7 H6 — dry-run preflight + dep snapshot
+# ---------------------------------------------------------------------------
+
+
+def test_framework_core_canonicals_lists_known_deps() -> None:
+    """``framework_core_canonicals()`` should surface every
+    ``deeptrade-quant`` direct dependency canonicalized. We don't pin the
+    exact list (it evolves), but the framework's most-load-bearing
+    runtime deps must be present so the H6-a check has something to
+    protect."""
+    from deeptrade.core.dep_installer import framework_core_canonicals
+
+    canonicals = framework_core_canonicals()
+    # Sanity floor: framework can't run without these.
+    for must_have in ("duckdb", "pydantic", "typer", "click"):
+        assert must_have in canonicals, (
+            f"framework_core_canonicals missing {must_have!r}; "
+            "either pyproject.toml was edited or the helper regressed"
+        )
+
+
+def test_parse_dry_run_changes_picks_up_update_and_remove() -> None:
+    """The parser pulls package names out of ``~`` (update) and ``-``
+    (remove) lines and intersects them with ``watched``."""
+    from deeptrade.core.dep_installer import _parse_dry_run_changes
+
+    sample = """
+    Resolved 4 packages in 200ms
+    Would install 1 package
+     + numpy==1.26.0
+     - duckdb==1.0.0
+     ~ pydantic from 2.7.0 to 2.13.0
+     + tornado==6.4.0
+    """
+    watched = {"duckdb", "pydantic", "click"}
+    assert _parse_dry_run_changes(sample, watched) == {"duckdb", "pydantic"}
+
+
+def test_parse_dry_run_changes_ignores_install_lines() -> None:
+    """``+ pkg`` lines are pure additions — they can't conflict with
+    already-installed framework core deps and must be filtered out."""
+    from deeptrade.core.dep_installer import _parse_dry_run_changes
+
+    sample = " + pydantic==2.13.0\n + click==8.3.0\n"
+    assert _parse_dry_run_changes(sample, {"pydantic", "click"}) == set()
+
+
+def test_preflight_dry_run_returns_empty_when_uv_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No ``uv`` binary on PATH → best-effort skip (return empty set).
+    Production behavior keeps the v0.4 install path runnable on hosts
+    that only have pip."""
+    from deeptrade.core import dep_installer
+
+    monkeypatch.setattr(dep_installer.shutil, "which", lambda n: None)
+    out = dep_installer.preflight_dry_run([Requirement("numpy>=1.0")], watched={"duckdb"})
+    assert out == set()
+
+
+def test_preflight_dry_run_returns_empty_for_no_requirements() -> None:
+    """Empty requirements list → no subprocess, no output."""
+    from deeptrade.core.dep_installer import preflight_dry_run
+
+    assert preflight_dry_run([], watched={"duckdb"}) == set()
+
+
+def test_preflight_dry_run_skips_when_watched_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Even with uv available, an empty ``watched`` set is the no-op
+    case — we'd have nothing to flag."""
+    from deeptrade.core import dep_installer
+
+    monkeypatch.setattr(dep_installer.shutil, "which", lambda n: "/usr/bin/uv")
+    # The subprocess.run path must NOT execute when watched is empty.
+    called: list[Any] = []
+    monkeypatch.setattr(
+        dep_installer.subprocess,
+        "run",
+        lambda *a, **kw: called.append(a) or (_ for _ in ()).throw(AssertionError("must not run")),
+    )
+    out = dep_installer.preflight_dry_run([Requirement("numpy>=1.0")], watched=set())
+    assert out == set()
+    assert called == []
+
+
+def test_handle_dependencies_refuses_core_bump_by_default(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the dry-run preflight reports an upgrade/downgrade of a
+    framework core dep, ``_handle_dependencies`` must raise unless
+    ``allow_core_bump=True``."""
+    from deeptrade.core import dep_installer
+    from deeptrade.core import plugin_manager as pm_mod
+
+    # Use a dep name that's definitely not installed so plan_install
+    # returns it as to_install (otherwise an already-satisfied dep would
+    # short-circuit before the preflight gate).
+    src = _make_plugin_dir(home, "corebump-plug", dependencies=["definitely-not-installed-xyz>=1"])
+    monkeypatch.setattr(pm_mod, "framework_core_canonicals", lambda: {"pandas"})
+    monkeypatch.setattr(pm_mod, "preflight_dry_run", lambda reqs, *, watched: {"pandas"})
+    # Suppress the actual subprocess install (we only care about the gate).
+    monkeypatch.setattr(pm_mod, "run_install", lambda reqs, *, reinstall=False: None)
+    monkeypatch.setattr(pm_mod, "write_dep_snapshot", lambda plugin_id, dir_root: None)
+    db = Database(home / "deeptrade.duckdb")
+    try:
+        with pytest.raises(PluginInstallError, match="--allow-core-bump"):
+            PluginManager(db).install(src)
+    finally:
+        db.close()
+    del dep_installer  # silence unused-import lint
+
+
+def test_handle_dependencies_allows_core_bump_when_flagged(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With ``allow_core_bump=True`` the gate is opened — install proceeds
+    even when the preflight flags a framework core dep."""
+    from deeptrade.core import plugin_manager as pm_mod
+
+    src = _make_plugin_dir(
+        home, "corebump-ok-plug", dependencies=["definitely-not-installed-xyz>=1"]
+    )
+    monkeypatch.setattr(pm_mod, "framework_core_canonicals", lambda: {"pandas"})
+    monkeypatch.setattr(pm_mod, "preflight_dry_run", lambda reqs, *, watched: {"pandas"})
+    install_called: list[Any] = []
+    monkeypatch.setattr(
+        pm_mod,
+        "run_install",
+        lambda reqs, *, reinstall=False: install_called.append((reqs, reinstall)),
+    )
+    monkeypatch.setattr(pm_mod, "write_dep_snapshot", lambda plugin_id, dir_root: None)
+    db = Database(home / "deeptrade.duckdb")
+    try:
+        rec = PluginManager(db).install(src, allow_core_bump=True)
+    finally:
+        db.close()
+    assert rec.plugin_id == "corebump-ok-plug"
+    assert install_called, "real installer must still run when --allow-core-bump is on"
+
+
+def test_write_dep_snapshot_creates_file_with_freeze_output(tmp_path: Path) -> None:
+    """Snapshot file lives at ``<dir>/<plugin_id>/pre-install-*.txt`` and
+    contains whatever ``pip list --format=freeze`` printed."""
+    from deeptrade.core.dep_installer import write_dep_snapshot
+
+    path = write_dep_snapshot("snap-plug", tmp_path)
+    assert path is not None, "pip list should be available in the test env"
+    assert path.parent == tmp_path / "snap-plug"
+    assert path.name.startswith("pre-install-") and path.name.endswith(".txt")
+    # Real pip output contains a == in every dependency line.
+    contents = path.read_text(encoding="utf-8")
+    assert "==" in contents
+
+
+def test_write_dep_snapshot_returns_none_when_pip_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """If ``pip list`` cannot be spawned, the snapshot is silently skipped
+    rather than failing the install path."""
+    from deeptrade.core import dep_installer
+
+    def boom(*args: Any, **kwargs: Any) -> Any:
+        raise FileNotFoundError("simulated pip missing")
+
+    monkeypatch.setattr(dep_installer.subprocess, "run", boom)
+    assert dep_installer.write_dep_snapshot("snap-plug", tmp_path) is None
+
+
+def test_cli_install_accepts_allow_core_bump_flag(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``deeptrade plugin install --allow-core-bump`` plumbs the flag
+    through to ``PluginManager.install``."""
+    from deeptrade.core import plugin_manager as pm_mod
+
+    src = _make_plugin_dir(home, "cliflag-plug", dependencies=["definitely-not-installed-xyz>=1"])
+    monkeypatch.setattr(pm_mod, "framework_core_canonicals", lambda: {"pandas"})
+    monkeypatch.setattr(pm_mod, "preflight_dry_run", lambda reqs, *, watched: {"pandas"})
+    monkeypatch.setattr(pm_mod, "run_install", lambda reqs, *, reinstall=False: None)
+    monkeypatch.setattr(pm_mod, "write_dep_snapshot", lambda pid, dr: None)
+    runner = CliRunner()
+    result = runner.invoke(app, ["plugin", "install", str(src), "-y", "--allow-core-bump"])
+    assert result.exit_code == 0, result.output
+
+
+def test_cli_install_without_flag_blocks_core_bump(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same scenario without ``--allow-core-bump`` exits 2 with the
+    expected error message."""
+    from deeptrade.core import plugin_manager as pm_mod
+
+    src = _make_plugin_dir(home, "blocked-plug", dependencies=["definitely-not-installed-xyz>=1"])
+    monkeypatch.setattr(pm_mod, "framework_core_canonicals", lambda: {"pandas"})
+    monkeypatch.setattr(pm_mod, "preflight_dry_run", lambda reqs, *, watched: {"pandas"})
+    monkeypatch.setattr(pm_mod, "run_install", lambda reqs, *, reinstall=False: None)
+    monkeypatch.setattr(pm_mod, "write_dep_snapshot", lambda pid, dr: None)
+    runner = CliRunner()
+    result = runner.invoke(app, ["plugin", "install", str(src), "-y"])
+    assert result.exit_code == 2, result.output
+    assert "--allow-core-bump" in result.output

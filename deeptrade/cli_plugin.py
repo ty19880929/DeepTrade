@@ -75,6 +75,11 @@ def cmd_install(
     reinstall_deps: bool = typer.Option(
         False, "--reinstall-deps", help="对全部依赖重新运行安装器（uv/pip --upgrade）"
     ),
+    allow_core_bump: bool = typer.Option(
+        False,
+        "--allow-core-bump",
+        help="允许该插件的依赖安装顺带升级 / 降级 / 移除框架核心 dep（默认拒绝）",
+    ),
 ) -> None:
     """从注册表 / GitHub URL / 本地目录安装一个插件。"""
     resolver = SourceResolver()
@@ -109,6 +114,7 @@ def cmd_install(
                 resolved.path,
                 install_deps=not no_deps,
                 reinstall_deps=reinstall_deps,
+                allow_core_bump=allow_core_bump,
             )
         except PluginInstallError as e:
             typer.echo(f"✘ 安装失败：{e}")
@@ -269,6 +275,11 @@ def cmd_upgrade(
     reinstall_deps: bool = typer.Option(
         False, "--reinstall-deps", help="对全部依赖重新运行安装器（uv/pip --upgrade）"
     ),
+    allow_core_bump: bool = typer.Option(
+        False,
+        "--allow-core-bump",
+        help="允许该插件的依赖升级顺带升级 / 降级 / 移除框架核心 dep（默认拒绝）",
+    ),
 ) -> None:
     """升级一个已安装的插件。
 
@@ -292,6 +303,7 @@ def cmd_upgrade(
                     resolved.path,
                     install_deps=not no_deps,
                     reinstall_deps=reinstall_deps,
+                    allow_core_bump=allow_core_bump,
                 )
             except PluginNotFoundError as e:
                 try:

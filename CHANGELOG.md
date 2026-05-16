@@ -2,6 +2,45 @@
 
 All notable changes to DeepTrade. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and SemVer.
 
+## [v0.7.0] — 2026-05-15 — 依赖隔离稳健化 + timezone IANA 校验
+
+本版按 2026-05-15 评审研判文档 §5 v0.7 路线落地 2 项主线，至此 v0.5 § 5 全部"采纳项"清零：
+
+1. **H6 依赖隔离稳健化**：
+   - **dry-run 预检**：``run_install`` 之前先跑 ``uv pip install --dry-run`` 抓 uv 的 change plan；解析 ``~`` (update) / ``-`` (remove) 行，与 ``framework_core_canonicals()`` 求交集。若插件依赖会顺带升级 / 降级 / 移除任何框架核心 dep，默认拒绝，要求显式 ``--allow-core-bump`` 才放行。``uv`` 不在 PATH 时降级为不做检查（``pip`` 没有对等结构化 dry-run），保持 v0.4 装机不动手的承诺。
+   - **dep snapshot**：``run_install`` 之前把 ``pip list --format=freeze`` 输出落到 ``~/.deeptrade/dep_snapshots/<plugin_id>/pre-install-<UTC>.txt``。失败时错误信息把这个目录甩到用户面前，便于 ``diff`` 回滚。
+   - 仍**不做**：venv-per-plugin / subprocess 隔离（重型方案，违反"框架轻"）；框架 deps 的 pin lockfile（会污染用户项目的解析）。
+2. **L1 timezone IANA 校验**：``AppConfig.app_timezone`` 改用 ``zoneinfo.available_timezones()`` 做硬校验，把 ``Asia/Shangai`` 这种近似拼写在写时拦住，而不是延迟到第一次 ``ZoneInfo(...)`` 调用爆 ``ZoneInfoNotFoundError``。``base_url`` HTTPS 强制按方案 §4 评估**仍不做**（本地 LLM 网关 / Ollama 常用 http）。
+
+### Added
+
+- ``deeptrade/core/dep_installer.py``：
+  - ``framework_core_canonicals()``——读取 ``deeptrade-quant`` distribution 的 ``Requires``，过滤掉 ``extra`` marker，输出框架核心 dep 的 canonical 名字集合。从源码运行（未 ``pip install -e``）时返回空集合，让预检自动降级为 no-op。
+  - ``preflight_dry_run(reqs, *, watched)``——best-effort 跑 ``uv pip install --dry-run``；解析 stderr / stdout 中的 ``~`` 与 ``-`` 行；返回与 ``watched`` 相交的 canonical 名字集合。``uv`` 缺席、resolution 失败、超时——一律返回空集合，让真正的 ``run_install`` 路径报底层错误，预检不抢话语权。
+  - ``_parse_dry_run_changes(text, watched)``——dry-run 输出解析的纯函数版本，便于单测覆盖。
+  - ``write_dep_snapshot(plugin_id, dir_root)``——优先 ``uv pip list``，回退 ``python -m pip list``（uv 管理的 venv 通常不带 pip）；写 ``<dir_root>/<plugin_id>/pre-install-<UTC>.txt``，返回 ``Path`` 或失败时 ``None``。
+  - ``DRY_RUN_TIMEOUT_SECONDS`` 短超时常量，避免被卡住的 uv 阻塞真正的 install。
+- ``deeptrade/core/paths.py::dep_snapshots_dir()``——``~/.deeptrade/dep_snapshots/``；纳入 ``ensure_layout()`` 自动创建。
+- ``deeptrade/core/plugin_manager.py::PluginManager.install`` / ``upgrade`` 接 ``allow_core_bump: bool = False``；``_handle_dependencies`` 在 ``run_install`` 之前先跑 preflight 与 snapshot，并在 install error 信息里附上 snapshot 目录 hint。
+- ``deeptrade/cli_plugin.py``：``plugin install`` 与 ``plugin upgrade`` 加 ``--allow-core-bump`` flag（中文 help 文案）。
+- ``deeptrade/core/config.py::AppConfig._validate_app_timezone``——基于 ``zoneinfo.available_timezones()`` 的 ``@field_validator``；非法值抛 Pydantic ``ValidationError`` 并指出如何打印当前主机支持的全部 zones。
+- 测试：``tests/core/test_config.py`` 5 个新用例（默认值通过、典型 IANA 名通过、typo / 空串 / 任意字符串拒绝）。``tests/core/test_plugin_dependencies.py`` 10 个新用例（``framework_core_canonicals`` 列出 must-have、``_parse_dry_run_changes`` 识别 update / remove、忽略 install 行、uv 缺席返回空集、空 requirements 返回空集、watched 为空跳过 subprocess、``_handle_dependencies`` 默认拒绝 core bump 与 ``--allow-core-bump`` 放行、``write_dep_snapshot`` 写文件、pip 缺失返回 ``None``、CLI 双向）。
+
+### Changed
+
+- ``deeptrade/core/plugin_manager.py::_handle_dependencies``：新增 ``allow_core_bump`` kwarg；``run_install`` 调用包了 ``try/except DepInstallError``，把异常包裹一层附上 snapshot 目录提示，便于排障。
+- ``deeptrade/core/dep_installer.py::write_dep_snapshot``：拆出 ``_snapshot_argv()`` 帮助选择 ``uv pip list`` vs ``python -m pip list``，与 ``detect_installer()`` 的优先级一致。
+
+### Migration notes
+
+- **用户视角零强制动作**：默认行为是更严的（核心 dep 改动需要显式确认），但常见插件不会动框架核心 dep——绝大多数 ``deeptrade plugin install <短名>`` 命令仍然零摩擦。
+- **遇到核心依赖冲突如何处理**：v0.7 之后若看到 ``plugin install would change framework core dep(s) [...]`` 的拒绝信息，先看 dry-run 报告的具体包：
+    - 如果是 ``duckdb`` / ``pydantic`` / ``click`` / ``typer`` 等加载链路上的运行时关键件——大概率是插件 spec 写得太死，反馈给插件作者放宽；强行 ``--allow-core-bump`` 可能让框架进程立刻 import 失败。
+    - 如果只是 minor 版本提升且已读过 release note——加 ``--allow-core-bump`` 显式确认放行。
+- **uv 缺席的主机**：``preflight_dry_run`` 自动跳过，行为与 v0.4 一致。``write_dep_snapshot`` 也能用 ``python -m pip list`` 兜底（虽然 uv-only venv 上 pip 通常缺席，此时 snapshot 静默 no-op）。
+- **dep_snapshots 目录的清理**：框架本身不做轮转。如果该目录变大，可以放心 ``rm`` 老的 ``pre-install-*.txt`` 文件——它们只用于回溯，不影响运行时。
+- **timezone**：升级到 v0.7 之后第一次 ``Database()`` 打开会触发自动迁移，迁移本身不动 ``app.timezone``；但如果你之前不小心存了 typo 进 ``app_config``，下一次 ``ConfigService.get_app_config()`` 会抛 ``ValidationError``。修法：``deeptrade config set app.timezone Asia/Shanghai``（或你本地的正确 IANA 名）。
+
 ## [v0.6.0] — 2026-05-15 — 插件运行时 API + LLM 方言 + 杂项收尾
 
 本版按 2026-05-15 评审研判文档 `DeepTrade-review-assessment-and-fix-plan-2026-05-15.md` §5 中 v0.6 路线落地 6 项主线：
