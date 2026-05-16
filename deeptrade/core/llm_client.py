@@ -183,6 +183,24 @@ class OpenAICompatTransport(LLMTransport):
         thinking: bool,
         reasoning_effort: str,
     ) -> LLMResponse:
+        """Send one chat as a server-sent-event stream and accumulate the
+        deltas into a single :class:`LLMResponse`.
+
+        Streaming is the only supported wire mode (v0.9+). Moonshot's
+        official guidance explicitly warns that long non-streaming
+        generations are killed by intermediate gateways that interpret a
+        long "no headers yet" pause as a dead connection. Streaming makes
+        the server emit ``200 OK`` + SSE headers within ~1 s, so no
+        gateway treats the request as a zombie regardless of how long
+        generation takes. The framework still returns a single
+        ``LLMResponse``; audit log, retry, and plugin code are unaffected.
+
+        ``stream_options={"include_usage": True}`` — every OpenAI-compatible
+        provider currently in scope (OpenAI, Moonshot, DeepSeek, DashScope,
+        Doubao, GLM, Yi, OpenRouter, SiliconFlow) returns ``usage`` on the
+        final chunk when this is set. The final chunk in usage mode has
+        ``choices=[]`` and ``usage`` populated.
+        """
         from openai import APIError, APITimeoutError  # noqa: PLC0415
 
         adjusted_temperature = self._adjust_temperature(model=model, temperature=temperature)
@@ -203,7 +221,8 @@ class OpenAICompatTransport(LLMTransport):
             "response_format": {"type": "json_object"},
             "temperature": adjusted_temperature,
             "max_tokens": max_tokens,
-            "stream": False,
+            "stream": True,
+            "stream_options": {"include_usage": True},
         }
         # v0.6 H5 — only send ``reasoning_effort`` when the transport
         # declares support AND the caller actually supplied a non-empty
@@ -218,15 +237,29 @@ class OpenAICompatTransport(LLMTransport):
         # ⚠ HARD CONSTRAINT (M3): we MUST NOT pass tools/tool_choice/functions.
         # If a future maintainer adds them, the no-tools test in V0.5 fails.
 
+        parts: list[str] = []
+        usage: Any = None
         try:
-            resp = self._client.chat.completions.create(**kwargs)
+            stream = self._client.chat.completions.create(**kwargs)
+            for chunk in stream:
+                # In include_usage mode the final chunk carries usage and
+                # an empty choices list. Earlier chunks carry one choice
+                # whose delta.content may be None (role-only opener) or a
+                # text fragment.
+                if chunk.choices:
+                    delta = chunk.choices[0].delta
+                    if delta is not None and delta.content:
+                        parts.append(delta.content)
+                if getattr(chunk, "usage", None) is not None:
+                    usage = chunk.usage
         except (APITimeoutError, APIError) as e:
+            # Errors raised during create() (header phase) or while
+            # iterating the stream (body phase) both surface as
+            # LLMTransportError so tenacity in _transport_call retries.
             raise LLMTransportError(str(e)) from e
 
-        text = resp.choices[0].message.content or ""
-        usage = resp.usage
         return LLMResponse(
-            text=text,
+            text="".join(parts),
             input_tokens=int(getattr(usage, "prompt_tokens", 0) or 0),
             output_tokens=int(getattr(usage, "completion_tokens", 0) or 0),
         )

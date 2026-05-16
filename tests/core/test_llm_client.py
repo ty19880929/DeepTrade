@@ -80,6 +80,28 @@ def client(db: Database, transport: RecordedTransport) -> LLMClient:
     )
 
 
+def _text_chunk(content: str | None) -> Any:
+    """Fabricate a streaming ChatCompletionChunk with a single delta content
+    fragment. Mirrors what openai SDK yields per delta during ``stream=True``.
+    """
+    from types import SimpleNamespace
+
+    delta = SimpleNamespace(content=content, role=None)
+    choice = SimpleNamespace(delta=delta, index=0, finish_reason=None)
+    return SimpleNamespace(choices=[choice], usage=None)
+
+
+def _final_usage_chunk(*, prompt_tokens: int, completion_tokens: int) -> Any:
+    """Final chunk in ``stream_options={'include_usage': True}`` mode: empty
+    choices list, populated usage."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        choices=[],
+        usage=SimpleNamespace(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens),
+    )
+
+
 def _ok_response(stage_label: str = "test", n: int = 2) -> LLMResponse:
     payload = {
         "stage": stage_label,
@@ -370,16 +392,15 @@ def test_dashscope_transport_sends_enable_thinking_through_chat(
     """End-to-end wire-shape regression — the kwargs handed to OpenAI's
     chat.completions.create() must carry `extra_body={"enable_thinking": ...}`
     for DashScope, even when thinking=False."""
-    from types import SimpleNamespace
-
     captured: dict[str, Any] = {}
 
     def fake_create(**kwargs: Any) -> Any:
         captured.update(kwargs)
-        choice = SimpleNamespace(message=SimpleNamespace(content='{"k": 1}'))
-        return SimpleNamespace(
-            choices=[choice],
-            usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5),
+        return iter(
+            [
+                _text_chunk('{"k": 1}'),
+                _final_usage_chunk(prompt_tokens=10, completion_tokens=5),
+            ]
         )
 
     t = DashScopeTransport(
@@ -399,6 +420,8 @@ def test_dashscope_transport_sends_enable_thinking_through_chat(
         reasoning_effort="medium",
     )
     assert captured["extra_body"] == {"enable_thinking": False}
+    assert captured["stream"] is True
+    assert captured["stream_options"] == {"include_usage": True}
 
 
 def test_select_transport_class_routes_dashscope_by_base_url() -> None:
@@ -457,16 +480,15 @@ def test_moonshot_transport_sends_forced_temperature_on_wire(
 ) -> None:
     """End-to-end wire-shape regression: chat() composes kwargs with the
     *adjusted* temperature, not the caller's original value."""
-    from types import SimpleNamespace
-
     captured: dict[str, Any] = {}
 
     def fake_create(**kwargs: Any) -> Any:
         captured.update(kwargs)
-        choice = SimpleNamespace(message=SimpleNamespace(content='{"k": 1}'))
-        return SimpleNamespace(
-            choices=[choice],
-            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+        return iter(
+            [
+                _text_chunk('{"k": 1}'),
+                _final_usage_chunk(prompt_tokens=1, completion_tokens=1),
+            ]
         )
 
     t = MoonshotTransport(api_key="dummy", base_url="https://api.moonshot.cn/v1", timeout=10)
@@ -481,6 +503,8 @@ def test_moonshot_transport_sends_forced_temperature_on_wire(
         reasoning_effort="",
     )
     assert captured["temperature"] == 1.0
+    assert captured["stream"] is True
+    assert captured["stream_options"] == {"include_usage": True}
 
 
 def test_select_transport_class_routes_moonshot() -> None:
@@ -523,16 +547,15 @@ def test_generic_transport_drops_reasoning_effort(monkeypatch: pytest.MonkeyPatc
     """Even when the caller's StageProfile sets ``reasoning_effort='high'``,
     a Generic (non-OpenAI) transport must NOT send the field — most Chinese
     OpenAI-compat providers either ignore or 400 on it."""
-    from types import SimpleNamespace
-
     captured: dict[str, Any] = {}
 
     def fake_create(**kwargs: Any) -> Any:
         captured.update(kwargs)
-        choice = SimpleNamespace(message=SimpleNamespace(content='{"k": 1}'))
-        return SimpleNamespace(
-            choices=[choice],
-            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+        return iter(
+            [
+                _text_chunk('{"k": 1}'),
+                _final_usage_chunk(prompt_tokens=1, completion_tokens=1),
+            ]
         )
 
     t = GenericOpenAITransport(api_key="dummy", base_url="https://api.deepseek.com", timeout=10)
@@ -549,6 +572,8 @@ def test_generic_transport_drops_reasoning_effort(monkeypatch: pytest.MonkeyPatc
     assert "reasoning_effort" not in captured, (
         "GenericOpenAITransport must not forward reasoning_effort even when the caller sets it"
     )
+    assert captured["stream"] is True
+    assert captured["stream_options"] == {"include_usage": True}
 
 
 def test_openai_official_transport_sends_reasoning_effort(
@@ -556,16 +581,15 @@ def test_openai_official_transport_sends_reasoning_effort(
 ) -> None:
     """The official OpenAI transport forwards ``reasoning_effort`` when the
     caller's StageProfile supplies a non-empty value."""
-    from types import SimpleNamespace
-
     captured: dict[str, Any] = {}
 
     def fake_create(**kwargs: Any) -> Any:
         captured.update(kwargs)
-        choice = SimpleNamespace(message=SimpleNamespace(content='{"k": 1}'))
-        return SimpleNamespace(
-            choices=[choice],
-            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+        return iter(
+            [
+                _text_chunk('{"k": 1}'),
+                _final_usage_chunk(prompt_tokens=1, completion_tokens=1),
+            ]
         )
 
     t = OpenAIOfficialTransport(api_key="dummy", base_url="https://api.openai.com/v1", timeout=10)
@@ -580,6 +604,8 @@ def test_openai_official_transport_sends_reasoning_effort(
         reasoning_effort="medium",
     )
     assert captured.get("reasoning_effort") == "medium"
+    assert captured["stream"] is True
+    assert captured["stream_options"] == {"include_usage": True}
 
 
 def test_openai_official_transport_drops_empty_reasoning_effort(
@@ -587,16 +613,15 @@ def test_openai_official_transport_drops_empty_reasoning_effort(
 ) -> None:
     """An empty ``reasoning_effort`` (caller declined to set one) is dropped
     even on the official transport — sending an empty string would 400."""
-    from types import SimpleNamespace
-
     captured: dict[str, Any] = {}
 
     def fake_create(**kwargs: Any) -> Any:
         captured.update(kwargs)
-        choice = SimpleNamespace(message=SimpleNamespace(content='{"k": 1}'))
-        return SimpleNamespace(
-            choices=[choice],
-            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+        return iter(
+            [
+                _text_chunk('{"k": 1}'),
+                _final_usage_chunk(prompt_tokens=1, completion_tokens=1),
+            ]
         )
 
     t = OpenAIOfficialTransport(api_key="dummy", base_url="https://api.openai.com/v1", timeout=10)
@@ -611,6 +636,8 @@ def test_openai_official_transport_drops_empty_reasoning_effort(
         reasoning_effort="",
     )
     assert "reasoning_effort" not in captured
+    assert captured["stream"] is True
+    assert captured["stream_options"] == {"include_usage": True}
 
 
 def test_select_transport_class_defaults_to_generic() -> None:

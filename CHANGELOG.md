@@ -2,6 +2,32 @@
 
 All notable changes to DeepTrade. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and SemVer.
 
+## [v0.9.0] — 2026-05-16 — LLM transport 改流式，规避网关 idle-timeout
+
+打板等长生成场景下，`kimi-k2.6` 等 thinking 模型的非流式调用 100% 触发 `LLMTransportError: Request timed out.`，单次失败耗时 ~27 分钟（外层 tenacity 3 次 × openai SDK 3 次 × 180 s）。Moonshot 官方文档明确：思考模型在 server 端先思考再生成，**任何中间网关（包括 Moonshot 自家网关）只要看到长时间无 header 返回就会把 TCP 当僵尸连接切掉**，这是非流式的设计性缺陷，与 base_url / DNS / TLS 均无关。
+
+实证：同一 prompt + `stream=True` 下 TTFC 1.3 s、总耗时 42 s、`content_len=240`、JSON 合法、usage 完整。
+
+### Changed
+
+- `deeptrade/core/llm_client.py::OpenAICompatTransport.chat()` 改为流式：`stream=True` + `stream_options={"include_usage": True}`，逐 chunk 累积 `delta.content` 拼成完整文本，从末 chunk 取 usage。`create()` 与迭代两阶段的 `APITimeoutError` / `APIError` 都包成 `LLMTransportError`，原 tenacity 重试路径不变。
+- 保留 v0.6 / v0.8.1 的两段逻辑：`_adjust_temperature()` 钩子（Moonshot 强制 1.0）与 `supports_reasoning_effort` 门控（仅 `OpenAIOfficialTransport` 翻 True）继续生效。
+- 子类（`GenericOpenAITransport` / `DashScopeTransport` / `MoonshotTransport` / `OpenAIOfficialTransport`）零修改，继承新基类实现。`RecordedTransport`、`LLMClient`、`LLMResponse`、`llm_calls` 表结构、`reports/<run>/llm_calls.jsonl` 格式全部不变。
+
+### Why streaming-only, no fallback
+
+内测期约定：**不留 `stream=False` 开关、不加配置项、不做降级**。理由：
+
+- timeout 语义自然从「整次调用墙钟」变为「单 chunk 间最大不活跃间隔」，更宽容、更符合 LLM 长生成的实际形态；`provider.timeout=180` 字面值无需调整。
+- 流式中途断 → 截断 JSON → 走 `LLMClient._with_retry` 已有的 `LLMValidationError` 1 次 repair-retry，不必单独走非流式 fallback。
+- include_usage 是 OpenAI 协议 2024-07 起的官方约定，in-scope 的全部 provider（OpenAI / Moonshot / DeepSeek / DashScope / Doubao / GLM / Yi / OpenRouter / SiliconFlow）均已支持；万一某末 chunk 缺 usage，审计记 0 不抛。
+
+### Migration notes
+
+- 插件零改动。`LLMClient.complete_json()` 接口、异常类型、返回类型、重试语义、审计格式全部不变。
+- `app_config.llm_providers[*].timeout` 字段保留，语义如上；用户原本配的数值无需调整。
+- 行为差异详见 `docs/fix/2026-05-16-llm-streaming-transport.md` §4.3。
+
 ## [v0.8.1] — 2026-05-16 — Moonshot reasoning 模型 temperature 兼容性
 
 `limit-up-board` 等插件接入 Kimi K2.6（``base_url = https://api.moonshot.cn/v1``）后，**所有** LLM 调用 100% 命中 ``HTTP 400 invalid temperature: only 1 is allowed for this model``。根因：Kimi K2 系列的 thinking / reasoning 变体（与 OpenAI o1/o3、Anthropic Sonnet thinking 同侧设计）在服务端硬约束 ``temperature``——仅接受模型专属的固定值，而插件 ``StageProfile`` 出于复现性给的是 ``0.0 ~ 0.2``。
